@@ -1,0 +1,216 @@
+// ~/Desktop/teran-api/src/index.ts
+import { createClient } from "@supabase/supabase-js";
+
+export interface Env {
+  SUPABASE_URL: string;
+  SUPABASE_SERVICE_ROLE_KEY: string;
+  JWT_SECRET: string;
+  CORS_ORIGIN?: string; // optional: "http://localhost:5173" etc
+}
+
+// --------- tiny helpers (CORS) ----------
+function corsHeaders(req: Request, env: Env) {
+  const origin = req.headers.get("Origin") || "";
+  const allowed = env.CORS_ORIGIN || origin || "*";
+  return {
+    "Access-Control-Allow-Origin": allowed,
+    "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Max-Age": "86400",
+  };
+}
+
+function json(req: Request, env: Env, data: unknown, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      ...corsHeaders(req, env),
+    },
+  });
+}
+
+// --------- base64url ----------
+function b64urlEncode(bytes: ArrayBuffer): string {
+  const bin = String.fromCharCode(...new Uint8Array(bytes));
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function b64urlEncodeStr(s: string): string {
+  return b64urlEncode(new TextEncoder().encode(s).buffer);
+}
+function b64urlDecodeToBytes(s: string): Uint8Array {
+  const pad = s.length % 4 ? "=".repeat(4 - (s.length % 4)) : "";
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/") + pad;
+  const bin = atob(b64);
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+
+// --------- JWT HS256 (no deps) ----------
+async function hmacSha256(key: string, msg: string): Promise<string> {
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(key),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(msg));
+  return b64urlEncode(sig);
+}
+
+async function jwtSign(env: Env, payload: Record<string, unknown>) {
+  const header = { alg: "HS256", typ: "JWT" };
+  const h = b64urlEncodeStr(JSON.stringify(header));
+  const p = b64urlEncodeStr(JSON.stringify(payload));
+  const msg = `${h}.${p}`;
+  const sig = await hmacSha256(env.JWT_SECRET, msg);
+  return `${msg}.${sig}`;
+}
+
+async function jwtVerify(env: Env, token: string): Promise<Record<string, any> | null> {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [h, p, sig] = parts;
+  const msg = `${h}.${p}`;
+  const expected = await hmacSha256(env.JWT_SECRET, msg);
+  if (expected !== sig) return null;
+
+  const payloadJson = new TextDecoder().decode(b64urlDecodeToBytes(p));
+  const payload = JSON.parse(payloadJson);
+
+  // exp check (seconds)
+  if (payload?.exp && typeof payload.exp === "number") {
+    const now = Math.floor(Date.now() / 1000);
+    if (now > payload.exp) return null;
+  }
+  return payload;
+}
+
+async function requireAuth(req: Request, env: Env): Promise<string | null> {
+  const auth = req.headers.get("Authorization") || "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return null;
+  const token = m[1];
+  const payload = await jwtVerify(env, token);
+  const userId = payload?.sub;
+  return typeof userId === "string" ? userId : null;
+}
+
+// --------- Supabase client ----------
+function sb(env: Env) {
+  return createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { persistSession: false },
+    global: { fetch },
+  });
+}
+
+// --------- routes ----------
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    // Preflight
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders(req, env) });
+    }
+
+    const url = new URL(req.url);
+    const path = url.pathname;
+
+    try {
+      // /api/identity (POST) -> { user_id, token }
+      if (path === "/api/identity" && req.method === "POST") {
+        const user_id = crypto.randomUUID();
+        const now = Math.floor(Date.now() / 1000);
+        const token = await jwtSign(env, {
+          sub: user_id,
+          iat: now,
+          exp: now + 60 * 60 * 24 * 365, // 1 year
+        });
+        return json(req, env, { user_id, token });
+      }
+
+      // /api/posts (GET)
+      if (path === "/api/posts" && req.method === "GET") {
+        const { data, error } = await sb(env)
+          .from("posts")
+          .select("*")
+          .order("created_at", { ascending: false })
+          .limit(50);
+        if (error) throw error;
+        return json(req, env, { posts: data ?? [] });
+      }
+
+      // /api/posts (POST)
+      if (path === "/api/posts" && req.method === "POST") {
+        const user_id = await requireAuth(req, env);
+        if (!user_id) return json(req, env, { error: "Unauthorized" }, 401);
+
+        const body = (await req.json().catch(() => null)) as any;
+        const content = typeof body?.content === "string" ? body.content.trim() : "";
+        if (!content) return json(req, env, { error: "content required" }, 400);
+
+        const { data, error } = await sb(env)
+          .from("posts")
+          .insert({ user_id, content })
+          .select("*")
+          .single();
+        if (error) throw error;
+        return json(req, env, { post: data }, 201);
+      }
+
+      // /api/posts/:id (DELETE)
+      {
+        const m = path.match(/^\/api\/posts\/(\d+)$/);
+        if (m && req.method === "DELETE") {
+          const user_id = await requireAuth(req, env);
+          if (!user_id) return json(req, env, { error: "Unauthorized" }, 401);
+
+          const id = Number(m[1]);
+          const { error } = await sb(env)
+            .from("posts")
+            .delete()
+            .eq("id", id)
+            .eq("user_id", user_id);
+          if (error) throw error;
+          return json(req, env, { ok: true });
+        }
+      }
+
+      // /api/comments (GET) ?post_id=123
+      if (path === "/api/comments" && req.method === "GET") {
+        const post_id_param = url.searchParams.get("post_id");
+        let q = sb(env).from("comments").select("*").order("created_at", { ascending: true }).limit(200);
+        if (post_id_param) q = q.eq("post_id", Number(post_id_param));
+        const { data, error } = await q;
+        if (error) throw error;
+        return json(req, env, { comments: data ?? [] });
+      }
+
+      // /api/comments (POST) -> { post_id, content }
+      if (path === "/api/comments" && req.method === "POST") {
+        const user_id = await requireAuth(req, env);
+        if (!user_id) return json(req, env, { error: "Unauthorized" }, 401);
+
+        const body = (await req.json().catch(() => null)) as any;
+        const post_id = Number(body?.post_id);
+        const content = typeof body?.content === "string" ? body.content.trim() : "";
+        if (!post_id || !content) return json(req, env, { error: "post_id & content required" }, 400);
+
+        const { data, error } = await sb(env)
+          .from("comments")
+          .insert({ post_id, user_id, content })
+          .select("*")
+          .single();
+        if (error) throw error;
+        return json(req, env, { comment: data }, 201);
+      }
+
+      return json(req, env, { error: "Not found" }, 404);
+    } catch (e: any) {
+      const msg = typeof e?.message === "string" ? e.message : "Internal error";
+      return json(req, env, { error: msg }, 500);
+    }
+  },
+};
+
+
+
