@@ -188,9 +188,16 @@ export default {
           throw new HttpError(422, "VALIDATION_ERROR", "content required");
         }
 
+        // Parse optional author fields from request
+        const title = typeof body?.title === "string" ? body.title.trim() : "";
+        const author_id = typeof body?.author_id === "string" ? body.author_id : null;
+        const author_name = typeof body?.author_name === "string" ? body.author_name : null;
+        const author_avatar = typeof body?.author_avatar === "string" ? body.author_avatar : null;
+        const room_id = typeof body?.room_id === "string" ? body.room_id : null;
+
         const { data, error } = await sb(env)
           .from("posts")
-          .insert({ user_id, content })
+          .insert({ user_id, content, title, author_id, author_name, author_avatar, room_id })
           .select("*")
           .single();
         if (error) throw error;
