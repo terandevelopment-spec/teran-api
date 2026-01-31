@@ -9,7 +9,17 @@
 	"compatibility_date": "2025-09-27",
 	"observability": {
 		"enabled": true
-	}
+	},
+	/**
+	 * R2 Object Storage
+	 * https://developers.cloudflare.com/r2/api/workers/workers-api-usage/
+	 */
+	"r2_buckets": [
+		{
+			"binding": "R2_MEDIA",
+			"bucket_name": "teran-media"
+		}
+	]
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
