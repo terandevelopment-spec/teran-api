@@ -1818,6 +1818,8 @@ export default {
             throw new HttpError(400, "BAD_REQUEST", "user_id is required");
           }
 
+          console.log(`[profile-sync] PUT /api/profile request_id=${request_id} user_id=${user_id}`);
+
           const { error } = await sb(env)
             .from("user_profiles")
             .upsert(
