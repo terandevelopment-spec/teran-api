@@ -1809,6 +1809,33 @@ export default {
           return ok(req, env, request_id, data);
         }
 
+        // PUT /api/profile (Stage 2: sync persona to backend)
+        if (path === "/api/profile" && req.method === "PUT") {
+          const body = (await req.json().catch(() => null)) as any;
+          const user_id = body?.user_id;
+
+          if (!user_id || typeof user_id !== "string" || user_id.trim() === "") {
+            throw new HttpError(400, "BAD_REQUEST", "user_id is required");
+          }
+
+          const { error } = await sb(env)
+            .from("user_profiles")
+            .upsert(
+              {
+                user_id: user_id.trim(),
+                display_name: typeof body?.display_name === "string" ? body.display_name : "Anonymous",
+                bio: typeof body?.bio === "string" ? body.bio : null,
+                avatar: typeof body?.avatar === "string" ? body.avatar : null,
+                updated_at: new Date().toISOString(),
+              },
+              { onConflict: "user_id" }
+            );
+
+          if (error) throw error;
+
+          return ok(req, env, request_id, { ok: true });
+        }
+
         // =====================================================
         // PROFILE GALLERY API
         // =====================================================
