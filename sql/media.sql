@@ -29,13 +29,35 @@ CREATE TABLE IF NOT EXISTS media (
 CREATE INDEX IF NOT EXISTS media_post_id_idx ON media(post_id);
 CREATE INDEX IF NOT EXISTS media_comment_id_idx ON media(comment_id);
 
--- RLS: enable and allow select for all (writes via service role only)
+-- RLS: enable and allow select for all, writes via service role
 ALTER TABLE media ENABLE ROW LEVEL SECURITY;
 
 -- Allow anyone to read media
 CREATE POLICY "Allow public read on media"
   ON media
   FOR SELECT
+  USING (true);
+
+-- Allow service_role to insert media (Worker uses service_role key)
+CREATE POLICY "Allow service_role insert on media"
+  ON media
+  FOR INSERT
+  TO service_role
+  WITH CHECK (true);
+
+-- Allow service_role to update media
+CREATE POLICY "Allow service_role update on media"
+  ON media
+  FOR UPDATE
+  TO service_role
+  USING (true)
+  WITH CHECK (true);
+
+-- Allow service_role to delete media
+CREATE POLICY "Allow service_role delete on media"
+  ON media
+  FOR DELETE
+  TO service_role
   USING (true);
 
 -- OPTIONAL: migrate existing post_media rows to media table

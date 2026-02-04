@@ -182,7 +182,6 @@ async function sha256Hex(str: string): Promise<string> {
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
-
 // --------- Notifications Helper ----------
 async function createNotification(
   env: Env,
@@ -191,17 +190,34 @@ async function createNotification(
     actor_user_id: string;
     actor_name?: string | null;
     actor_avatar?: string | null;
-    type: "comment_like" | "reply" | "post_comment";
+    type: "comment_like" | "reply" | "post_comment" | "post_like" | "post_reply";
     post_id?: number;
     comment_id?: number;
     parent_comment_id?: number;
     group_key: string;
-  }
+    snippet?: string | null;
+  },
+  request_id?: string
 ) {
   // Skip self-notification
-  if (payload.recipient_user_id === payload.actor_user_id) return;
+  if (payload.recipient_user_id === payload.actor_user_id) {
+    console.log(`[notif][${request_id}] skipping self-notification`, {
+      type: payload.type,
+      actor: payload.actor_user_id,
+    });
+    return;
+  }
 
-  await sb(env).from("notifications").insert({
+  console.log(`[notif][${request_id}] inserting notification`, {
+    recipient_user_id: payload.recipient_user_id,
+    actor_user_id: payload.actor_user_id,
+    type: payload.type,
+    post_id: payload.post_id,
+    comment_id: payload.comment_id,
+    group_key: payload.group_key,
+  });
+
+  const insertPayload = {
     recipient_user_id: payload.recipient_user_id,
     actor_user_id: payload.actor_user_id,
     actor_name: payload.actor_name ?? null,
@@ -211,7 +227,21 @@ async function createNotification(
     comment_id: payload.comment_id ?? null,
     parent_comment_id: payload.parent_comment_id ?? null,
     group_key: payload.group_key,
-  });
+  };
+
+  const { data, error } = await sb(env).from("notifications").insert(insertPayload).select("id");
+
+  if (error) {
+    console.error(`[notif][${request_id}] INSERT FAILED`, {
+      code: error.code,
+      message: error.message,
+      details: error.details,
+      hint: error.hint,
+      payload: insertPayload,
+    });
+  } else {
+    console.log(`[notif][${request_id}] INSERT SUCCESS`, { data });
+  }
 }
 
 // --------- routes ----------
@@ -245,7 +275,7 @@ export default {
           return ok(req, env, request_id, { user_id, token });
         }
 
-        // /api/posts (GET) - filter by ?id=, ?user_id=, ?author_id=, ?room_id=, ?limit=
+        // /api/posts (GET) - filter by ?id=, ?user_id=, ?author_id=, ?room_id=, ?limit=, ?actor_id=
         if (path === "/api/posts" && req.method === "GET") {
           const handlerStart = Date.now();
           // Parse all query params
@@ -254,6 +284,7 @@ export default {
           const author_id_param = url.searchParams.get("author_id");
           const room_id_param = url.searchParams.get("room_id");
           const limit_param = url.searchParams.get("limit");
+          const actor_id_param = url.searchParams.get("actor_id")?.trim() || null;
 
           // Build base query
           let q = sb(env)
@@ -301,7 +332,11 @@ export default {
           // Fetch media for all posts
           const postIds = (posts ?? []).map((p: any) => p.id);
           let mediaByPost: Record<number, any[]> = {};
+          let likeCounts: Record<number, number> = {};
+          let likedByActorSet = new Set<number>();
+
           if (postIds.length > 0) {
+            // Fetch media
             t1 = Date.now();
             const { data: mediaRows } = await sb(env)
               .from("media")
@@ -312,12 +347,39 @@ export default {
               if (!mediaByPost[m.post_id]) mediaByPost[m.post_id] = [];
               mediaByPost[m.post_id].push(m);
             }
+
+            // Fetch like counts grouped by post_id
+            t1 = Date.now();
+            const { data: likeCountRows } = await sb(env)
+              .from("post_likes")
+              .select("post_id")
+              .in("post_id", postIds);
+            console.log(`[perf] /api/posts like_counts ${Date.now() - t1}ms`, { rows: likeCountRows?.length });
+            for (const row of likeCountRows ?? []) {
+              likeCounts[row.post_id] = (likeCounts[row.post_id] || 0) + 1;
+            }
+
+            // Fetch liked_by_me for actor_id
+            if (actor_id_param) {
+              t1 = Date.now();
+              const { data: likedRows } = await sb(env)
+                .from("post_likes")
+                .select("post_id")
+                .in("post_id", postIds)
+                .eq("actor_id", actor_id_param);
+              console.log(`[perf] /api/posts liked_by_me ${Date.now() - t1}ms`, { rows: likedRows?.length });
+              for (const row of likedRows ?? []) {
+                likedByActorSet.add(row.post_id);
+              }
+            }
           }
 
-          // Enrich posts with media
+          // Enrich posts with media, like_count, liked_by_me
           const enrichedPosts = (posts ?? []).map((p: any) => ({
             ...p,
             media: mediaByPost[p.id] || [],
+            like_count: likeCounts[p.id] || 0,
+            liked_by_me: likedByActorSet.has(p.id),
           }));
 
           console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms`, { id: id_param, posts: enrichedPosts.length });
@@ -340,6 +402,18 @@ export default {
           const author_name = typeof body?.author_name === "string" ? body.author_name : null;
           const author_avatar = typeof body?.author_avatar === "string" ? body.author_avatar : null;
           const room_id = typeof body?.room_id === "string" ? body.room_id : null;
+
+          // Parse reply/share fields with robust numeric coercion
+          const rawParentPostId = body?.parent_post_id;
+          const parent_post_id = rawParentPostId != null ? (Number.isFinite(Number(rawParentPostId)) ? Number(rawParentPostId) : null) : null;
+
+          const rawPostType = body?.post_type;
+          const post_type = typeof rawPostType === "string" && ["status", "share", "thread"].includes(rawPostType)
+            ? rawPostType
+            : "status";
+
+          const rawSharedPostId = body?.shared_post_id;
+          const shared_post_id = rawSharedPostId != null ? (Number.isFinite(Number(rawSharedPostId)) ? Number(rawSharedPostId) : null) : null;
 
           // Parse optional media array
           const mediaInput = Array.isArray(body?.media) ? body.media : [];
@@ -405,7 +479,18 @@ export default {
 
           const { data, error } = await sb(env)
             .from("posts")
-            .insert({ user_id, content, title, author_id, author_name, author_avatar, room_id })
+            .insert({
+              user_id,
+              content,
+              title,
+              author_id,
+              author_name,
+              author_avatar,
+              room_id,
+              parent_post_id,
+              post_type,
+              shared_post_id,
+            })
             .select("*")
             .single();
           if (error) throw error;
@@ -430,6 +515,45 @@ export default {
               .select("*");
             if (mediaError) throw mediaError;
             mediaRows = insertedMedia ?? [];
+          }
+
+          // Create notification for replies (if this is a reply to another post)
+          if (parent_post_id) {
+            // Fetch the parent post owner's user_id (NOT author_id/persona)
+            const { data: parentPost, error: parentFetchError } = await sb(env)
+              .from("posts")
+              .select("user_id, author_id")
+              .eq("id", parent_post_id)
+              .single();
+
+            if (parentFetchError) {
+              console.error(`[notif][${request_id}] failed to fetch parent post owner`, { parent_post_id, error: parentFetchError });
+            }
+
+            // Use user_id (JWT sub) for notification recipient, NOT author_id (persona)
+            if (parentPost?.user_id && parentPost.user_id !== user_id) {
+              console.log(`[notif] creating post_reply`, {
+                request_id,
+                parent_post_id,
+                actor_user_id: user_id,
+                recipient_user_id: parentPost.user_id,
+                actor_persona_id: author_id,
+                parent_author_id: parentPost.author_id,
+              });
+              await createNotification(env, {
+                recipient_user_id: parentPost.user_id,  // JWT sub of parent post owner
+                actor_user_id: user_id,                  // JWT sub of replier
+                actor_name: author_name,
+                actor_avatar: author_avatar,
+                type: "post_reply",
+                post_id: parent_post_id, // Link to parent so notification opens the thread
+                group_key: `post_reply:${parent_post_id}`,
+              }, request_id);
+            } else if (!parentPost?.user_id) {
+              console.warn(`[notif][${request_id}] parent post user_id not found, skipping notification`, { parent_post_id });
+            } else {
+              console.log(`[notif][${request_id}] skipping self-reply`, { parent_post_id, user_id });
+            }
           }
 
           return ok(req, env, request_id, { post: { ...data, media: mediaRows } }, 201);
@@ -894,7 +1018,7 @@ export default {
                 post_id,
                 comment_id: data.id,
                 group_key: `pc:${post_id}`,
-              });
+              }, request_id);
             }
           } else {
             // Reply to a comment -> notify parent comment owner
@@ -914,7 +1038,7 @@ export default {
                 comment_id: data.id,
                 parent_comment_id,
                 group_key: `rp:${parent_comment_id}`,
-              });
+              }, request_id);
             }
           }
 
@@ -979,7 +1103,7 @@ export default {
                     comment_id,
                     parent_comment_id: commentData.parent_comment_id,
                     group_key: `cl:${comment_id}`,
-                  });
+                  }, request_id);
                 }
                 console.log(`[perf] /api/comments/:id/like POST notification ${Date.now() - t1}ms`);
               }
@@ -1000,6 +1124,117 @@ export default {
               if (error) throw error;
 
               console.log(`[perf] /api/comments/:id/like DELETE total ${Date.now() - handlerStart}ms`, { comment_id });
+              return ok(req, env, request_id, { liked: false });
+            }
+
+            throw new HttpError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+          }
+        }
+
+        // /api/posts/:id/like (POST = like, DELETE = unlike) - IDEMPOTENT, actor-based
+        {
+          const m = path.match(/^\/api\/posts\/(\d+)\/like$/);
+          if (m) {
+            const handlerStart = Date.now();
+            const post_id = Number(m[1]);
+
+            if (!Number.isFinite(post_id)) {
+              throw new HttpError(400, "BAD_REQUEST", "invalid post_id");
+            }
+
+            // POST = ensure liked (idempotent)
+            if (req.method === "POST") {
+              // Get JWT user_id for notifications
+              const jwt_user_id = await requireAuth(req, env);
+
+              // Parse actor fields from request body (for post_likes table and UI display)
+              const body = (await req.json().catch(() => ({}))) as any;
+              const actor_id = typeof body?.actor_id === "string" ? body.actor_id.trim() : null;
+              const actor_name = typeof body?.actor_name === "string" ? body.actor_name : null;
+              const actor_avatar = typeof body?.actor_avatar === "string" ? body.actor_avatar : null;
+
+              if (!actor_id) {
+                throw new HttpError(400, "BAD_REQUEST", "actor_id is required");
+              }
+
+              // Single upsert - no-op if already liked (ignoreDuplicates)
+              let t1 = Date.now();
+              const { data, error: insertError } = await sb(env)
+                .from("post_likes")
+                .upsert(
+                  { post_id, actor_id, actor_name, actor_avatar },
+                  { onConflict: "post_id,actor_id", ignoreDuplicates: true }
+                )
+                .select("post_id");
+              const wasInserted = (data?.length ?? 0) > 0;
+              console.log(`[perf] /api/posts/:id/like POST upsert ${Date.now() - t1}ms`, { post_id, wasInserted });
+
+              if (insertError) throw insertError;
+
+              // Create notification if this was a new like
+              if (wasInserted) {
+                t1 = Date.now();
+                // Fetch the post owner's user_id (NOT author_id/persona)
+                const { data: postData, error: postFetchError } = await sb(env)
+                  .from("posts")
+                  .select("user_id, author_id")
+                  .eq("id", post_id)
+                  .single();
+
+                if (postFetchError) {
+                  console.error(`[notif][${request_id}] failed to fetch post owner`, { post_id, error: postFetchError });
+                }
+
+                // Use user_id (JWT sub) for notification recipient, NOT author_id (persona)
+                if (postData?.user_id && postData.user_id !== jwt_user_id) {
+                  console.log(`[notif] creating post_like`, {
+                    request_id,
+                    post_id,
+                    actor_user_id: jwt_user_id,
+                    recipient_user_id: postData.user_id,
+                    actor_persona_id: actor_id,
+                    post_author_id: postData.author_id,
+                  });
+                  await createNotification(env, {
+                    recipient_user_id: postData.user_id,  // JWT sub of post owner
+                    actor_user_id: jwt_user_id,           // JWT sub of liker
+                    actor_name,
+                    actor_avatar,
+                    type: "post_like",
+                    post_id,
+                    group_key: `post_like:${post_id}`,
+                  }, request_id);
+                } else if (!postData?.user_id) {
+                  console.warn(`[notif][${request_id}] post user_id not found, skipping notification`, { post_id });
+                } else {
+                  console.log(`[notif][${request_id}] skipping self-like`, { post_id, user_id: jwt_user_id });
+                }
+                console.log(`[perf] /api/posts/:id/like POST notification ${Date.now() - t1}ms`);
+              }
+
+              console.log(`[perf] /api/posts/:id/like POST total ${Date.now() - handlerStart}ms`, { post_id });
+              return ok(req, env, request_id, { liked: true }, wasInserted ? 201 : 200);
+            }
+
+            // DELETE = ensure unliked (idempotent)
+            if (req.method === "DELETE") {
+              // Parse actor_id from query param
+              const actor_id = url.searchParams.get("actor_id")?.trim() || null;
+
+              if (!actor_id) {
+                throw new HttpError(400, "BAD_REQUEST", "actor_id query param is required");
+              }
+
+              const t1 = Date.now();
+              const { error } = await sb(env)
+                .from("post_likes")
+                .delete()
+                .eq("post_id", post_id)
+                .eq("actor_id", actor_id);
+              console.log(`[perf] /api/posts/:id/like DELETE ${Date.now() - t1}ms`, { post_id });
+              if (error) throw error;
+
+              console.log(`[perf] /api/posts/:id/like DELETE total ${Date.now() - handlerStart}ms`, { post_id });
               return ok(req, env, request_id, { liked: false });
             }
 
@@ -1143,6 +1378,28 @@ export default {
           if (error) throw error;
 
           return ok(req, env, request_id, { unread_count: count ?? 0 });
+        }
+
+        // GET /api/debug/notifications?type=post_like&limit=20 (DEV ONLY - no auth)
+        if (path === "/api/debug/notifications" && req.method === "GET") {
+          const type = url.searchParams.get("type") || null;
+          const limit = Math.min(Number(url.searchParams.get("limit")) || 20, 100);
+          const post_id = url.searchParams.get("post_id") || null;
+
+          let query = sb(env)
+            .from("notifications")
+            .select("*")
+            .order("created_at", { ascending: false })
+            .limit(limit);
+
+          if (type) query = query.eq("type", type);
+          if (post_id) query = query.eq("post_id", Number(post_id));
+
+          const { data, error } = await query;
+          if (error) throw error;
+
+          console.log(`[debug] /api/debug/notifications`, { type, limit, post_id, count: data?.length });
+          return ok(req, env, request_id, { notifications: data ?? [], count: data?.length ?? 0 });
         }
 
         // POST /api/upload-url -> presigned PUT URL for R2
