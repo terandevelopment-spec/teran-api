@@ -380,12 +380,20 @@ export default {
           }
 
           // Enrich posts with media, like_count, liked_by_me
-          const enrichedPosts = (posts ?? []).map((p: any) => ({
-            ...p,
-            media: mediaByPost[p.id] || [],
-            like_count: likeCounts[p.id] || 0,
-            liked_by_me: likedByActorSet.has(p.id),
-          }));
+          // Sanitize author_avatar: strip data URIs to prevent MB-sized payloads
+          const enrichedPosts = (posts ?? []).map((p: any) => {
+            let avatar = p.author_avatar;
+            if (typeof avatar === "string" && avatar.startsWith("data:")) {
+              avatar = null; // Strip data URI, let frontend use fallback
+            }
+            return {
+              ...p,
+              author_avatar: avatar,
+              media: mediaByPost[p.id] || [],
+              like_count: likeCounts[p.id] || 0,
+              liked_by_me: likedByActorSet.has(p.id),
+            };
+          });
 
           const payloadSize = JSON.stringify(enrichedPosts).length;
           console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms`, { id: id_param, posts: enrichedPosts.length, payloadBytes: payloadSize });
@@ -406,7 +414,12 @@ export default {
           const title = typeof body?.title === "string" ? body.title.trim() : "";
           const author_id = typeof body?.author_id === "string" ? body.author_id : null;
           const author_name = typeof body?.author_name === "string" ? body.author_name : null;
-          const author_avatar = typeof body?.author_avatar === "string" ? body.author_avatar : null;
+          const rawAuthorAvatar = typeof body?.author_avatar === "string" ? body.author_avatar : null;
+          // Reject data URIs to prevent storing MB-sized base64 in DB
+          if (rawAuthorAvatar && rawAuthorAvatar.startsWith("data:")) {
+            throw new HttpError(422, "VALIDATION_ERROR", "author_avatar must be a URL, not a data URI");
+          }
+          const author_avatar = rawAuthorAvatar;
           const room_id = typeof body?.room_id === "string" ? body.room_id : null;
 
           // Parse reply/share fields with robust numeric coercion
@@ -899,7 +912,12 @@ export default {
           // author_id is always set to user_id from auth (canonical account id)
           const author_id = user_id;
           const author_name = typeof body?.author_name === "string" ? body.author_name : null;
-          const author_avatar = typeof body?.author_avatar === "string" ? body.author_avatar : null;
+          const rawAuthorAvatar = typeof body?.author_avatar === "string" ? body.author_avatar : null;
+          // Reject data URIs to prevent storing MB-sized base64 in DB
+          if (rawAuthorAvatar && rawAuthorAvatar.startsWith("data:")) {
+            throw new HttpError(422, "VALIDATION_ERROR", "author_avatar must be a URL, not a data URI");
+          }
+          const author_avatar = rawAuthorAvatar;
 
           // Validate media array (same limits as posts for images)
           const MAX_COMMENT_IMAGES = 4;
@@ -1841,19 +1859,56 @@ export default {
         }
 
         // GET /api/blocks/relations?user_ids=a,b,c - Check mutual blocks for filtering
+        // CACHED: 60s TTL using Cloudflare Cache API
         if (path === "/api/blocks/relations" && req.method === "GET") {
+          const BLOCKS_CACHE_TTL_SECONDS = 60;
+          const handlerStart = Date.now();
+
           const my_user_id = await requireAuth(req, env);
 
+          // Normalize user_ids: split, trim, filter, dedupe, sort
           const userIdsParam = url.searchParams.get("user_ids") || "";
-          const userIds = userIdsParam
-            .split(",")
-            .map(s => s.trim())
-            .filter(s => s.length > 0)
-            .slice(0, 200);
+          const userIds = [...new Set(
+            userIdsParam
+              .split(",")
+              .map(s => s.trim())
+              .filter(s => s.length > 0)
+          )].sort().slice(0, 200);
 
+          // Fast path: empty list
           if (userIds.length === 0) {
+            console.log(`[perf] /api/blocks/relations EMPTY ${Date.now() - handlerStart}ms`);
             return ok(req, env, request_id, { blocked_user_ids: [] });
           }
+
+          // Build stable cache key: hash of requester + normalized ids
+          const cacheKeyData = `blocks:${my_user_id}:${userIds.join(",")}`;
+          const cacheKeyHash = await sha256Hex(cacheKeyData);
+          const cacheUrl = new URL(req.url);
+          cacheUrl.pathname = `/cache/blocks/${cacheKeyHash}`;
+          cacheUrl.search = "";
+          const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+
+          // Try cache first
+          const cache = caches.default;
+          let cachedResponse = await cache.match(cacheKey);
+          if (cachedResponse) {
+            console.log(`[perf] /api/blocks/relations CACHE_HIT ${Date.now() - handlerStart}ms`, { user: my_user_id, ids: userIds.length });
+            // Clone and return with fresh headers
+            const body = await cachedResponse.text();
+            return new Response(body, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+                "X-Cache": "HIT",
+                ...corsHeaders(req, env),
+              },
+            });
+          }
+
+          // Cache miss: query DB
+          const t1 = Date.now();
 
           // Users I blocked
           const { data: iBlocked, error: e1 } = await sb(env)
@@ -1875,7 +1930,37 @@ export default {
           for (const row of iBlocked ?? []) blockedSet.add(row.blocked_user_id);
           for (const row of blockedMe ?? []) blockedSet.add(row.blocker_user_id);
 
-          return ok(req, env, request_id, { blocked_user_ids: Array.from(blockedSet) });
+          const responseData = { blocked_user_ids: Array.from(blockedSet), request_id };
+          const responseBody = JSON.stringify(responseData);
+
+          console.log(`[perf] /api/blocks/relations CACHE_MISS db_query ${Date.now() - t1}ms total ${Date.now() - handlerStart}ms`, { user: my_user_id, ids: userIds.length, blocked: blockedSet.size });
+
+          // Create response for cache (must be cloneable)
+          const response = new Response(responseBody, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              "X-Request-Id": request_id,
+              "X-Cache": "MISS",
+              "Cache-Control": `public, max-age=${BLOCKS_CACHE_TTL_SECONDS}`,
+              ...corsHeaders(req, env),
+            },
+          });
+
+          // Store in cache (non-blocking)
+          const responseToCache = new Response(responseBody, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              "Cache-Control": `public, max-age=${BLOCKS_CACHE_TTL_SECONDS}`,
+            },
+          });
+          // Use waitUntil if available, otherwise fire-and-forget
+          cache.put(cacheKey, responseToCache).catch(err => {
+            console.error("[cache] blocks/relations cache.put failed", err);
+          });
+
+          return response;
         }
 
         // =====================================================
@@ -2260,7 +2345,12 @@ export default {
           const parent_comment_id =
             typeof body?.parent_comment_id === "number" ? body.parent_comment_id : null;
           const author_name = typeof body?.author_name === "string" ? body.author_name : null;
-          const author_avatar = typeof body?.author_avatar === "string" ? body.author_avatar : null;
+          const rawNewsAuthorAvatar = typeof body?.author_avatar === "string" ? body.author_avatar : null;
+          // Reject data URIs to prevent storing MB-sized base64 in DB
+          if (rawNewsAuthorAvatar && rawNewsAuthorAvatar.startsWith("data:")) {
+            throw new HttpError(422, "VALIDATION_ERROR", "author_avatar must be a URL, not a data URI");
+          }
+          const author_avatar = rawNewsAuthorAvatar;
 
           console.log("[news-notif] parsed parent_comment_id:", parent_comment_id);
 
