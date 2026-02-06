@@ -1900,9 +1900,29 @@ export default {
 
         // GET /api/blocks/relations?user_ids=a,b,c - Check mutual blocks for filtering
         // CACHED: 60s TTL using Cloudflare Cache API
+        //
+        // ─── Safari DevTools fetch() snippet ───────────────────────────────
+        // This endpoint uses Authorization Bearer token (NOT cookies).
+        // When copying from Safari Network tab, use these options:
+        //
+        //   fetch("https://teran-api.teran-development.workers.dev/api/blocks/relations?user_ids=a,b,c", {
+        //     method: "GET",
+        //     mode: "cors",
+        //     headers: {
+        //       "Authorization": "Bearer YOUR_TOKEN",
+        //       "Accept": "application/json"
+        //     }
+        //   }).then(r => r.json()).then(console.log);
+        //
+        // Do NOT use credentials: "include" — it causes CORS errors.
+        // ────────────────────────────────────────────────────────────────────
         if (path === "/api/blocks/relations" && req.method === "GET") {
           const BLOCKS_CACHE_TTL_SECONDS = 60;
           const handlerStart = Date.now();
+
+          // Debug: confirm auth header is present on original request
+          const hasAuth = req.headers.has("Authorization");
+          console.log(`[debug] blocks/relations auth header present=${hasAuth} rid=${request_id}`);
 
           const my_user_id = await requireAuth(req, env);
 
@@ -1917,7 +1937,7 @@ export default {
 
           // Fast path: empty list
           if (userIds.length === 0) {
-            console.log(`[perf] /api/blocks/relations EMPTY ${Date.now() - handlerStart}ms`);
+            console.log(`[cache] blocks/relations SKIP_EMPTY rid=${request_id}`);
             return ok(req, env, request_id, { blocked_user_ids: [] });
           }
 
@@ -1928,15 +1948,14 @@ export default {
           cacheUrl.pathname = `/cache/blocks/${cacheKeyHash}`;
           cacheUrl.search = "";
           const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
-          console.log(`[cache] blocks/relations key=${cacheUrl.pathname}`);
 
           // Try cache first
           const cache = caches.default;
-          let cachedResponse = await cache.match(cacheKey);
-          console.log(`[cache] blocks/relations match ${cachedResponse ? "HIT" : "MISS"}`);
+          const cachedResponse = await cache.match(cacheKey);
+
           if (cachedResponse) {
-            console.log(`[perf] /api/blocks/relations CACHE_HIT ${Date.now() - handlerStart}ms`, { user: my_user_id, ids: userIds.length });
-            // Clone and return with fresh headers
+            // ─── CACHE HIT ───
+            console.log(`[cache] blocks/relations match HIT hash=${cacheKeyHash.slice(0, 12)} rid=${request_id}`);
             const body = await cachedResponse.text();
             return new Response(body, {
               status: 200,
@@ -1944,15 +1963,18 @@ export default {
                 "Content-Type": "application/json",
                 "X-Request-Id": request_id,
                 "X-Cache": "HIT",
+                "X-Cache-Key": cacheKeyHash.slice(0, 12),
                 ...corsHeaders(req, env),
               },
             });
           }
 
-          // Cache miss: query DB
+          // ─── CACHE MISS ───
+          console.log(`[cache] blocks/relations match MISS hash=${cacheKeyHash.slice(0, 12)} rid=${request_id}`);
+
+          // Query DB
           const t1 = Date.now();
 
-          // Users I blocked
           const { data: iBlocked, error: e1 } = await sb(env)
             .from("blocks")
             .select("blocked_user_id")
@@ -1960,7 +1982,6 @@ export default {
             .in("blocked_user_id", userIds);
           if (e1) throw e1;
 
-          // Users who blocked me
           const { data: blockedMe, error: e2 } = await sb(env)
             .from("blocks")
             .select("blocker_user_id")
@@ -1975,21 +1996,22 @@ export default {
           const responseData = { blocked_user_ids: Array.from(blockedSet), request_id };
           const responseBody = JSON.stringify(responseData);
 
-          console.log(`[perf] /api/blocks/relations CACHE_MISS db_query ${Date.now() - t1}ms total ${Date.now() - handlerStart}ms`, { user: my_user_id, ids: userIds.length, blocked: blockedSet.size });
+          console.log(`[perf] blocks/relations db=${Date.now() - t1}ms total=${Date.now() - handlerStart}ms rid=${request_id}`);
 
-          // Create response for cache (must be cloneable)
+          // Response to client
           const response = new Response(responseBody, {
             status: 200,
             headers: {
               "Content-Type": "application/json",
               "X-Request-Id": request_id,
               "X-Cache": "MISS",
+              "X-Cache-Key": cacheKeyHash.slice(0, 12),
               "Cache-Control": `public, max-age=${BLOCKS_CACHE_TTL_SECONDS}`,
               ...corsHeaders(req, env),
             },
           });
 
-          // Store in cache (await to ensure logs are visible)
+          // Store in cache (await to ensure logs are visible before response)
           const responseToCache = new Response(responseBody, {
             status: 200,
             headers: {
@@ -1999,9 +2021,9 @@ export default {
           });
           try {
             await cache.put(cacheKey, responseToCache);
-            console.log(`[cache] blocks/relations put OK`);
+            console.log(`[cache] blocks/relations put OK hash=${cacheKeyHash.slice(0, 12)} rid=${request_id}`);
           } catch (err) {
-            console.error(`[cache] blocks/relations put FAIL`, err);
+            console.error(`[cache] blocks/relations put FAIL hash=${cacheKeyHash.slice(0, 12)} rid=${request_id}`, err);
           }
 
           return response;
