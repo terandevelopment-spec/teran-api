@@ -190,7 +190,7 @@ async function createNotification(
     actor_user_id: string;
     actor_name?: string | null;
     actor_avatar?: string | null;
-    type: "comment_like" | "reply" | "post_comment" | "post_like" | "post_reply";
+    type: "comment_like" | "reply" | "post_comment" | "post_like" | "post_reply" | "news_comment_like" | "news_comment_reply";
     post_id?: number;
     comment_id?: number;
     parent_comment_id?: number;
@@ -286,10 +286,15 @@ export default {
           const limit_param = url.searchParams.get("limit");
           const actor_id_param = url.searchParams.get("actor_id")?.trim() || null;
 
-          // Build base query
+          // Build base query with conditional select:
+          // - Feed lists: exclude heavy `content` field to reduce payload (~1.5MB -> ~50KB)
+          // - Single post by id: include full data for PostDetail
+          const feedSelectFields = "id,user_id,created_at,title,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id";
+          const selectFields = id_param ? "*" : feedSelectFields;
+
           let q = sb(env)
             .from("posts")
-            .select("*")
+            .select(selectFields)
             .order("created_at", { ascending: false });
 
           // Apply filters - priority: id > user_id > author_id > default
@@ -382,7 +387,8 @@ export default {
             liked_by_me: likedByActorSet.has(p.id),
           }));
 
-          console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms`, { id: id_param, posts: enrichedPosts.length });
+          const payloadSize = JSON.stringify(enrichedPosts).length;
+          console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms`, { id: id_param, posts: enrichedPosts.length, payloadBytes: payloadSize });
           return ok(req, env, request_id, { posts: enrichedPosts });
         }
 
@@ -2244,7 +2250,7 @@ export default {
         if (path === "/api/news/comments" && req.method === "POST") {
           console.log("[NEWS COMMENT CREATE] hit");
           const user_id = await requireAuth(req, env);
-          console.log("[NEWS COMMENT CREATE] user_id:", user_id);
+          console.log("[news-notif] HIT /api/news/comments", { request_id, user_id, parent_comment_id: "(pending body parse)" });
 
           const body = (await req.json().catch(() => null)) as any;
           console.log("[NEWS COMMENT CREATE] body:", JSON.stringify(body));
@@ -2255,6 +2261,8 @@ export default {
             typeof body?.parent_comment_id === "number" ? body.parent_comment_id : null;
           const author_name = typeof body?.author_name === "string" ? body.author_name : null;
           const author_avatar = typeof body?.author_avatar === "string" ? body.author_avatar : null;
+
+          console.log("[news-notif] parsed parent_comment_id:", parent_comment_id);
 
           if (!news_url) {
             throw new HttpError(400, "BAD_REQUEST", "news_url is required");
@@ -2297,6 +2305,43 @@ export default {
           }
 
           console.log("[NEWS COMMENT CREATE] success, id:", data?.id);
+
+          // Create notification for reply to a news comment
+          if (parent_comment_id) {
+            console.log("[news-notif] parent_comment_id is set, fetching parent owner");
+            try {
+              const { data: parentComment, error: parentFetchErr } = await sb(env)
+                .from("news_comments")
+                .select("user_id, news_id")
+                .eq("id", parent_comment_id)
+                .single();
+
+              console.log("[news-notif] parentComment fetch result:", { parentComment, error: parentFetchErr?.message });
+
+              if (parentComment?.user_id && parentComment.user_id !== user_id) {
+                const notifPayload = {
+                  recipient_user_id: parentComment.user_id,
+                  actor_user_id: user_id,
+                  actor_name: author_name,
+                  actor_avatar: author_avatar,
+                  type: "news_comment_reply" as const,
+                  comment_id: data.id,
+                  parent_comment_id: parent_comment_id,
+                  group_key: `ncr:${parent_comment_id}`,
+                };
+                console.log("[news-notif] about to createNotification", notifPayload);
+                await createNotification(env, notifPayload, request_id);
+                console.log("[news-notif] createNotification succeeded for news_comment_reply");
+              } else {
+                console.log("[news-notif] skipping notification: self or no owner", { parentUserId: parentComment?.user_id, actorUserId: user_id });
+              }
+            } catch (notifErr) {
+              console.error(`[news-notif] news_comment_reply notification FAILED`, String(notifErr));
+            }
+          } else {
+            console.log("[news-notif] no parent_comment_id, skipping reply notification");
+          }
+
           return ok(req, env, request_id, {
             comment: { ...data, like_count: 0, liked_by_me: false }
           }, 201);
@@ -2340,6 +2385,7 @@ export default {
           if (m && req.method === "POST") {
             const user_id = await requireAuth(req, env);
             const comment_id = Number(m[1]);
+            console.log("[news-notif] HIT /api/news/comments/:id/like", { request_id, user_id, comment_id });
 
             if (!Number.isFinite(comment_id)) {
               throw new HttpError(400, "BAD_REQUEST", "Invalid comment_id");
@@ -2362,6 +2408,47 @@ export default {
             }
 
             if (insertError) throw insertError;
+
+            // Create notification for news comment like
+            console.log("[news-notif] like inserted, fetching comment owner");
+            try {
+              const { data: likedComment, error: likedFetchErr } = await sb(env)
+                .from("news_comments")
+                .select("user_id, news_id, author_name, author_avatar")
+                .eq("id", comment_id)
+                .single();
+
+              console.log("[news-notif] likedComment fetch result:", { likedComment, error: likedFetchErr?.message });
+
+              if (likedComment?.user_id && likedComment.user_id !== user_id) {
+                // Fetch actor info from user_profiles
+                const { data: actorProfile } = await sb(env)
+                  .from("user_profiles")
+                  .select("display_name, avatar_key")
+                  .eq("user_id", user_id)
+                  .single();
+
+                console.log("[news-notif] actorProfile:", actorProfile);
+
+                const notifPayload = {
+                  recipient_user_id: likedComment.user_id,
+                  actor_user_id: user_id,
+                  actor_name: actorProfile?.display_name ?? null,
+                  actor_avatar: actorProfile?.avatar_key ?? null,
+                  type: "news_comment_like" as const,
+                  comment_id: comment_id,
+                  group_key: `ncl:${comment_id}`,
+                };
+                console.log("[news-notif] about to createNotification", notifPayload);
+                await createNotification(env, notifPayload, request_id);
+                console.log("[news-notif] createNotification succeeded for news_comment_like");
+              } else {
+                console.log("[news-notif] skipping notification: self or no owner", { likedUserId: likedComment?.user_id, actorUserId: user_id });
+              }
+            } catch (notifErr) {
+              console.error(`[news-notif] news_comment_like notification FAILED`, String(notifErr));
+            }
+
             return ok(req, env, request_id, { liked: true }, 201);
           }
         }
