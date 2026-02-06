@@ -331,52 +331,87 @@ export default {
 
           let t1 = Date.now();
           const { data: posts, error } = await q;
-          console.log(`[perf] /api/posts posts_query ${Date.now() - t1}ms`, { id: id_param, count: posts?.length });
+          const postsQueryMs = Date.now() - t1;
+          console.log(`[perf] /api/posts posts_query ${postsQueryMs}ms`, { id: id_param, count: posts?.length });
           if (error) throw error;
 
-          // Fetch media for all posts
+          // Fast path: no posts => return immediately
           const postIds = (posts ?? []).map((p: any) => p.id);
-          let mediaByPost: Record<number, any[]> = {};
-          let likeCounts: Record<number, number> = {};
-          let likedByActorSet = new Set<number>();
+          if (postIds.length === 0) {
+            console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms (empty)`);
+            return ok(req, env, request_id, { posts: [] });
+          }
 
-          if (postIds.length > 0) {
-            // Fetch media
-            t1 = Date.now();
-            const { data: mediaRows } = await sb(env)
+          // Parallel fetch: media, like_counts, liked_by_me
+          // Optimized: run all 3 queries concurrently with Promise.all
+          const parallelStart = Date.now();
+          let mediaMs = 0, likesMs = 0, likedByMeMs = 0;
+
+          // Prepare query promises
+          const mediaQuery = (async () => {
+            const t = Date.now();
+            // Select only fields needed for feed thumbnails
+            const { data } = await sb(env)
               .from("media")
-              .select("id, post_id, type, key, thumb_key, width, height, bytes, duration_ms")
+              .select("id, post_id, type, key, thumb_key, width, height, duration_ms")
               .in("post_id", postIds);
-            console.log(`[perf] /api/posts media_query ${Date.now() - t1}ms`, { mediaCount: mediaRows?.length });
-            for (const m of mediaRows ?? []) {
-              if (!mediaByPost[m.post_id]) mediaByPost[m.post_id] = [];
-              mediaByPost[m.post_id].push(m);
-            }
+            mediaMs = Date.now() - t;
+            return data ?? [];
+          })();
 
-            // Fetch like counts grouped by post_id
-            t1 = Date.now();
-            const { data: likeCountRows } = await sb(env)
+          const likesQuery = (async () => {
+            const t = Date.now();
+            // Fetch all like rows and count in JS (Supabase doesn't support GROUP BY aggregation directly)
+            const { data } = await sb(env)
               .from("post_likes")
               .select("post_id")
               .in("post_id", postIds);
-            console.log(`[perf] /api/posts like_counts ${Date.now() - t1}ms`, { rows: likeCountRows?.length });
-            for (const row of likeCountRows ?? []) {
-              likeCounts[row.post_id] = (likeCounts[row.post_id] || 0) + 1;
-            }
+            likesMs = Date.now() - t;
+            return data ?? [];
+          })();
 
-            // Fetch liked_by_me for actor_id
-            if (actor_id_param) {
-              t1 = Date.now();
-              const { data: likedRows } = await sb(env)
-                .from("post_likes")
-                .select("post_id")
-                .in("post_id", postIds)
-                .eq("actor_id", actor_id_param);
-              console.log(`[perf] /api/posts liked_by_me ${Date.now() - t1}ms`, { rows: likedRows?.length });
-              for (const row of likedRows ?? []) {
-                likedByActorSet.add(row.post_id);
-              }
-            }
+          const likedByMeQuery = actor_id_param ? (async () => {
+            const t = Date.now();
+            const { data } = await sb(env)
+              .from("post_likes")
+              .select("post_id")
+              .in("post_id", postIds)
+              .eq("actor_id", actor_id_param);
+            likedByMeMs = Date.now() - t;
+            return data ?? [];
+          })() : Promise.resolve([]);
+
+          // Execute all queries in parallel
+          const [mediaRows, likeRows, likedRows] = await Promise.all([
+            mediaQuery,
+            likesQuery,
+            likedByMeQuery,
+          ]);
+          const parallelMs = Date.now() - parallelStart;
+
+          console.log(`[perf] /api/posts parallel_queries ${parallelMs}ms`, {
+            media: mediaMs,
+            likes: likesMs,
+            likedByMe: likedByMeMs,
+            mediaCount: mediaRows.length,
+            likeRows: likeRows.length,
+          });
+
+          // Process results
+          const mediaByPost: Record<number, any[]> = {};
+          for (const m of mediaRows) {
+            if (!mediaByPost[m.post_id]) mediaByPost[m.post_id] = [];
+            mediaByPost[m.post_id].push(m);
+          }
+
+          const likeCounts: Record<number, number> = {};
+          for (const row of likeRows) {
+            likeCounts[row.post_id] = (likeCounts[row.post_id] || 0) + 1;
+          }
+
+          const likedByActorSet = new Set<number>();
+          for (const row of likedRows) {
+            likedByActorSet.add(row.post_id);
           }
 
           // Enrich posts with media, like_count, liked_by_me
@@ -396,7 +431,12 @@ export default {
           });
 
           const payloadSize = JSON.stringify(enrichedPosts).length;
-          console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms`, { id: id_param, posts: enrichedPosts.length, payloadBytes: payloadSize });
+          console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms`, {
+            posts_query: postsQueryMs,
+            parallel: parallelMs,
+            posts: enrichedPosts.length,
+            payloadBytes: payloadSize,
+          });
           return ok(req, env, request_id, { posts: enrichedPosts });
         }
 
