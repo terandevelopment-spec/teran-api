@@ -2014,7 +2014,7 @@ export default {
           return !error && (count ?? 0) > 0;
         }
 
-        // POST /api/echoes - Echo a user - OPTIMIZED
+        // POST /api/echoes - Echo a user - ATOMIC (single RPC call)
         if (path === "/api/echoes" && req.method === "POST") {
           const handlerStart = Date.now();
 
@@ -2034,30 +2034,30 @@ export default {
             throw new HttpError(400, "BAD_REQUEST", "Cannot echo yourself");
           }
 
-          // Block enforcement: check mutual block (required for safety)
+          // ATOMIC: Single RPC call that checks blocks + inserts if allowed
           t1 = Date.now();
-          if (await isMutuallyBlocked(user_id, echoed_user_id)) {
-            console.log(`[perf] POST /api/echoes block_check ${Date.now() - t1}ms (blocked)`);
+          const { data, error } = await sb(env).rpc("echo_user_if_not_blocked", {
+            p_user_id: user_id,
+            p_echoed_user_id: echoed_user_id,
+          });
+          const rpcMs = Date.now() - t1;
+
+          if (error) {
+            console.log(`[perf] POST /api/echoes rpc ${rpcMs}ms (error: ${error.message})`);
+            throw error;
+          }
+
+          // RPC returns array with single row: { status: 'OK'|'BLOCKED', was_inserted: boolean }
+          const result = data?.[0] ?? { status: "OK", was_inserted: false };
+
+          if (result.status === "BLOCKED") {
+            console.log(`[perf] POST /api/echoes rpc ${rpcMs}ms (blocked)`);
             throw new HttpError(403, "BLOCKED", "Cannot echo a blocked user");
           }
-          console.log(`[perf] POST /api/echoes block_check ${Date.now() - t1}ms`);
 
-          // Upsert (idempotent - no-op if already echoing)
-          t1 = Date.now();
-          const { data, error } = await sb(env)
-            .from("echoes")
-            .upsert(
-              { user_id, echoed_user_id },
-              { onConflict: "user_id,echoed_user_id", ignoreDuplicates: true }
-            )
-            .select("echoed_user_id");
-          const wasInserted = (data?.length ?? 0) > 0;
-          console.log(`[perf] POST /api/echoes upsert ${Date.now() - t1}ms`, { wasInserted });
-
-          if (error) throw error;
-
+          console.log(`[perf] POST /api/echoes rpc ${rpcMs}ms`, { wasInserted: result.was_inserted });
           console.log(`[perf] POST /api/echoes total ${Date.now() - handlerStart}ms`);
-          return ok(req, env, request_id, { ok: true }, wasInserted ? 201 : 200);
+          return ok(req, env, request_id, { ok: true }, result.was_inserted ? 201 : 200);
         }
 
         // DELETE /api/echoes/:userId - Un-echo a user
