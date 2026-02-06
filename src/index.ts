@@ -21,6 +21,7 @@ function corsHeaders(req: Request, env: Env) {
     "Access-Control-Allow-Origin": allowed === "null" ? "*" : allowed,
     "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Expose-Headers": "X-Cache, X-Cache-Key, X-Request-Id, Cache-Control",
     "Access-Control-Max-Age": "86400",
   };
 }
@@ -1903,18 +1904,23 @@ export default {
         //
         // ─── Safari DevTools fetch() snippet ───────────────────────────────
         // This endpoint uses Authorization Bearer token (NOT cookies).
-        // When copying from Safari Network tab, use these options:
+        // Do NOT use credentials: "include" — it causes CORS errors.
+        // To force MISS in manual tests, add cache: "no-store".
         //
-        //   fetch("https://teran-api.teran-development.workers.dev/api/blocks/relations?user_ids=a,b,c", {
+        //   const r = await fetch("https://teran-api.teran-development.workers.dev/api/blocks/relations?user_ids=a,b,c", {
         //     method: "GET",
         //     mode: "cors",
+        //     cache: "no-store", // remove this to observe HIT on 2nd call
         //     headers: {
         //       "Authorization": "Bearer YOUR_TOKEN",
         //       "Accept": "application/json"
         //     }
-        //   }).then(r => r.json()).then(console.log);
+        //   });
+        //   console.log("x-cache:", r.headers.get("x-cache"));
+        //   console.log("x-cache-key:", r.headers.get("x-cache-key"));
+        //   console.log("x-request-id:", r.headers.get("x-request-id"));
+        //   console.log(await r.json());
         //
-        // Do NOT use credentials: "include" — it causes CORS errors.
         // ────────────────────────────────────────────────────────────────────
         if (path === "/api/blocks/relations" && req.method === "GET") {
           const BLOCKS_CACHE_TTL_SECONDS = 60;
@@ -2011,7 +2017,7 @@ export default {
             },
           });
 
-          // Store in cache (await to ensure logs are visible before response)
+          // Store in cache (fire-and-forget, logs via .then/.catch)
           const responseToCache = new Response(responseBody, {
             status: 200,
             headers: {
@@ -2019,12 +2025,11 @@ export default {
               "Cache-Control": `public, max-age=${BLOCKS_CACHE_TTL_SECONDS}`,
             },
           });
-          try {
-            await cache.put(cacheKey, responseToCache);
+          cache.put(cacheKey, responseToCache).then(() => {
             console.log(`[cache] blocks/relations put OK hash=${cacheKeyHash.slice(0, 12)} rid=${request_id}`);
-          } catch (err) {
+          }).catch((err) => {
             console.error(`[cache] blocks/relations put FAIL hash=${cacheKeyHash.slice(0, 12)} rid=${request_id}`, err);
-          }
+          });
 
           return response;
         }
