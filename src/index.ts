@@ -246,7 +246,7 @@ async function createNotification(
 
 // --------- routes ----------
 export default {
-  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(req: Request, env: Env): Promise<Response> {
     const request_id = getReqId();
     const t0 = Date.now();
 
@@ -1922,11 +1922,12 @@ export default {
           }
 
           // Build stable cache key: hash of requester + normalized ids
-          // Use a hardcoded origin to ensure match/put use identical keys
           const cacheKeyData = `blocks:${my_user_id}:${userIds.join(",")}`;
           const cacheKeyHash = await sha256Hex(cacheKeyData);
-          const cacheKeyUrl = `https://cache.internal/blocks/${cacheKeyHash}`;
-          const cacheKey = new Request(cacheKeyUrl);
+          const cacheUrl = new URL(req.url);
+          cacheUrl.pathname = `/cache/blocks/${cacheKeyHash}`;
+          cacheUrl.search = "";
+          const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
           // Try cache first
           const cache = caches.default;
@@ -1986,7 +1987,7 @@ export default {
             },
           });
 
-          // Store in cache using waitUntil to ensure write completes
+          // Store in cache (non-blocking)
           const responseToCache = new Response(responseBody, {
             status: 200,
             headers: {
@@ -1994,8 +1995,10 @@ export default {
               "Cache-Control": `public, max-age=${BLOCKS_CACHE_TTL_SECONDS}`,
             },
           });
-          ctx.waitUntil(cache.put(cacheKey, responseToCache.clone()));
-          console.log("[cache] blocks/relations put scheduled", { key: cacheKey.url });
+          // Use waitUntil if available, otherwise fire-and-forget
+          cache.put(cacheKey, responseToCache).catch(err => {
+            console.error("[cache] blocks/relations cache.put failed", err);
+          });
 
           return response;
         }
@@ -2014,7 +2017,7 @@ export default {
           return !error && (count ?? 0) > 0;
         }
 
-        // POST /api/echoes - Echo a user - ATOMIC (single RPC call)
+        // POST /api/echoes - Echo a user - OPTIMIZED
         if (path === "/api/echoes" && req.method === "POST") {
           const handlerStart = Date.now();
 
@@ -2034,30 +2037,30 @@ export default {
             throw new HttpError(400, "BAD_REQUEST", "Cannot echo yourself");
           }
 
-          // ATOMIC: Single RPC call that checks blocks + inserts if allowed
+          // Block enforcement: check mutual block (required for safety)
           t1 = Date.now();
-          const { data, error } = await sb(env).rpc("echo_user_if_not_blocked", {
-            p_user_id: user_id,
-            p_echoed_user_id: echoed_user_id,
-          });
-          const rpcMs = Date.now() - t1;
-
-          if (error) {
-            console.log(`[perf] POST /api/echoes rpc ${rpcMs}ms (error: ${error.message})`);
-            throw error;
-          }
-
-          // RPC returns array with single row: { status: 'OK'|'BLOCKED', was_inserted: boolean }
-          const result = data?.[0] ?? { status: "OK", was_inserted: false };
-
-          if (result.status === "BLOCKED") {
-            console.log(`[perf] POST /api/echoes rpc ${rpcMs}ms (blocked)`);
+          if (await isMutuallyBlocked(user_id, echoed_user_id)) {
+            console.log(`[perf] POST /api/echoes block_check ${Date.now() - t1}ms (blocked)`);
             throw new HttpError(403, "BLOCKED", "Cannot echo a blocked user");
           }
+          console.log(`[perf] POST /api/echoes block_check ${Date.now() - t1}ms`);
 
-          console.log(`[perf] POST /api/echoes rpc ${rpcMs}ms`, { wasInserted: result.was_inserted });
+          // Upsert (idempotent - no-op if already echoing)
+          t1 = Date.now();
+          const { data, error } = await sb(env)
+            .from("echoes")
+            .upsert(
+              { user_id, echoed_user_id },
+              { onConflict: "user_id,echoed_user_id", ignoreDuplicates: true }
+            )
+            .select("echoed_user_id");
+          const wasInserted = (data?.length ?? 0) > 0;
+          console.log(`[perf] POST /api/echoes upsert ${Date.now() - t1}ms`, { wasInserted });
+
+          if (error) throw error;
+
           console.log(`[perf] POST /api/echoes total ${Date.now() - handlerStart}ms`);
-          return ok(req, env, request_id, { ok: true }, result.was_inserted ? 201 : 200);
+          return ok(req, env, request_id, { ok: true }, wasInserted ? 201 : 200);
         }
 
         // DELETE /api/echoes/:userId - Un-echo a user
