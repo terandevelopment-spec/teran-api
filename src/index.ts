@@ -1928,10 +1928,12 @@ export default {
           cacheUrl.pathname = `/cache/blocks/${cacheKeyHash}`;
           cacheUrl.search = "";
           const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+          console.log(`[cache] blocks/relations key=${cacheUrl.pathname}`);
 
           // Try cache first
           const cache = caches.default;
           let cachedResponse = await cache.match(cacheKey);
+          console.log(`[cache] blocks/relations match ${cachedResponse ? "HIT" : "MISS"}`);
           if (cachedResponse) {
             console.log(`[perf] /api/blocks/relations CACHE_HIT ${Date.now() - handlerStart}ms`, { user: my_user_id, ids: userIds.length });
             // Clone and return with fresh headers
@@ -1996,8 +1998,10 @@ export default {
             },
           });
           // Use waitUntil if available, otherwise fire-and-forget
-          cache.put(cacheKey, responseToCache).catch(err => {
-            console.error("[cache] blocks/relations cache.put failed", err);
+          cache.put(cacheKey, responseToCache).then(() => {
+            console.log(`[cache] blocks/relations put OK`);
+          }).catch(err => {
+            console.error(`[cache] blocks/relations put FAIL`, err);
           });
 
           return response;
