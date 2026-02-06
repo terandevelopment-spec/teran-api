@@ -246,7 +246,7 @@ async function createNotification(
 
 // --------- routes ----------
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const request_id = getReqId();
     const t0 = Date.now();
 
@@ -1922,12 +1922,11 @@ export default {
           }
 
           // Build stable cache key: hash of requester + normalized ids
+          // Use a hardcoded origin to ensure match/put use identical keys
           const cacheKeyData = `blocks:${my_user_id}:${userIds.join(",")}`;
           const cacheKeyHash = await sha256Hex(cacheKeyData);
-          const cacheUrl = new URL(req.url);
-          cacheUrl.pathname = `/cache/blocks/${cacheKeyHash}`;
-          cacheUrl.search = "";
-          const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+          const cacheKeyUrl = `https://cache.internal/blocks/${cacheKeyHash}`;
+          const cacheKey = new Request(cacheKeyUrl);
 
           // Try cache first
           const cache = caches.default;
@@ -1987,7 +1986,7 @@ export default {
             },
           });
 
-          // Store in cache (non-blocking)
+          // Store in cache using waitUntil to ensure write completes
           const responseToCache = new Response(responseBody, {
             status: 200,
             headers: {
@@ -1995,10 +1994,8 @@ export default {
               "Cache-Control": `public, max-age=${BLOCKS_CACHE_TTL_SECONDS}`,
             },
           });
-          // Use waitUntil if available, otherwise fire-and-forget
-          cache.put(cacheKey, responseToCache).catch(err => {
-            console.error("[cache] blocks/relations cache.put failed", err);
-          });
+          ctx.waitUntil(cache.put(cacheKey, responseToCache.clone()));
+          console.log("[cache] blocks/relations put scheduled", { key: cacheKey.url });
 
           return response;
         }
