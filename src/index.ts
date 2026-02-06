@@ -1989,7 +1989,7 @@ export default {
             },
           });
 
-          // Store in cache (non-blocking)
+          // Store in cache (await to ensure logs are visible)
           const responseToCache = new Response(responseBody, {
             status: 200,
             headers: {
@@ -1997,12 +1997,12 @@ export default {
               "Cache-Control": `public, max-age=${BLOCKS_CACHE_TTL_SECONDS}`,
             },
           });
-          // Use waitUntil if available, otherwise fire-and-forget
-          cache.put(cacheKey, responseToCache).then(() => {
+          try {
+            await cache.put(cacheKey, responseToCache);
             console.log(`[cache] blocks/relations put OK`);
-          }).catch(err => {
+          } catch (err) {
             console.error(`[cache] blocks/relations put FAIL`, err);
-          });
+          }
 
           return response;
         }
