@@ -2367,36 +2367,48 @@ export default {
             return ok(req, env, request_id, { comments: [] });
           }
 
-          // Get like counts
+          // Get like counts, liked_by_me, and media in parallel
           const commentIds = commentList.map((c: any) => c.id);
-          const { data: likesData } = await sb(env)
-            .from("news_comment_likes")
-            .select("comment_id")
-            .in("comment_id", commentIds);
+          const [likesResult, userLikesResult, mediaResult] = await Promise.all([
+            sb(env)
+              .from("news_comment_likes")
+              .select("comment_id")
+              .in("comment_id", commentIds),
+            current_user_id
+              ? sb(env)
+                .from("news_comment_likes")
+                .select("comment_id")
+                .in("comment_id", commentIds)
+                .eq("user_id", current_user_id)
+              : Promise.resolve({ data: [] }),
+            sb(env)
+              .from("media")
+              .select("id, news_comment_id, type, key, thumb_key, width, height, bytes, duration_ms")
+              .in("news_comment_id", commentIds),
+          ]);
 
           const likeCounts: Record<number, number> = {};
-          for (const like of likesData ?? []) {
+          for (const like of likesResult.data ?? []) {
             likeCounts[like.comment_id] = (likeCounts[like.comment_id] || 0) + 1;
           }
 
-          // Get liked_by_me
           const likedByMe: Set<number> = new Set();
-          if (current_user_id) {
-            const { data: userLikes } = await sb(env)
-              .from("news_comment_likes")
-              .select("comment_id")
-              .in("comment_id", commentIds)
-              .eq("user_id", current_user_id);
-            for (const like of userLikes ?? []) {
-              likedByMe.add(like.comment_id);
-            }
+          for (const like of userLikesResult.data ?? []) {
+            likedByMe.add(like.comment_id);
           }
 
-          // Enrich comments
+          const mediaByComment: Record<number, any[]> = {};
+          for (const m of mediaResult.data ?? []) {
+            if (!mediaByComment[m.news_comment_id]) mediaByComment[m.news_comment_id] = [];
+            mediaByComment[m.news_comment_id].push(m);
+          }
+
+          // Enrich comments with likes + media
           const enrichedComments = commentList.map((c: any) => ({
             ...c,
             like_count: likeCounts[c.id] || 0,
             liked_by_me: likedByMe.has(c.id),
+            media: mediaByComment[c.id] || [],
           }));
 
           return ok(req, env, request_id, { comments: enrichedComments });
@@ -2428,8 +2440,65 @@ export default {
           if (!news_url) {
             throw new HttpError(400, "BAD_REQUEST", "news_url is required");
           }
-          if (!content) {
-            throw new HttpError(400, "BAD_REQUEST", "content is required");
+          // Allow content to be empty if media is provided (media-only comment)
+          const mediaInput = Array.isArray(body?.media) ? body.media : [];
+          if (!content && mediaInput.length === 0) {
+            throw new HttpError(400, "BAD_REQUEST", "content or media is required");
+          }
+
+          // Validate media items (same rules as post media)
+          const MAX_NC_IMAGES = 4;
+          const MAX_NC_VIDEOS = 1;
+          const validatedMedia: Array<{
+            type: "image" | "video";
+            key: string;
+            thumb_key?: string | null;
+            width?: number | null;
+            height?: number | null;
+            bytes?: number | null;
+            duration_ms?: number | null;
+          }> = [];
+
+          let ncImageCount = 0;
+          let ncVideoCount = 0;
+          for (const m of mediaInput) {
+            const mType = m?.type;
+            const mKey = m?.key;
+            const mThumbKey = m?.thumb_key;
+            if (!mType || !mKey || typeof mKey !== "string" || !mKey.trim()) {
+              throw new HttpError(422, "VALIDATION_ERROR", "Each media item must have type and key");
+            }
+            if (mType === "image") {
+              ncImageCount++;
+              if (ncImageCount > MAX_NC_IMAGES) {
+                throw new HttpError(422, "VALIDATION_ERROR", `Maximum ${MAX_NC_IMAGES} images allowed`);
+              }
+              if (!mThumbKey || typeof mThumbKey !== "string" || !mThumbKey.trim()) {
+                throw new HttpError(422, "VALIDATION_ERROR", "thumb_key is required for images");
+              }
+              validatedMedia.push({
+                type: "image",
+                key: mKey.trim(),
+                thumb_key: mThumbKey.trim(),
+                width: typeof m?.width === "number" ? m.width : null,
+                height: typeof m?.height === "number" ? m.height : null,
+                bytes: typeof m?.bytes === "number" ? m.bytes : null,
+              });
+            } else if (mType === "video") {
+              ncVideoCount++;
+              if (ncVideoCount > MAX_NC_VIDEOS) {
+                throw new HttpError(422, "VALIDATION_ERROR", `Maximum ${MAX_NC_VIDEOS} video allowed`);
+              }
+              validatedMedia.push({
+                type: "video",
+                key: mKey.trim(),
+                thumb_key: mThumbKey ? mThumbKey.trim() : null,
+                bytes: typeof m?.bytes === "number" ? m.bytes : null,
+                duration_ms: typeof m?.duration_ms === "number" ? m.duration_ms : null,
+              });
+            } else {
+              throw new HttpError(422, "VALIDATION_ERROR", "Media type must be 'image' or 'video'");
+            }
           }
 
           // Normalize URL and compute news_id
@@ -2449,7 +2518,7 @@ export default {
             author_id: user_id,
             author_name,
             author_avatar,
-            content,
+            content: content || "",
             parent_comment_id,
           };
           console.log("[NEWS COMMENT CREATE] insertPayload:", JSON.stringify(insertPayload));
@@ -2466,6 +2535,32 @@ export default {
           }
 
           console.log("[NEWS COMMENT CREATE] success, id:", data?.id);
+
+          // Insert media rows into unified 'media' table with news_comment_id
+          let mediaRows: any[] = [];
+          if (validatedMedia.length > 0) {
+            const newsCommentId = data.id;
+            const mediaInsert = validatedMedia.map((m) => ({
+              news_comment_id: newsCommentId,
+              type: m.type,
+              key: m.key,
+              thumb_key: m.thumb_key,
+              width: m.width ?? null,
+              height: m.height ?? null,
+              bytes: m.bytes ?? null,
+              duration_ms: m.duration_ms ?? null,
+            }));
+            const { data: insertedMedia, error: mediaError } = await sb(env)
+              .from("media")
+              .insert(mediaInsert)
+              .select("*");
+            if (mediaError) {
+              console.error("[NEWS COMMENT CREATE] media insert error:", mediaError.message);
+              throw mediaError;
+            }
+            mediaRows = insertedMedia ?? [];
+            console.log("[NEWS COMMENT CREATE] media inserted:", mediaRows.length);
+          }
 
           // Create notification for reply to a news comment
           if (parent_comment_id) {
@@ -2504,7 +2599,7 @@ export default {
           }
 
           return ok(req, env, request_id, {
-            comment: { ...data, like_count: 0, liked_by_me: false }
+            comment: { ...data, like_count: 0, liked_by_me: false, media: mediaRows }
           }, 201);
         }
 
