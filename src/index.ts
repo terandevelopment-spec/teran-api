@@ -288,9 +288,9 @@ export default {
           const actor_id_param = url.searchParams.get("actor_id")?.trim() || null;
 
           // Build base query with conditional select:
-          // - Feed lists: exclude heavy `content` field to reduce payload (~1.5MB -> ~50KB)
+          // - Feed lists: lightweight select (content included for card preview)
           // - Single post by id: include full data for PostDetail
-          const feedSelectFields = "id,user_id,created_at,title,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id";
+          const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id";
           const selectFields = id_param ? "*" : feedSelectFields;
 
           let q = sb(env)
