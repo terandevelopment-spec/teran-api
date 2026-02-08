@@ -2471,7 +2471,7 @@ export default {
           const news_url = typeof body?.news_url === "string" ? body.news_url.trim() : "";
           const content = typeof body?.content === "string" ? body.content.trim() : "";
           const parent_comment_id =
-            typeof body?.parent_comment_id === "number" ? body.parent_comment_id : null;
+            body?.parent_comment_id != null ? Number(body.parent_comment_id) || null : null;
           const author_name = typeof body?.author_name === "string" ? body.author_name : null;
           const rawNewsAuthorAvatar = typeof body?.author_avatar === "string" ? body.author_avatar : null;
           // Reject data URIs to prevent storing MB-sized base64 in DB
