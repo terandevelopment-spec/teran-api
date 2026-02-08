@@ -202,15 +202,14 @@ async function createNotification(
   },
   request_id?: string
 ) {
-  console.log("[createNotification called]", {
+  console.log("[NOTIF DEBUG] incoming payload", {
     type: payload.type,
-    actor_user_id: payload.actor_user_id,
-    recipient_user_id: payload.recipient_user_id,
+    news_id: payload.news_id,
     post_id: payload.post_id,
     comment_id: payload.comment_id,
     parent_comment_id: payload.parent_comment_id,
-    news_id: payload.news_id,
-    news_url: payload.news_url,
+    recipient_user_id: payload.recipient_user_id,
+    actor_user_id: payload.actor_user_id,
   });
   // Skip self-notification
   if (payload.recipient_user_id === payload.actor_user_id) {
@@ -234,6 +233,7 @@ async function createNotification(
       group_key: `news:${payload.news_id ?? "unknown"}:${payload.type}`,
     };
 
+    console.log(`[NOTIF DEBUG] final insert payload`, { type: newsInsert.type, news_id: newsInsert.news_id, recipient_user_id: newsInsert.recipient_user_id });
     console.log(`[NEWS NOTIF CREATE] about to insert`, newsInsert);
 
     const { data: newsData, error: newsError } = await sb(env)
@@ -279,6 +279,7 @@ async function createNotification(
     news_url: payload.news_url ?? null,
   };
 
+  console.log(`[NOTIF DEBUG] final insert payload`, { type: insertPayload.type, news_id: insertPayload.news_id, post_id: insertPayload.post_id, recipient_user_id: insertPayload.recipient_user_id });
   const { data, error } = await sb(env).from("notifications").insert(insertPayload).select("id");
 
   if (error) {
