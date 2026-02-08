@@ -195,6 +195,8 @@ async function createNotification(
     post_id?: number;
     comment_id?: number;
     parent_comment_id?: number;
+    news_id?: string;
+    news_url?: string;
     group_key: string;
     snippet?: string | null;
   },
@@ -228,6 +230,8 @@ async function createNotification(
     comment_id: payload.comment_id ?? null,
     parent_comment_id: payload.parent_comment_id ?? null,
     group_key: payload.group_key,
+    news_id: payload.news_id ?? null,
+    news_url: payload.news_url ?? null,
   };
 
   const { data, error } = await sb(env).from("notifications").insert(insertPayload).select("id");
@@ -1351,14 +1355,22 @@ export default {
             return cleaned.slice(0, maxLen - 1) + "…";
           };
 
-          // Collect all comment IDs we need to fetch
+          // Collect comment IDs for thread/post comments
           const commentIdSet = new Set<number>();
+          // Collect comment IDs for news comments (separate table)
+          const newsCommentIdSet = new Set<number>();
           for (const n of notifications) {
-            if (n.comment_id) commentIdSet.add(n.comment_id);
-            if (n.parent_comment_id) commentIdSet.add(n.parent_comment_id);
+            const isNews = typeof n.type === "string" && n.type.startsWith("news_");
+            if (isNews) {
+              if (n.comment_id) newsCommentIdSet.add(n.comment_id);
+              if (n.parent_comment_id) newsCommentIdSet.add(n.parent_comment_id);
+            } else {
+              if (n.comment_id) commentIdSet.add(n.comment_id);
+              if (n.parent_comment_id) commentIdSet.add(n.parent_comment_id);
+            }
           }
 
-          // Fetch all needed comments in one query
+          // Fetch thread/post comments in one query
           let commentsMap: Record<number, string> = {};
           if (commentIdSet.size > 0) {
             const { data: commentsData } = await sb(env)
@@ -1370,19 +1382,40 @@ export default {
             }
           }
 
+          // Fetch news comments in one query
+          let newsCommentsMap: Record<number, string> = {};
+          if (newsCommentIdSet.size > 0) {
+            const { data: newsCommentsData } = await sb(env)
+              .from("news_comments")
+              .select("id, content")
+              .in("id", Array.from(newsCommentIdSet));
+            for (const c of newsCommentsData ?? []) {
+              newsCommentsMap[c.id] = c.content;
+            }
+          }
+
           // Enrich notifications with primary_text and secondary_text
           const enriched = notifications.map((n: any) => {
             let primary_text: string | null = null;
             let secondary_text: string | null = null;
+            const isNews = typeof n.type === "string" && n.type.startsWith("news_");
 
-            // primary_text = excerpt of n.comment_id content
-            if (n.comment_id && commentsMap[n.comment_id]) {
-              primary_text = excerpt(commentsMap[n.comment_id]);
-            }
-
-            // secondary_text = excerpt of n.parent_comment_id content (only for reply)
-            if (n.type === "reply" && n.parent_comment_id && commentsMap[n.parent_comment_id]) {
-              secondary_text = excerpt(commentsMap[n.parent_comment_id]);
+            if (isNews) {
+              // For news notifications: primary_text = comment content, secondary_text = parent comment content (for replies)
+              if (n.comment_id && newsCommentsMap[n.comment_id]) {
+                primary_text = excerpt(newsCommentsMap[n.comment_id]);
+              }
+              if (n.type === "news_comment_reply" && n.parent_comment_id && newsCommentsMap[n.parent_comment_id]) {
+                secondary_text = excerpt(newsCommentsMap[n.parent_comment_id]);
+              }
+            } else {
+              // Existing behavior for thread/post comments
+              if (n.comment_id && commentsMap[n.comment_id]) {
+                primary_text = excerpt(commentsMap[n.comment_id]);
+              }
+              if (n.type === "reply" && n.parent_comment_id && commentsMap[n.parent_comment_id]) {
+                secondary_text = excerpt(commentsMap[n.parent_comment_id]);
+              }
             }
 
             return {
@@ -1397,6 +1430,8 @@ export default {
               post_id: n.post_id,
               comment_id: n.comment_id,
               parent_comment_id: n.parent_comment_id,
+              news_id: n.news_id ?? null,
+              news_url: n.news_url ?? null,
               primary_text,
               secondary_text,
             };
@@ -2568,7 +2603,7 @@ export default {
             try {
               const { data: parentComment, error: parentFetchErr } = await sb(env)
                 .from("news_comments")
-                .select("user_id, news_id")
+                .select("user_id, news_id, news_url")
                 .eq("id", parent_comment_id)
                 .single();
 
@@ -2583,6 +2618,8 @@ export default {
                   type: "news_comment_reply" as const,
                   comment_id: data.id,
                   parent_comment_id: parent_comment_id,
+                  news_id: parentComment.news_id,
+                  news_url: parentComment.news_url,
                   group_key: `ncr:${parent_comment_id}`,
                 };
                 console.log("[news-notif] about to createNotification", notifPayload);
@@ -2670,7 +2707,7 @@ export default {
             try {
               const { data: likedComment, error: likedFetchErr } = await sb(env)
                 .from("news_comments")
-                .select("user_id, news_id, author_name, author_avatar")
+                .select("user_id, news_id, news_url, author_name, author_avatar")
                 .eq("id", comment_id)
                 .single();
 
@@ -2693,6 +2730,8 @@ export default {
                   actor_avatar: actorProfile?.avatar_key ?? null,
                   type: "news_comment_like" as const,
                   comment_id: comment_id,
+                  news_id: likedComment.news_id,
+                  news_url: likedComment.news_url,
                   group_key: `ncl:${comment_id}`,
                 };
                 console.log("[news-notif] about to createNotification", notifPayload);
