@@ -202,6 +202,16 @@ async function createNotification(
   },
   request_id?: string
 ) {
+  console.log("[createNotification called]", {
+    type: payload.type,
+    actor_user_id: payload.actor_user_id,
+    recipient_user_id: payload.recipient_user_id,
+    post_id: payload.post_id,
+    comment_id: payload.comment_id,
+    parent_comment_id: payload.parent_comment_id,
+    news_id: payload.news_id,
+    news_url: payload.news_url,
+  });
   // Skip self-notification
   if (payload.recipient_user_id === payload.actor_user_id) {
     console.log(`[notif][${request_id}] skipping self-notification`, {
