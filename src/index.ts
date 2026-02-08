@@ -2632,6 +2632,12 @@ export default {
                   news_url: parentComment.news_url,
                   group_key: `ncr:${parent_comment_id}`,
                 };
+                console.log("[NEWS REPLY] about to notify", {
+                  parent_comment_id,
+                  news_id: parentComment?.news_id,
+                  actor_user_id: user_id,
+                  recipient_user_id: parentComment?.user_id,
+                });
                 console.log("[news-notif] about to createNotification", notifPayload);
                 await createNotification(env, notifPayload, request_id);
                 console.log("[news-notif] createNotification succeeded for news_comment_reply");
@@ -2744,6 +2750,12 @@ export default {
                   news_url: likedComment.news_url,
                   group_key: `ncl:${comment_id}`,
                 };
+                console.log("[NEWS LIKE] about to notify", {
+                  comment_id,
+                  news_id: likedComment?.news_id,
+                  actor_user_id: user_id,
+                  recipient_user_id: likedComment?.user_id,
+                });
                 console.log("[news-notif] about to createNotification", notifPayload);
                 await createNotification(env, notifPayload, request_id);
                 console.log("[news-notif] createNotification succeeded for news_comment_like");
