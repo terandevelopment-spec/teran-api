@@ -221,6 +221,41 @@ async function createNotification(
     return;
   }
 
+  // ── NEWS comment notifications: dedicated insert path ──
+  if (payload.type === "news_comment_reply" || payload.type === "news_comment_like") {
+    const newsInsert = {
+      recipient_user_id: payload.recipient_user_id,
+      actor_user_id: payload.actor_user_id,
+      actor_name: payload.actor_name ?? null,
+      actor_avatar: payload.actor_avatar ?? null,
+      type: payload.type,
+      news_id: payload.news_id ?? null,
+      news_url: payload.news_url ?? null,
+      group_key: `news:${payload.news_id ?? "unknown"}:${payload.type}`,
+    };
+
+    console.log(`[NEWS NOTIF CREATE] about to insert`, newsInsert);
+
+    const { data: newsData, error: newsError } = await sb(env)
+      .from("notifications")
+      .insert(newsInsert)
+      .select("id");
+
+    if (newsError) {
+      console.error(`[NEWS NOTIF CREATE] INSERT FAILED`, {
+        code: newsError.code,
+        message: newsError.message,
+        details: newsError.details,
+        hint: newsError.hint,
+        payload: newsInsert,
+      });
+    } else {
+      console.log(`[NEWS NOTIF CREATE] INSERT SUCCESS`, { id: newsData });
+    }
+    return;
+  }
+
+  // ── Post / comment notifications: existing logic ──
   console.log(`[notif][${request_id}] inserting notification`, {
     recipient_user_id: payload.recipient_user_id,
     actor_user_id: payload.actor_user_id,
