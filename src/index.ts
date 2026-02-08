@@ -191,26 +191,18 @@ async function createNotification(
     actor_user_id: string;
     actor_name?: string | null;
     actor_avatar?: string | null;
-    type: "comment_like" | "reply" | "post_comment" | "post_like" | "post_reply" | "news_comment_like" | "news_comment_reply";
+    type: "comment_like" | "reply" | "post_comment" | "post_like" | "post_reply";
     post_id?: number;
     comment_id?: number;
     parent_comment_id?: number;
     news_id?: string;
-    news_url?: string;
+
     group_key: string;
     snippet?: string | null;
   },
   request_id?: string
 ) {
-  console.log("[NOTIF DEBUG] incoming payload", {
-    type: payload.type,
-    news_id: payload.news_id,
-    post_id: payload.post_id,
-    comment_id: payload.comment_id,
-    parent_comment_id: payload.parent_comment_id,
-    recipient_user_id: payload.recipient_user_id,
-    actor_user_id: payload.actor_user_id,
-  });
+
   // Skip self-notification
   if (payload.recipient_user_id === payload.actor_user_id) {
     console.log(`[notif][${request_id}] skipping self-notification`, {
@@ -220,42 +212,7 @@ async function createNotification(
     return;
   }
 
-  // ── NEWS comment notifications: dedicated insert path ──
-  if (payload.type === "news_comment_reply" || payload.type === "news_comment_like") {
-    const newsInsert = {
-      recipient_user_id: payload.recipient_user_id,
-      actor_user_id: payload.actor_user_id,
-      actor_name: payload.actor_name ?? null,
-      actor_avatar: payload.actor_avatar ?? null,
-      type: payload.type,
-      news_id: payload.news_id ?? null,
-      news_url: payload.news_url ?? null,
-      group_key: `news:${payload.news_id ?? "unknown"}:${payload.type}`,
-    };
 
-    console.log(`[NOTIF DEBUG] final insert payload`, { type: newsInsert.type, news_id: newsInsert.news_id, recipient_user_id: newsInsert.recipient_user_id });
-    console.log(`[NEWS NOTIF CREATE] about to insert`, newsInsert);
-
-    const { data: newsData, error: newsError } = await sb(env)
-      .from("notifications")
-      .insert(newsInsert)
-      .select("id");
-
-    if (newsError) {
-      console.error(`[NEWS NOTIF CREATE] INSERT FAILED`, {
-        code: newsError.code,
-        message: newsError.message,
-        details: newsError.details,
-        hint: newsError.hint,
-        payload: newsInsert,
-      });
-    } else {
-      console.log(`[NEWS NOTIF CREATE] INSERT SUCCESS`, { id: newsData });
-    }
-    return;
-  }
-
-  // ── Post / comment notifications: existing logic ──
   console.log(`[notif][${request_id}] inserting notification`, {
     recipient_user_id: payload.recipient_user_id,
     actor_user_id: payload.actor_user_id,
@@ -276,10 +233,9 @@ async function createNotification(
     parent_comment_id: payload.parent_comment_id ?? null,
     group_key: payload.group_key,
     news_id: payload.news_id ?? null,
-    news_url: payload.news_url ?? null,
   };
 
-  console.log(`[NOTIF DEBUG] final insert payload`, { type: insertPayload.type, news_id: insertPayload.news_id, post_id: insertPayload.post_id, recipient_user_id: insertPayload.recipient_user_id });
+
   const { data, error } = await sb(env).from("notifications").insert(insertPayload).select("id");
 
   if (error) {
@@ -1403,65 +1359,48 @@ export default {
 
           // Collect comment IDs for thread/post comments
           const commentIdSet = new Set<number>();
-          // Collect comment IDs for news comments (separate table)
-          const newsCommentIdSet = new Set<number>();
           for (const n of notifications) {
-            const isNews = typeof n.type === "string" && n.type.startsWith("news_");
-            if (isNews) {
-              if (n.comment_id) newsCommentIdSet.add(n.comment_id);
-              if (n.parent_comment_id) newsCommentIdSet.add(n.parent_comment_id);
-            } else {
-              if (n.comment_id) commentIdSet.add(n.comment_id);
-              if (n.parent_comment_id) commentIdSet.add(n.parent_comment_id);
-            }
+            if (n.comment_id) commentIdSet.add(n.comment_id);
+            if (n.parent_comment_id) commentIdSet.add(n.parent_comment_id);
           }
 
           // Fetch thread/post comments in one query
           let commentsMap: Record<number, string> = {};
-          if (commentIdSet.size > 0) {
+          const postCommentIds = Array.from(commentIdSet);
+          if (postCommentIds.length > 0) {
             const { data: commentsData } = await sb(env)
               .from("comments")
               .select("id, content")
-              .in("id", Array.from(commentIdSet));
+              .in("id", postCommentIds);
             for (const c of commentsData ?? []) {
               commentsMap[c.id] = c.content;
             }
           }
 
-          // Fetch news comments in one query
-          let newsCommentsMap: Record<number, string> = {};
-          if (newsCommentIdSet.size > 0) {
+          // For IDs not found in comments table, try news_comments table
+          const missingIds = postCommentIds.filter(id => !(id in commentsMap));
+          if (missingIds.length > 0) {
             const { data: newsCommentsData } = await sb(env)
               .from("news_comments")
               .select("id, content")
-              .in("id", Array.from(newsCommentIdSet));
+              .in("id", missingIds);
             for (const c of newsCommentsData ?? []) {
-              newsCommentsMap[c.id] = c.content;
+              commentsMap[c.id] = c.content;
             }
           }
+
+
 
           // Enrich notifications with primary_text and secondary_text
           const enriched = notifications.map((n: any) => {
             let primary_text: string | null = null;
             let secondary_text: string | null = null;
-            const isNews = typeof n.type === "string" && n.type.startsWith("news_");
 
-            if (isNews) {
-              // For news notifications: primary_text = comment content, secondary_text = parent comment content (for replies)
-              if (n.comment_id && newsCommentsMap[n.comment_id]) {
-                primary_text = excerpt(newsCommentsMap[n.comment_id]);
-              }
-              if (n.type === "news_comment_reply" && n.parent_comment_id && newsCommentsMap[n.parent_comment_id]) {
-                secondary_text = excerpt(newsCommentsMap[n.parent_comment_id]);
-              }
-            } else {
-              // Existing behavior for thread/post comments
-              if (n.comment_id && commentsMap[n.comment_id]) {
-                primary_text = excerpt(commentsMap[n.comment_id]);
-              }
-              if (n.type === "reply" && n.parent_comment_id && commentsMap[n.parent_comment_id]) {
-                secondary_text = excerpt(commentsMap[n.parent_comment_id]);
-              }
+            if (n.comment_id && commentsMap[n.comment_id]) {
+              primary_text = excerpt(commentsMap[n.comment_id]);
+            }
+            if (n.type === "reply" && n.parent_comment_id && commentsMap[n.parent_comment_id]) {
+              secondary_text = excerpt(commentsMap[n.parent_comment_id]);
             }
 
             return {
@@ -2499,7 +2438,7 @@ export default {
         if (path === "/api/news/comments" && req.method === "POST") {
           console.log("[NEWS COMMENT CREATE] hit");
           const user_id = await requireAuth(req, env);
-          console.log("[news-notif] HIT /api/news/comments", { request_id, user_id, parent_comment_id: "(pending body parse)" });
+
 
           const body = (await req.json().catch(() => null)) as any;
           console.log("[NEWS COMMENT CREATE] body:", JSON.stringify(body));
@@ -2523,7 +2462,7 @@ export default {
           }
           const author_avatar = rawNewsAuthorAvatar;
 
-          console.log("[news-notif] parsed parent_comment_id:", parent_comment_id);
+
 
           if (!news_url) {
             throw new HttpError(400, "BAD_REQUEST", "news_url is required");
@@ -2650,48 +2589,30 @@ export default {
             console.log("[NEWS COMMENT CREATE] media inserted:", mediaRows.length);
           }
 
-          // Create notification for reply to a news comment
+          // Notify parent comment author on reply (skip self-notification)
           if (parent_comment_id) {
-            console.log("[news-notif] parent_comment_id is set, fetching parent owner");
             try {
-              const { data: parentComment, error: parentFetchErr } = await sb(env)
+              const { data: parentComment } = await sb(env)
                 .from("news_comments")
-                .select("user_id, news_id, news_url")
+                .select("user_id")
                 .eq("id", parent_comment_id)
                 .single();
-
-              console.log("[news-notif] parentComment fetch result:", { parentComment, error: parentFetchErr?.message });
-
-              if (parentComment?.user_id && parentComment.user_id !== user_id) {
-                const notifPayload = {
+              if (parentComment) {
+                await createNotification(env, {
                   recipient_user_id: parentComment.user_id,
                   actor_user_id: user_id,
                   actor_name: author_name,
                   actor_avatar: author_avatar,
-                  type: "news_comment_reply" as const,
+                  type: "reply",
                   comment_id: data.id,
-                  parent_comment_id: parent_comment_id,
-                  news_id: parentComment.news_id,
-                  news_url: parentComment.news_url,
-                  group_key: `ncr:${parent_comment_id}`,
-                };
-                console.log("[NEWS REPLY] about to notify", {
                   parent_comment_id,
-                  news_id: parentComment?.news_id,
-                  actor_user_id: user_id,
-                  recipient_user_id: parentComment?.user_id,
-                });
-                console.log("[news-notif] about to createNotification", notifPayload);
-                await createNotification(env, notifPayload, request_id);
-                console.log("[news-notif] createNotification succeeded for news_comment_reply");
-              } else {
-                console.log("[news-notif] skipping notification: self or no owner", { parentUserId: parentComment?.user_id, actorUserId: user_id });
+                  news_id,
+                  group_key: `rp:${parent_comment_id}`,
+                }, request_id);
               }
             } catch (notifErr) {
-              console.error(`[news-notif] news_comment_reply notification FAILED`, String(notifErr));
+              console.error("[NEWS COMMENT] reply notification failed", String(notifErr));
             }
-          } else {
-            console.log("[news-notif] no parent_comment_id, skipping reply notification");
           }
 
           return ok(req, env, request_id, {
@@ -2737,7 +2658,7 @@ export default {
           if (m && req.method === "POST") {
             const user_id = await requireAuth(req, env);
             const comment_id = Number(m[1]);
-            console.log("[news-notif] HIT /api/news/comments/:id/like", { request_id, user_id, comment_id });
+
 
             if (!Number.isFinite(comment_id)) {
               throw new HttpError(400, "BAD_REQUEST", "Invalid comment_id");
@@ -2761,52 +2682,33 @@ export default {
 
             if (insertError) throw insertError;
 
-            // Create notification for news comment like
-            console.log("[news-notif] like inserted, fetching comment owner");
+            // Notify comment author on like
             try {
-              const { data: likedComment, error: likedFetchErr } = await sb(env)
+              const { data: likedComment } = await sb(env)
                 .from("news_comments")
-                .select("user_id, news_id, news_url, author_name, author_avatar")
+                .select("user_id, news_id")
                 .eq("id", comment_id)
                 .single();
-
-              console.log("[news-notif] likedComment fetch result:", { likedComment, error: likedFetchErr?.message });
-
-              if (likedComment?.user_id && likedComment.user_id !== user_id) {
-                // Fetch actor info from user_profiles
+              if (likedComment) {
+                // Fetch actor info
                 const { data: actorProfile } = await sb(env)
                   .from("user_profiles")
                   .select("display_name, avatar_key")
                   .eq("user_id", user_id)
                   .single();
-
-                console.log("[news-notif] actorProfile:", actorProfile);
-
-                const notifPayload = {
+                await createNotification(env, {
                   recipient_user_id: likedComment.user_id,
                   actor_user_id: user_id,
                   actor_name: actorProfile?.display_name ?? null,
                   actor_avatar: actorProfile?.avatar_key ?? null,
-                  type: "news_comment_like" as const,
-                  comment_id: comment_id,
-                  news_id: likedComment.news_id,
-                  news_url: likedComment.news_url,
-                  group_key: `ncl:${comment_id}`,
-                };
-                console.log("[NEWS LIKE] about to notify", {
+                  type: "comment_like",
                   comment_id,
-                  news_id: likedComment?.news_id,
-                  actor_user_id: user_id,
-                  recipient_user_id: likedComment?.user_id,
-                });
-                console.log("[news-notif] about to createNotification", notifPayload);
-                await createNotification(env, notifPayload, request_id);
-                console.log("[news-notif] createNotification succeeded for news_comment_like");
-              } else {
-                console.log("[news-notif] skipping notification: self or no owner", { likedUserId: likedComment?.user_id, actorUserId: user_id });
+                  news_id: likedComment.news_id,
+                  group_key: `cl:${comment_id}`,
+                }, request_id);
               }
             } catch (notifErr) {
-              console.error(`[news-notif] news_comment_like notification FAILED`, String(notifErr));
+              console.error("[NEWS LIKE] notification failed", String(notifErr));
             }
 
             return ok(req, env, request_id, { liked: true }, 201);
