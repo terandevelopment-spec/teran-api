@@ -2470,6 +2470,13 @@ export default {
 
           const news_url = typeof body?.news_url === "string" ? body.news_url.trim() : "";
           const content = typeof body?.content === "string" ? body.content.trim() : "";
+          console.log("[DEBUG parent_comment_id RAW]", {
+            raw: body?.parent_comment_id,
+            raw_type: typeof body?.parent_comment_id,
+            number_cast: Number(body?.parent_comment_id),
+            is_null: body?.parent_comment_id === null,
+            is_undefined: body?.parent_comment_id === undefined,
+          });
           const parent_comment_id =
             body?.parent_comment_id != null ? Number(body.parent_comment_id) || null : null;
           const author_name = typeof body?.author_name === "string" ? body.author_name : null;
