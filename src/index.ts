@@ -2378,7 +2378,7 @@ export default {
             .from("news_comments")
             .select("*")
             .eq("news_id", news_id.trim())
-            .order("created_at", { ascending: true })
+            .order("created_at", { ascending: false })
             .limit(limit);
           if (error) throw error;
 
