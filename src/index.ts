@@ -1527,19 +1527,20 @@ export default {
           const user_id = await requireAuth(req, env);
           const p1 = performance.now();
 
-          // Stable cache key: hash of user_id (same pattern as blocks/relations)
+          // Build stable cache key: deterministic URL from hash (same as blocks/relations)
           const cacheKeyData = `unread_count:${user_id}`;
-          const cacheKeyHash = (await sha256Hex(cacheKeyData)).slice(0, 12);
+          const cacheKeyHash = await sha256Hex(cacheKeyData);
           const cacheUrl = `https://cache.internal/__cache/unread_count?me=${encodeURIComponent(user_id)}&key=${cacheKeyHash}`;
-          const cacheReq = new Request(cacheUrl, { method: "GET" });
+          const cacheReq = new Request(cacheUrl.toString(), { method: "GET" });
+
+          // Try cache first
           const cache = caches.default;
+          const cachedResponse = await cache.match(cacheReq);
           const p2 = performance.now();
 
-          // Try cache
-          const cachedResponse = await cache.match(cacheReq);
           if (cachedResponse) {
-            const p3 = performance.now();
-            console.log(`[cache] unread_count HIT rid=${request_id} url=${cacheUrl} key=${cacheKeyHash} me=${user_id} total=${(p3 - p0).toFixed(1)}ms`);
+            // ─── CACHE HIT ───
+            console.log(`[cache] unread_count HIT rid=${request_id} url=${cacheUrl.slice(0, 100)} key=${cacheKeyHash.slice(0, 12)} me=${user_id} total=${(p2 - p0).toFixed(1)}ms`);
             const body = await cachedResponse.text();
             return new Response(body, {
               status: 200,
@@ -1547,12 +1548,14 @@ export default {
                 "Content-Type": "application/json",
                 "X-Request-Id": request_id,
                 "X-Cache": "HIT",
+                "X-Cache-Key": cacheKeyHash.slice(0, 12),
                 ...corsHeaders(req, env),
               },
             });
           }
-          const p3 = performance.now();
-          console.log(`[cache] unread_count MISS rid=${request_id} url=${cacheUrl} key=${cacheKeyHash} me=${user_id}`);
+
+          // ─── CACHE MISS ───
+          console.log(`[cache] unread_count MISS rid=${request_id} url=${cacheUrl.slice(0, 100)} key=${cacheKeyHash.slice(0, 12)} me=${user_id}`);
 
           // DB query
           const { count, error } = await sb(env)
@@ -1560,17 +1563,28 @@ export default {
             .select("id", { count: "exact", head: true })
             .eq("recipient_user_id", user_id)
             .eq("is_read", false);
-          const p4 = performance.now();
+          const p3 = performance.now();
 
           if (error) throw error;
 
           const responseData = { unread_count: count ?? 0 };
           const responseBody = JSON.stringify(responseData);
-          const p5 = performance.now();
 
-          console.log(`[perf] unread_count breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} cache_lookup=${(p3 - p2).toFixed(1)} db=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${(p5 - p0).toFixed(1)} count=${count ?? 0}`);
+          console.log(`[perf] unread_count breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} cache_lookup=${(p2 - p1).toFixed(1)} db=${(p3 - p2).toFixed(1)} total=${(p3 - p0).toFixed(1)} count=${count ?? 0}`);
 
-          // Store in cache
+          // Response to client (created first, before cache put)
+          const response = new Response(responseBody, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              "X-Request-Id": request_id,
+              "X-Cache": "MISS",
+              "X-Cache-Key": cacheKeyHash.slice(0, 12),
+              ...corsHeaders(req, env),
+            },
+          });
+
+          // Store in cache — create a clean Response (same pattern as blocks/relations)
           try {
             const responseToCache = new Response(responseBody, {
               status: 200,
@@ -1579,21 +1593,17 @@ export default {
                 "Cache-Control": `public, max-age=${UNREAD_CACHE_TTL}`,
               },
             });
+            // Debug: log what we're about to cache
+            const hdrs = responseToCache.headers;
+            console.log(`[cache-debug] unread_count headers rid=${request_id} cc=${hdrs.get("cache-control")} vary=${hdrs.get("vary")} setCookiePresent=${hdrs.has("set-cookie")} ct=${hdrs.get("content-type")}`);
+
             await cache.put(cacheReq, responseToCache);
-            console.log(`[cache] unread_count put ok=true rid=${request_id} key=${cacheKeyHash}`);
+            console.log(`[cache] unread_count put ok=true rid=${request_id} hash=${cacheKeyHash.slice(0, 12)}`);
           } catch (err) {
-            console.error(`[cache] unread_count put ok=false rid=${request_id} key=${cacheKeyHash}`, err);
+            console.error(`[cache] unread_count put ok=false rid=${request_id} hash=${cacheKeyHash.slice(0, 12)}`, err);
           }
 
-          return new Response(responseBody, {
-            status: 200,
-            headers: {
-              "Content-Type": "application/json",
-              "X-Request-Id": request_id,
-              "X-Cache": "MISS",
-              ...corsHeaders(req, env),
-            },
-          });
+          return response;
         }
 
         // GET /api/debug/notifications?type=post_like&limit=20 (DEV ONLY - no auth)
