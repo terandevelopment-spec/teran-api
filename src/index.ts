@@ -2370,7 +2370,7 @@ export default {
           return ok(req, env, request_id, data);
         }
 
-        // PUT /api/profile (Stage 2: sync persona to backend — KV hash memo)
+        // PUT /api/profile (sync persona — DB-only, no KV)
         if (path === "/api/profile" && req.method === "PUT") {
           const p0 = performance.now();
 
@@ -2387,59 +2387,33 @@ export default {
             bio: typeof body?.bio === "string" ? body.bio : null,
             avatar: typeof body?.avatar === "string" ? body.avatar : null,
           };
-
-          // Deterministic hash of incoming payload
-          const incomingStr = JSON.stringify([incoming.display_name, incoming.bio, incoming.avatar]);
-          const incomingHash = await sha256Hex(incomingStr);
           const p1 = performance.now();
 
-          console.log(`[profile-sync] incoming rid=${request_id} user=${trimmedUserId} dn=${incoming.display_name} avatar=${incoming.avatar?.slice(0, 30) ?? "null"} hash=${incomingHash.slice(0, 12)}`);
+          console.log(`[profile-sync] incoming rid=${request_id} user=${trimmedUserId} dn=${incoming.display_name} avatar=${incoming.avatar?.slice(0, 30) ?? "null"}`);
 
-          // ── KV fast path: skip DB read if hash matches ──
-          const kvKey = `profile_hash:${trimmedUserId}`;
-          let kvHash: string | null = null;
-          try {
-            kvHash = await env.UNREAD_KV.get(kvKey, "text");
-          } catch (_) { /* KV read failure is non-fatal */ }
-          const p2 = performance.now();
-
-          if (kvHash && kvHash === incomingHash) {
-            console.log(`[profile-sync] skip rid=${request_id} reason=KV_HASH_MATCH user=${trimmedUserId} hash=${incomingHash.slice(0, 12)}`);
-            console.log(`[perf] profile breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} kv_lookup=${(p2 - p1).toFixed(1)} total=${(p2 - p0).toFixed(1)} decision=SKIP_KV`);
-            return ok(req, env, request_id, { ok: true, changed: false });
-          }
-
-          // ── KV miss or hash mismatch: read DB ──
-          console.log(`[profile-sync] compare rid=${request_id} kvHash=${kvHash?.slice(0, 12) ?? "null"} incomingHash=${incomingHash.slice(0, 12)} user=${trimmedUserId}`);
-
+          // ── DB read: minimal columns ──
           const { data: current, error: readErr } = await sb(env)
             .from("user_profiles")
             .select("display_name, bio, avatar")
             .eq("user_id", trimmedUserId)
             .maybeSingle();
-          const p3 = performance.now();
+          const p2 = performance.now();
 
           if (readErr) throw readErr;
 
-          // Compare with DB: skip write if nothing changed
+          // ── Compare: skip write if nothing changed ──
           if (
             current &&
             current.display_name === incoming.display_name &&
             (current.bio ?? null) === (incoming.bio ?? null) &&
             (current.avatar ?? null) === (incoming.avatar ?? null)
           ) {
-            // DB matches — write the hash to KV so next call skips entirely
-            try {
-              await env.UNREAD_KV.put(kvKey, incomingHash, { expirationTtl: 300 });
-            } catch (_) { /* non-fatal */ }
-            const p4 = performance.now();
-            console.log(`[profile-sync] skip rid=${request_id} reason=DB_MATCH user=${trimmedUserId} hash=${incomingHash.slice(0, 12)}`);
-            console.log(`[perf] profile breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} kv_lookup=${(p2 - p1).toFixed(1)} db_read=${(p3 - p2).toFixed(1)} kv_put=${(p4 - p3).toFixed(1)} total=${(p4 - p0).toFixed(1)} decision=SKIP_WRITE`);
+            console.log(`[profile-sync] skip rid=${request_id} reason=DB_MATCH user=${trimmedUserId}`);
+            console.log(`[perf] profile breakdown rid=${request_id} parse=${(p1 - p0).toFixed(1)} db_read=${(p2 - p1).toFixed(1)} total=${(p2 - p0).toFixed(1)} decision=SKIP_WRITE`);
             return ok(req, env, request_id, { ok: true, changed: false });
           }
 
-          // ── Something changed (or new user) — upsert ──
-          const p4 = performance.now();
+          // ── Changed or new user — upsert ──
           const { error: writeErr } = await sb(env)
             .from("user_profiles")
             .upsert(
@@ -2450,18 +2424,12 @@ export default {
               },
               { onConflict: "user_id" }
             );
-          const p5 = performance.now();
+          const p3 = performance.now();
 
           if (writeErr) throw writeErr;
 
-          // Update KV hash after successful write
-          try {
-            await env.UNREAD_KV.put(kvKey, incomingHash, { expirationTtl: 300 });
-          } catch (_) { /* non-fatal */ }
-          const p6 = performance.now();
-
-          console.log(`[profile-sync] write rid=${request_id} user=${trimmedUserId} hash=${incomingHash.slice(0, 12)}`);
-          console.log(`[perf] profile breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} kv_lookup=${(p2 - p1).toFixed(1)} db_read=${(p3 - p2).toFixed(1)} compare=${(p4 - p3).toFixed(1)} db_write=${(p5 - p4).toFixed(1)} kv_put=${(p6 - p5).toFixed(1)} total=${(p6 - p0).toFixed(1)} decision=WRITE`);
+          console.log(`[profile-sync] write rid=${request_id} user=${trimmedUserId} dn=${incoming.display_name}`);
+          console.log(`[perf] profile breakdown rid=${request_id} parse=${(p1 - p0).toFixed(1)} db_read=${(p2 - p1).toFixed(1)} db_write=${(p3 - p2).toFixed(1)} total=${(p3 - p0).toFixed(1)} decision=WRITE`);
           return ok(req, env, request_id, { ok: true, changed: true });
         }
 
