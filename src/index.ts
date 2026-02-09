@@ -304,32 +304,7 @@ export default {
           const actor_id_param = url.searchParams.get("actor_id")?.trim() || null;
           const p1 = performance.now();
 
-          const POSTS_CACHE_TTL = 15; // seconds
-          const isDefaultFeed = !id_param && !user_id_param && !author_id_param && !room_id_param && !actor_id_param;
-          let postsCacheReq: Request | null = null;
-
-          if (isDefaultFeed) {
-            const lim = limit_param ? Math.min(200, Math.max(1, parseInt(limit_param, 10) || 50)) : 50;
-            const cacheUrl = `https://cache.internal/__cache/posts_feed?limit=${lim}`;
-            postsCacheReq = new Request(cacheUrl, { method: "GET" });
-
-            const cached = await caches.default.match(postsCacheReq);
-            if (cached) {
-              const p_hit = performance.now();
-              console.log(`[cache] /api/posts feed HIT rid=${request_id} total=${(p_hit - p0).toFixed(1)}ms`);
-              const body = await cached.text();
-              return new Response(body, {
-                status: 200,
-                headers: {
-                  "Content-Type": "application/json",
-                  "X-Request-Id": request_id,
-                  "X-Cache": "HIT",
-                  ...corsHeaders(req, env),
-                },
-              });
-            }
-            console.log(`[cache] /api/posts feed MISS rid=${request_id}`);
-          }
+          // No Cache API for feed — fast enough with indexes, avoids subrequest limit
 
           // Build base query with conditional select:
           // - Feed lists: lightweight select (content included for card preview)
@@ -405,20 +380,15 @@ export default {
             return data ?? [];
           })();
 
-          // Like counts: use head+exact count per post (no row transfer)
+          // Like counts: single batch query, count in JS
           const likesQuery = (async () => {
             const t = Date.now();
-            const counts: Record<number, number> = {};
-            // Batch count queries in parallel — much cheaper than fetching all rows
-            await Promise.all(postIds.map(async (pid: number) => {
-              const { count } = await sb(env)
-                .from("post_likes")
-                .select("id", { count: "exact", head: true })
-                .eq("post_id", pid);
-              counts[pid] = count ?? 0;
-            }));
+            const { data } = await sb(env)
+              .from("post_likes")
+              .select("post_id")
+              .in("post_id", postIds);
             likesMs = Date.now() - t;
-            return counts;
+            return data ?? [];
           })();
 
           const likedByMeQuery = actor_id_param ? (async () => {
@@ -432,7 +402,7 @@ export default {
             return data ?? [];
           })() : Promise.resolve([]);
 
-          const [mediaRows, likeCounts, likedRows] = await Promise.all([
+          const [mediaRows, likeRows, likedRows] = await Promise.all([
             mediaQuery,
             likesQuery,
             likedByMeQuery,
@@ -445,13 +415,19 @@ export default {
             likes: likesMs,
             likedByMe: likedByMeMs,
             mediaCount: mediaRows.length,
+            likeRows: (likeRows as any[]).length,
           });
 
-          // Process media results
+          // Process results
           const mediaByPost: Record<number, any[]> = {};
           for (const m of mediaRows) {
             if (!mediaByPost[m.post_id]) mediaByPost[m.post_id] = [];
             mediaByPost[m.post_id].push(m);
+          }
+
+          const likeCounts: Record<number, number> = {};
+          for (const row of likeRows as any[]) {
+            likeCounts[row.post_id] = (likeCounts[row.post_id] || 0) + 1;
           }
 
           const likedByActorSet = new Set<number>();
@@ -484,34 +460,11 @@ export default {
           });
           console.log(`[perf] /api/posts breakdown rid=${request_id} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} parallel=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${(p5 - p0).toFixed(1)} rows=${enrichedPosts.length}`);
 
-          // Cache the default feed response (non-blocking)
-          if (postsCacheReq) {
-            const _cacheReq = postsCacheReq;
-            ctx.waitUntil(
-              (async () => {
-                try {
-                  const cacheRes = new Response(responseBody, {
-                    status: 200,
-                    headers: {
-                      "Content-Type": "application/json",
-                      "Cache-Control": `public, max-age=${POSTS_CACHE_TTL}`,
-                    },
-                  });
-                  await caches.default.put(_cacheReq, cacheRes);
-                  console.log(`[cache] /api/posts feed put ok=true rid=${request_id}`);
-                } catch (err) {
-                  console.error(`[cache] /api/posts feed put ok=false rid=${request_id}`, err);
-                }
-              })()
-            );
-          }
-
           return new Response(responseBody, {
             status: 200,
             headers: {
               "Content-Type": "application/json",
               "X-Request-Id": request_id,
-              "X-Cache": isDefaultFeed ? "MISS" : "BYPASS",
               ...corsHeaders(req, env),
             },
           });
