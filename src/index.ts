@@ -135,12 +135,19 @@ async function requireAuth(req: Request, env: Env): Promise<string> {
   return userId;
 }
 
-// --------- Supabase client ----------
+// --------- Supabase client (singleton per isolate) ----------
+let _sbClient: ReturnType<typeof createClient> | null = null;
+let _sbUrl: string | null = null;
+
 function sb(env: Env) {
-  return createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
+  // Reuse client if URL hasn't changed (same isolate)
+  if (_sbClient && _sbUrl === env.SUPABASE_URL) return _sbClient;
+  _sbClient = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false },
     global: { fetch },
   });
+  _sbUrl = env.SUPABASE_URL;
+  return _sbClient;
 }
 
 // --------- News URL helpers ----------
@@ -296,6 +303,33 @@ export default {
           const actor_id_param = url.searchParams.get("actor_id")?.trim() || null;
           const p1 = performance.now();
 
+          const POSTS_CACHE_TTL = 10;
+          const isDefaultFeed = !id_param && !user_id_param && !author_id_param && !room_id_param && !actor_id_param;
+          let postsCacheReq: Request | null = null;
+
+          if (isDefaultFeed) {
+            const lim = limit_param ? Math.min(200, Math.max(1, parseInt(limit_param, 10) || 50)) : 50;
+            const cacheUrl = `https://cache.internal/__cache/posts_feed?limit=${lim}`;
+            postsCacheReq = new Request(cacheUrl, { method: "GET" });
+
+            const cached = await caches.default.match(postsCacheReq);
+            if (cached) {
+              const p_hit = performance.now();
+              console.log(`[cache] /api/posts feed HIT rid=${request_id} total=${(p_hit - p0).toFixed(1)}ms`);
+              const body = await cached.text();
+              return new Response(body, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Request-Id": request_id,
+                  "X-Cache": "HIT",
+                  ...corsHeaders(req, env),
+                },
+              });
+            }
+            console.log(`[cache] /api/posts feed MISS rid=${request_id}`);
+          }
+
           // Build base query with conditional select:
           // - Feed lists: lightweight select (content included for card preview)
           // - Single post by id: include full data for PostDetail
@@ -445,15 +479,41 @@ export default {
           });
           const p5 = performance.now();
 
-          const payloadSize = JSON.stringify(enrichedPosts).length;
+          const responseBody = JSON.stringify({ posts: enrichedPosts });
           console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms`, {
             posts_query: postsQueryMs,
             parallel: parallelMs,
             posts: enrichedPosts.length,
-            payloadBytes: payloadSize,
+            payloadBytes: responseBody.length,
           });
           console.log(`[perf] /api/posts breakdown rid=${request_id} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} parallel=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${(p5 - p0).toFixed(1)} rows=${enrichedPosts.length}`);
-          return ok(req, env, request_id, { posts: enrichedPosts });
+
+          // Cache the default feed response
+          if (postsCacheReq) {
+            try {
+              const cacheRes = new Response(responseBody, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Cache-Control": `public, max-age=${POSTS_CACHE_TTL}`,
+                },
+              });
+              await caches.default.put(postsCacheReq, cacheRes);
+              console.log(`[cache] /api/posts feed put ok=true rid=${request_id}`);
+            } catch (err) {
+              console.error(`[cache] /api/posts feed put ok=false rid=${request_id}`, err);
+            }
+          }
+
+          return new Response(responseBody, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              "X-Request-Id": request_id,
+              "X-Cache": isDefaultFeed ? "MISS" : "BYPASS",
+              ...corsHeaders(req, env),
+            },
+          });
         }
 
         // /api/posts (POST)
@@ -1461,17 +1521,77 @@ export default {
 
         // GET /api/notifications/unread_count
         if (path === "/api/notifications/unread_count" && req.method === "GET") {
-          const user_id = await requireAuth(req, env);
+          const UNREAD_CACHE_TTL = 15; // seconds
+          const p0 = performance.now();
 
+          const user_id = await requireAuth(req, env);
+          const p1 = performance.now();
+
+          // Stable cache key per user
+          const cacheUrl = `https://cache.internal/__cache/unread_count?me=${encodeURIComponent(user_id)}`;
+          const cacheReq = new Request(cacheUrl, { method: "GET" });
+          const cache = caches.default;
+          const p2 = performance.now();
+
+          // Try cache
+          const cachedResponse = await cache.match(cacheReq);
+          if (cachedResponse) {
+            const p3 = performance.now();
+            console.log(`[cache] unread_count HIT rid=${request_id} url=${cacheUrl} total=${(p3 - p0).toFixed(1)}ms`);
+            const body = await cachedResponse.text();
+            return new Response(body, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+                "X-Cache": "HIT",
+                ...corsHeaders(req, env),
+              },
+            });
+          }
+          const p3 = performance.now();
+          console.log(`[cache] unread_count MISS rid=${request_id} url=${cacheUrl}`);
+
+          // DB query
           const { count, error } = await sb(env)
             .from("notifications")
             .select("id", { count: "exact", head: true })
             .eq("recipient_user_id", user_id)
             .eq("is_read", false);
+          const p4 = performance.now();
 
           if (error) throw error;
 
-          return ok(req, env, request_id, { unread_count: count ?? 0 });
+          const responseData = { unread_count: count ?? 0 };
+          const responseBody = JSON.stringify(responseData);
+          const p5 = performance.now();
+
+          console.log(`[perf] unread_count breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} cache_lookup=${(p3 - p2).toFixed(1)} db=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${(p5 - p0).toFixed(1)} count=${count ?? 0}`);
+
+          // Store in cache
+          try {
+            const responseToCache = new Response(responseBody, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "Cache-Control": `public, max-age=${UNREAD_CACHE_TTL}`,
+              },
+            });
+            await cache.put(cacheReq, responseToCache);
+            console.log(`[cache] unread_count put ok=true rid=${request_id}`);
+          } catch (err) {
+            console.error(`[cache] unread_count put ok=false rid=${request_id}`, err);
+          }
+
+          return new Response(responseBody, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              "X-Request-Id": request_id,
+              "X-Cache": "MISS",
+              ...corsHeaders(req, env),
+            },
+          });
         }
 
         // GET /api/debug/notifications?type=post_like&limit=20 (DEV ONLY - no auth)
@@ -2258,6 +2378,8 @@ export default {
 
         // PUT /api/profile (Stage 2: sync persona to backend)
         if (path === "/api/profile" && req.method === "PUT") {
+          const p0 = performance.now();
+
           const body = (await req.json().catch(() => null)) as any;
           const user_id = body?.user_id;
 
@@ -2265,24 +2387,54 @@ export default {
             throw new HttpError(400, "BAD_REQUEST", "user_id is required");
           }
 
-          console.log(`[profile-sync] PUT /api/profile request_id=${request_id} user_id=${user_id}`);
+          const trimmedUserId = user_id.trim();
+          const incoming = {
+            display_name: typeof body?.display_name === "string" ? body.display_name : "Anonymous",
+            bio: typeof body?.bio === "string" ? body.bio : null,
+            avatar: typeof body?.avatar === "string" ? body.avatar : null,
+          };
+          const p1 = performance.now();
 
-          const { error } = await sb(env)
+          // Read current profile to check if anything changed
+          const { data: current, error: readErr } = await sb(env)
+            .from("user_profiles")
+            .select("display_name, bio, avatar")
+            .eq("user_id", trimmedUserId)
+            .maybeSingle();
+          const p2 = performance.now();
+
+          if (readErr) throw readErr;
+
+          // Compare: skip write if nothing changed
+          if (
+            current &&
+            current.display_name === incoming.display_name &&
+            (current.bio ?? null) === (incoming.bio ?? null) &&
+            (current.avatar ?? null) === (incoming.avatar ?? null)
+          ) {
+            const p3 = performance.now();
+            console.log(`[perf] PUT /api/profile SKIP rid=${request_id} auth=${(p1 - p0).toFixed(1)} read=${(p2 - p1).toFixed(1)} total=${(p3 - p0).toFixed(1)} user=${trimmedUserId}`);
+            return ok(req, env, request_id, { ok: true, changed: false });
+          }
+          const p3 = performance.now();
+
+          // Something changed (or new user) — upsert
+          const { error: writeErr } = await sb(env)
             .from("user_profiles")
             .upsert(
               {
-                user_id: user_id.trim(),
-                display_name: typeof body?.display_name === "string" ? body.display_name : "Anonymous",
-                bio: typeof body?.bio === "string" ? body.bio : null,
-                avatar: typeof body?.avatar === "string" ? body.avatar : null,
+                user_id: trimmedUserId,
+                ...incoming,
                 updated_at: new Date().toISOString(),
               },
               { onConflict: "user_id" }
             );
+          const p4 = performance.now();
 
-          if (error) throw error;
+          if (writeErr) throw writeErr;
 
-          return ok(req, env, request_id, { ok: true });
+          console.log(`[perf] PUT /api/profile WRITE rid=${request_id} auth=${(p1 - p0).toFixed(1)} read=${(p2 - p1).toFixed(1)} compare=${(p3 - p2).toFixed(1)} write=${(p4 - p3).toFixed(1)} total=${(p4 - p0).toFixed(1)} user=${trimmedUserId}`);
+          return ok(req, env, request_id, { ok: true, changed: true });
         }
 
         // =====================================================
