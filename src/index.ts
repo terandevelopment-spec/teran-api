@@ -261,7 +261,7 @@ async function createNotification(
 
 // --------- routes ----------
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const request_id = getReqId();
     const t0 = Date.now();
 
@@ -1520,7 +1520,7 @@ export default {
           return ok(req, env, request_id, { ok: true });
         }
 
-        // GET /api/notifications/unread_count (KV-cached, 15s TTL)
+        // GET /api/notifications/unread_count (KV-cached, 60s TTL, non-blocking put)
         if (path === "/api/notifications/unread_count" && req.method === "GET") {
           const KV_TTL = 60; // seconds (KV minimum is 60)
           const p0 = performance.now();
@@ -1565,16 +1565,14 @@ export default {
 
           const unreadCount = count ?? 0;
 
-          // Store in KV with TTL
-          try {
-            await env.UNREAD_KV.put(kvKey, String(unreadCount), { expirationTtl: KV_TTL });
-            console.log(`[kv] unread_count put ok=true rid=${request_id} me=${user_id} count=${unreadCount}`);
-          } catch (err) {
-            console.error(`[kv] unread_count put ok=false rid=${request_id} me=${user_id}`, err);
-          }
-          const p4 = performance.now();
+          // Fire-and-forget KV put via waitUntil (non-blocking)
+          ctx.waitUntil(
+            env.UNREAD_KV.put(kvKey, String(unreadCount), { expirationTtl: KV_TTL })
+              .then(() => console.log(`[kv] unread_count put ok=true rid=${request_id} me=${user_id} count=${unreadCount}`))
+              .catch((err) => console.error(`[kv] unread_count put ok=false rid=${request_id} me=${user_id}`, err))
+          );
 
-          console.log(`[perf] unread_count breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} kv_lookup=${(p2 - p1).toFixed(1)} db=${(p3 - p2).toFixed(1)} kv_put=${(p4 - p3).toFixed(1)} total=${(p4 - p0).toFixed(1)} count=${unreadCount}`);
+          console.log(`[perf] unread_count breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} kv_lookup=${(p2 - p1).toFixed(1)} db=${(p3 - p2).toFixed(1)} total=${(p3 - p0).toFixed(1)} count=${unreadCount} kv_put=async`);
 
           const responseBody = JSON.stringify({ unread_count: unreadCount, source: "db" });
           return new Response(responseBody, {
@@ -2119,26 +2117,27 @@ export default {
           // ─── CACHE MISS ───
           console.log(`[cache] blocks/relations MISS rid=${request_id} url=${cacheUrl.slice(0, 100)} userCount=${userIds.length} hash=${cacheKeyHash.slice(0, 12)}`);
 
-          // Query DB
+          // Query DB — both directions in parallel
           const t1 = Date.now();
 
-          const { data: iBlocked, error: e1 } = await sb(env)
-            .from("blocks")
-            .select("blocked_user_id")
-            .eq("blocker_user_id", my_user_id)
-            .in("blocked_user_id", userIds);
-          if (e1) throw e1;
-
-          const { data: blockedMe, error: e2 } = await sb(env)
-            .from("blocks")
-            .select("blocker_user_id")
-            .eq("blocked_user_id", my_user_id)
-            .in("blocker_user_id", userIds);
-          if (e2) throw e2;
+          const [res1, res2] = await Promise.all([
+            sb(env)
+              .from("blocks")
+              .select("blocked_user_id")
+              .eq("blocker_user_id", my_user_id)
+              .in("blocked_user_id", userIds),
+            sb(env)
+              .from("blocks")
+              .select("blocker_user_id")
+              .eq("blocked_user_id", my_user_id)
+              .in("blocker_user_id", userIds),
+          ]);
+          if (res1.error) throw res1.error;
+          if (res2.error) throw res2.error;
 
           const blockedSet = new Set<string>();
-          for (const row of iBlocked ?? []) blockedSet.add(row.blocked_user_id);
-          for (const row of blockedMe ?? []) blockedSet.add(row.blocker_user_id);
+          for (const row of res1.data ?? []) blockedSet.add(row.blocked_user_id);
+          for (const row of res2.data ?? []) blockedSet.add(row.blocker_user_id);
 
           const responseData = { blocked_user_ids: Array.from(blockedSet), request_id };
           const responseBody = JSON.stringify(responseData);
@@ -2158,20 +2157,24 @@ export default {
             },
           });
 
-          // Store in cache — await so it completes before response
-          try {
-            const responseToCache = new Response(responseBody, {
-              status: 200,
-              headers: {
-                "Content-Type": "application/json",
-                "Cache-Control": `public, max-age=${BLOCKS_CACHE_TTL_SECONDS}`,
-              },
-            });
-            await cache.put(cacheReq, responseToCache);
-            console.log(`[cache] blocks/relations put ok=true rid=${request_id} hash=${cacheKeyHash.slice(0, 12)}`);
-          } catch (err) {
-            console.error(`[cache] blocks/relations put ok=false rid=${request_id} hash=${cacheKeyHash.slice(0, 12)}`, err);
-          }
+          // Fire-and-forget cache put via waitUntil (non-blocking)
+          ctx.waitUntil(
+            (async () => {
+              try {
+                const responseToCache = new Response(responseBody, {
+                  status: 200,
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Cache-Control": `public, max-age=${BLOCKS_CACHE_TTL_SECONDS}`,
+                  },
+                });
+                await cache.put(cacheReq, responseToCache);
+                console.log(`[cache] blocks/relations put ok=true rid=${request_id} hash=${cacheKeyHash.slice(0, 12)}`);
+              } catch (err) {
+                console.error(`[cache] blocks/relations put ok=false rid=${request_id} hash=${cacheKeyHash.slice(0, 12)}`, err);
+              }
+            })()
+          );
 
           return response;
         }
