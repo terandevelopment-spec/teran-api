@@ -304,7 +304,7 @@ export default {
           const actor_id_param = url.searchParams.get("actor_id")?.trim() || null;
           const p1 = performance.now();
 
-          const POSTS_CACHE_TTL = 10;
+          const POSTS_CACHE_TTL = 15; // seconds
           const isDefaultFeed = !id_param && !user_id_param && !author_id_param && !room_id_param && !actor_id_param;
           let postsCacheReq: Request | null = null;
 
@@ -340,7 +340,8 @@ export default {
           let q = sb(env)
             .from("posts")
             .select(selectFields)
-            .order("created_at", { ascending: false });
+            .order("created_at", { ascending: false })
+            .order("id", { ascending: false }); // tie-breaker for stable pagination
 
           // Apply filters - priority: id > user_id > author_id > default
           if (id_param) {
@@ -391,14 +392,11 @@ export default {
           }
 
           // Parallel fetch: media, like_counts, liked_by_me
-          // Optimized: run all 3 queries concurrently with Promise.all
           const parallelStart = Date.now();
           let mediaMs = 0, likesMs = 0, likedByMeMs = 0;
 
-          // Prepare query promises
           const mediaQuery = (async () => {
             const t = Date.now();
-            // Select only fields needed for feed thumbnails
             const { data } = await sb(env)
               .from("media")
               .select("id, post_id, type, key, thumb_key, width, height, duration_ms")
@@ -407,15 +405,20 @@ export default {
             return data ?? [];
           })();
 
+          // Like counts: use head+exact count per post (no row transfer)
           const likesQuery = (async () => {
             const t = Date.now();
-            // Fetch all like rows and count in JS (Supabase doesn't support GROUP BY aggregation directly)
-            const { data } = await sb(env)
-              .from("post_likes")
-              .select("post_id")
-              .in("post_id", postIds);
+            const counts: Record<number, number> = {};
+            // Batch count queries in parallel — much cheaper than fetching all rows
+            await Promise.all(postIds.map(async (pid: number) => {
+              const { count } = await sb(env)
+                .from("post_likes")
+                .select("id", { count: "exact", head: true })
+                .eq("post_id", pid);
+              counts[pid] = count ?? 0;
+            }));
             likesMs = Date.now() - t;
-            return data ?? [];
+            return counts;
           })();
 
           const likedByMeQuery = actor_id_param ? (async () => {
@@ -429,8 +432,7 @@ export default {
             return data ?? [];
           })() : Promise.resolve([]);
 
-          // Execute all queries in parallel
-          const [mediaRows, likeRows, likedRows] = await Promise.all([
+          const [mediaRows, likeCounts, likedRows] = await Promise.all([
             mediaQuery,
             likesQuery,
             likedByMeQuery,
@@ -443,32 +445,25 @@ export default {
             likes: likesMs,
             likedByMe: likedByMeMs,
             mediaCount: mediaRows.length,
-            likeRows: likeRows.length,
           });
 
-          // Process results
+          // Process media results
           const mediaByPost: Record<number, any[]> = {};
           for (const m of mediaRows) {
             if (!mediaByPost[m.post_id]) mediaByPost[m.post_id] = [];
             mediaByPost[m.post_id].push(m);
           }
 
-          const likeCounts: Record<number, number> = {};
-          for (const row of likeRows) {
-            likeCounts[row.post_id] = (likeCounts[row.post_id] || 0) + 1;
-          }
-
           const likedByActorSet = new Set<number>();
-          for (const row of likedRows) {
+          for (const row of likedRows as any[]) {
             likedByActorSet.add(row.post_id);
           }
 
           // Enrich posts with media, like_count, liked_by_me
-          // Sanitize author_avatar: strip data URIs to prevent MB-sized payloads
           const enrichedPosts = (posts ?? []).map((p: any) => {
             let avatar = p.author_avatar;
             if (typeof avatar === "string" && avatar.startsWith("data:")) {
-              avatar = null; // Strip data URI, let frontend use fallback
+              avatar = null;
             }
             return {
               ...p,
@@ -489,21 +484,26 @@ export default {
           });
           console.log(`[perf] /api/posts breakdown rid=${request_id} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} parallel=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${(p5 - p0).toFixed(1)} rows=${enrichedPosts.length}`);
 
-          // Cache the default feed response
+          // Cache the default feed response (non-blocking)
           if (postsCacheReq) {
-            try {
-              const cacheRes = new Response(responseBody, {
-                status: 200,
-                headers: {
-                  "Content-Type": "application/json",
-                  "Cache-Control": `public, max-age=${POSTS_CACHE_TTL}`,
-                },
-              });
-              await caches.default.put(postsCacheReq, cacheRes);
-              console.log(`[cache] /api/posts feed put ok=true rid=${request_id}`);
-            } catch (err) {
-              console.error(`[cache] /api/posts feed put ok=false rid=${request_id}`, err);
-            }
+            const _cacheReq = postsCacheReq;
+            ctx.waitUntil(
+              (async () => {
+                try {
+                  const cacheRes = new Response(responseBody, {
+                    status: 200,
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Cache-Control": `public, max-age=${POSTS_CACHE_TTL}`,
+                    },
+                  });
+                  await caches.default.put(_cacheReq, cacheRes);
+                  console.log(`[cache] /api/posts feed put ok=true rid=${request_id}`);
+                } catch (err) {
+                  console.error(`[cache] /api/posts feed put ok=false rid=${request_id}`, err);
+                }
+              })()
+            );
           }
 
           return new Response(responseBody, {
