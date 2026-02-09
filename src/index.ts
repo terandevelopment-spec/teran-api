@@ -1522,7 +1522,7 @@ export default {
 
         // GET /api/notifications/unread_count (KV-cached, 15s TTL)
         if (path === "/api/notifications/unread_count" && req.method === "GET") {
-          const KV_TTL = 15; // seconds
+          const KV_TTL = 60; // seconds (KV minimum is 60)
           const p0 = performance.now();
 
           const user_id = await requireAuth(req, env);
