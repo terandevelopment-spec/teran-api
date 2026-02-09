@@ -1990,7 +1990,7 @@ export default {
 
           if (cachedResponse) {
             // ─── CACHE HIT ───
-            console.log(`[cache] blocks/relations match HIT hash=${cacheKeyHash.slice(0, 12)} rid=${request_id}`);
+            console.log(`[cache] blocks/relations match HIT hash=${cacheKeyHash.slice(0, 12)} rid=${request_id} userCount=${userIds.length} first=${userIds[0]} last=${userIds[userIds.length - 1]}`);
             const body = await cachedResponse.text();
             return new Response(body, {
               status: 200,
@@ -2005,7 +2005,7 @@ export default {
           }
 
           // ─── CACHE MISS ───
-          console.log(`[cache] blocks/relations match MISS hash=${cacheKeyHash.slice(0, 12)} rid=${request_id}`);
+          console.log(`[cache] blocks/relations match MISS hash=${cacheKeyHash.slice(0, 12)} rid=${request_id} userCount=${userIds.length} rawLen=${userIdsParam.length} normalizedKey=${cacheKeyData.slice(0, 80)} first=${userIds[0]} last=${userIds[userIds.length - 1]}`);
 
           // Query DB
           const t1 = Date.now();
