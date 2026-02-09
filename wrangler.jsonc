@@ -24,6 +24,11 @@
 		{
 			"binding": "UNREAD_KV",
 			"id": "REPLACE_WITH_KV_NAMESPACE_ID"
+		},
+		{
+			"binding": "UNREAD_KV",
+			"id": "704a0aa3f72d4e1eb0ab8822ee8334a6",
+			"remote": true
 		}
 	]
 	/**
