@@ -1976,13 +1976,17 @@ export default {
 
         // GET /api/blocks - List users I have blocked
         if (path === "/api/blocks" && req.method === "GET") {
+          const handlerStart = Date.now();
           const blocker_user_id = await requireAuth(req, env);
+          const authMs = Date.now() - handlerStart;
 
+          const t1 = Date.now();
           const { data: rows, error } = await sb(env)
             .from("blocks")
             .select("blocked_user_id, created_at")
             .eq("blocker_user_id", blocker_user_id)
             .order("created_at", { ascending: false });
+          const dbMs = Date.now() - t1;
           if (error) throw error;
 
           const blocked = (rows ?? []).map(r => ({
@@ -1990,6 +1994,7 @@ export default {
             created_at: r.created_at,
           }));
 
+          console.log(`[perf] GET /api/blocks rid=${request_id} auth=${authMs}ms db=${dbMs}ms total=${Date.now() - handlerStart}ms rows=${blocked.length}`);
           return ok(req, env, request_id, { blocked });
         }
 
@@ -2215,6 +2220,7 @@ export default {
         if (path === "/api/echoes" && req.method === "GET") {
           const handlerStart = Date.now();
           const user_id = await requireAuth(req, env);
+          const authMs = Date.now() - handlerStart;
 
           // Run BOTH queries in parallel (saves ~150ms)
           const t1 = Date.now();
@@ -2232,7 +2238,8 @@ export default {
               .select("blocker_user_id, blocked_user_id")
               .or(`blocker_user_id.eq.${user_id},blocked_user_id.eq.${user_id}`),
           ]);
-          console.log(`[perf] /api/echoes parallel_queries ${Date.now() - t1}ms`, {
+          const dbMs = Date.now() - t1;
+          console.log(`[perf] /api/echoes rid=${request_id} auth=${authMs}ms db=${dbMs}ms`, {
             echoes: echoesResult.data?.length,
             blocks: blocksResult.data?.length,
           });
