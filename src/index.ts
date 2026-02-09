@@ -1976,21 +1976,19 @@ export default {
             return ok(req, env, request_id, { blocked_user_ids: [] });
           }
 
-          // Build stable cache key: hash of requester + normalized ids
+          // Build stable cache key: deterministic URL from hash
           const cacheKeyData = `blocks:${my_user_id}:${userIds.join(",")}`;
           const cacheKeyHash = await sha256Hex(cacheKeyData);
-          const cacheUrl = new URL(req.url);
-          cacheUrl.pathname = `/cache/blocks/${cacheKeyHash}`;
-          cacheUrl.search = "";
-          const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+          const cacheUrl = `https://cache.internal/__cache/blocks_relations?me=${encodeURIComponent(my_user_id)}&key=${cacheKeyHash}`;
+          const cacheReq = new Request(cacheUrl, { method: "GET" });
 
           // Try cache first
           const cache = caches.default;
-          const cachedResponse = await cache.match(cacheKey);
+          const cachedResponse = await cache.match(cacheReq);
 
           if (cachedResponse) {
             // ─── CACHE HIT ───
-            console.log(`[cache] blocks/relations match HIT hash=${cacheKeyHash.slice(0, 12)} rid=${request_id} userCount=${userIds.length} first=${userIds[0]} last=${userIds[userIds.length - 1]}`);
+            console.log(`[cache] blocks/relations HIT rid=${request_id} url=${cacheUrl.slice(0, 100)} userCount=${userIds.length}`);
             const body = await cachedResponse.text();
             return new Response(body, {
               status: 200,
@@ -2005,7 +2003,7 @@ export default {
           }
 
           // ─── CACHE MISS ───
-          console.log(`[cache] blocks/relations match MISS hash=${cacheKeyHash.slice(0, 12)} rid=${request_id} userCount=${userIds.length} rawLen=${userIdsParam.length} normalizedKey=${cacheKeyData.slice(0, 80)} first=${userIds[0]} last=${userIds[userIds.length - 1]}`);
+          console.log(`[cache] blocks/relations MISS rid=${request_id} url=${cacheUrl.slice(0, 100)} userCount=${userIds.length} hash=${cacheKeyHash.slice(0, 12)}`);
 
           // Query DB
           const t1 = Date.now();
@@ -2031,7 +2029,8 @@ export default {
           const responseData = { blocked_user_ids: Array.from(blockedSet), request_id };
           const responseBody = JSON.stringify(responseData);
 
-          console.log(`[perf] blocks/relations db=${Date.now() - t1}ms total=${Date.now() - handlerStart}ms rid=${request_id}`);
+          const dbMs = Date.now() - t1;
+          console.log(`[perf] blocks/relations db=${dbMs}ms total=${Date.now() - handlerStart}ms rid=${request_id}`);
 
           // Response to client
           const response = new Response(responseBody, {
@@ -2041,24 +2040,24 @@ export default {
               "X-Request-Id": request_id,
               "X-Cache": "MISS",
               "X-Cache-Key": cacheKeyHash.slice(0, 12),
-              "Cache-Control": `public, max-age=${BLOCKS_CACHE_TTL_SECONDS}`,
               ...corsHeaders(req, env),
             },
           });
 
-          // Store in cache (fire-and-forget, logs via .then/.catch)
-          const responseToCache = new Response(responseBody, {
-            status: 200,
-            headers: {
-              "Content-Type": "application/json",
-              "Cache-Control": `public, max-age=${BLOCKS_CACHE_TTL_SECONDS}`,
-            },
-          });
-          cache.put(cacheKey, responseToCache).then(() => {
-            console.log(`[cache] blocks/relations put OK hash=${cacheKeyHash.slice(0, 12)} rid=${request_id}`);
-          }).catch((err) => {
-            console.error(`[cache] blocks/relations put FAIL hash=${cacheKeyHash.slice(0, 12)} rid=${request_id}`, err);
-          });
+          // Store in cache — await so it completes before response
+          try {
+            const responseToCache = new Response(responseBody, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "Cache-Control": `public, max-age=${BLOCKS_CACHE_TTL_SECONDS}`,
+              },
+            });
+            await cache.put(cacheReq, responseToCache);
+            console.log(`[cache] blocks/relations put ok=true rid=${request_id} hash=${cacheKeyHash.slice(0, 12)}`);
+          } catch (err) {
+            console.error(`[cache] blocks/relations put ok=false rid=${request_id} hash=${cacheKeyHash.slice(0, 12)}`, err);
+          }
 
           return response;
         }
