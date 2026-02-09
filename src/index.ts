@@ -285,6 +285,8 @@ export default {
         // /api/posts (GET) - filter by ?id=, ?user_id=, ?author_id=, ?room_id=, ?limit=, ?actor_id=
         if (path === "/api/posts" && req.method === "GET") {
           const handlerStart = Date.now();
+          const p0 = performance.now();
+
           // Parse all query params
           const id_param = url.searchParams.get("id");
           const user_id_param = url.searchParams.get("user_id");
@@ -292,6 +294,7 @@ export default {
           const room_id_param = url.searchParams.get("room_id");
           const limit_param = url.searchParams.get("limit");
           const actor_id_param = url.searchParams.get("actor_id")?.trim() || null;
+          const p1 = performance.now();
 
           // Build base query with conditional select:
           // - Feed lists: lightweight select (content included for card preview)
@@ -335,10 +338,12 @@ export default {
             }
             q = q.limit(lim);
           }
+          const p2 = performance.now();
 
           let t1 = Date.now();
           const { data: posts, error } = await q;
           const postsQueryMs = Date.now() - t1;
+          const p3 = performance.now();
           console.log(`[perf] /api/posts posts_query ${postsQueryMs}ms`, { id: id_param, count: posts?.length });
           if (error) throw error;
 
@@ -346,6 +351,7 @@ export default {
           const postIds = (posts ?? []).map((p: any) => p.id);
           if (postIds.length === 0) {
             console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms (empty)`);
+            console.log(`[perf] /api/posts breakdown rid=${request_id} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} transform=0 total=${(p3 - p0).toFixed(1)} rows=0`);
             return ok(req, env, request_id, { posts: [] });
           }
 
@@ -395,6 +401,7 @@ export default {
             likedByMeQuery,
           ]);
           const parallelMs = Date.now() - parallelStart;
+          const p4 = performance.now();
 
           console.log(`[perf] /api/posts parallel_queries ${parallelMs}ms`, {
             media: mediaMs,
@@ -436,6 +443,7 @@ export default {
               liked_by_me: likedByActorSet.has(p.id),
             };
           });
+          const p5 = performance.now();
 
           const payloadSize = JSON.stringify(enrichedPosts).length;
           console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms`, {
@@ -444,6 +452,7 @@ export default {
             posts: enrichedPosts.length,
             payloadBytes: payloadSize,
           });
+          console.log(`[perf] /api/posts breakdown rid=${request_id} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} parallel=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${(p5 - p0).toFixed(1)} rows=${enrichedPosts.length}`);
           return ok(req, env, request_id, { posts: enrichedPosts });
         }
 
