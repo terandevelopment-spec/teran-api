@@ -19,6 +19,12 @@
 			"binding": "R2_MEDIA",
 			"bucket_name": "teran-media"
 		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "UNREAD_KV",
+			"id": "REPLACE_WITH_KV_NAMESPACE_ID"
+		}
 	]
 	/**
 	 * Smart Placement

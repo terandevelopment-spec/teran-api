@@ -7,6 +7,7 @@ export interface Env {
   JWT_SECRET: string;
   CORS_ORIGIN?: string; // optional: "http://localhost:5173" etc
   R2_MEDIA: R2Bucket;    // R2 bucket for media uploads
+  UNREAD_KV: KVNamespace; // KV for unread_count cache
 }
 
 // --------- request_id + response helpers ----------
@@ -1519,43 +1520,38 @@ export default {
           return ok(req, env, request_id, { ok: true });
         }
 
-        // GET /api/notifications/unread_count
+        // GET /api/notifications/unread_count (KV-cached, 15s TTL)
         if (path === "/api/notifications/unread_count" && req.method === "GET") {
-          const UNREAD_CACHE_TTL = 15; // seconds
+          const KV_TTL = 15; // seconds
           const p0 = performance.now();
 
           const user_id = await requireAuth(req, env);
           const p1 = performance.now();
 
-          // Build stable cache key: deterministic URL from hash (same as blocks/relations)
-          const cacheKeyData = `unread_count:${user_id}`;
-          const cacheKeyHash = await sha256Hex(cacheKeyData);
-          const cacheUrl = `https://cache.internal/__cache/unread_count?me=${encodeURIComponent(user_id)}&key=${cacheKeyHash}`;
-          const cacheReq = new Request(cacheUrl.toString(), { method: "GET" });
+          // KV key: simple, deterministic, per-user
+          const kvKey = `unread_count:${user_id}`;
 
-          // Try cache first
-          const cache = caches.default;
-          const cachedResponse = await cache.match(cacheReq);
+          // Try KV first
+          const cached = await env.UNREAD_KV.get(kvKey, "text");
           const p2 = performance.now();
 
-          if (cachedResponse) {
-            // ─── CACHE HIT ───
-            console.log(`[cache] unread_count HIT rid=${request_id} url=${cacheUrl.slice(0, 100)} key=${cacheKeyHash.slice(0, 12)} me=${user_id} total=${(p2 - p0).toFixed(1)}ms`);
-            const body = await cachedResponse.text();
-            return new Response(body, {
+          if (cached !== null) {
+            // ─── KV HIT ───
+            console.log(`[kv] unread_count HIT rid=${request_id} me=${user_id} ttl=${KV_TTL} total=${(p2 - p0).toFixed(1)}ms`);
+            const responseBody = JSON.stringify({ unread_count: parseInt(cached, 10), source: "kv" });
+            return new Response(responseBody, {
               status: 200,
               headers: {
                 "Content-Type": "application/json",
                 "X-Request-Id": request_id,
                 "X-Cache": "HIT",
-                "X-Cache-Key": cacheKeyHash.slice(0, 12),
                 ...corsHeaders(req, env),
               },
             });
           }
 
-          // ─── CACHE MISS ───
-          console.log(`[cache] unread_count MISS rid=${request_id} url=${cacheUrl.slice(0, 100)} key=${cacheKeyHash.slice(0, 12)} me=${user_id}`);
+          // ─── KV MISS ───
+          console.log(`[kv] unread_count MISS rid=${request_id} me=${user_id}`);
 
           // DB query
           const { count, error } = await sb(env)
@@ -1567,43 +1563,29 @@ export default {
 
           if (error) throw error;
 
-          const responseData = { unread_count: count ?? 0 };
-          const responseBody = JSON.stringify(responseData);
+          const unreadCount = count ?? 0;
 
-          console.log(`[perf] unread_count breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} cache_lookup=${(p2 - p1).toFixed(1)} db=${(p3 - p2).toFixed(1)} total=${(p3 - p0).toFixed(1)} count=${count ?? 0}`);
+          // Store in KV with TTL
+          try {
+            await env.UNREAD_KV.put(kvKey, String(unreadCount), { expirationTtl: KV_TTL });
+            console.log(`[kv] unread_count put ok=true rid=${request_id} me=${user_id} count=${unreadCount}`);
+          } catch (err) {
+            console.error(`[kv] unread_count put ok=false rid=${request_id} me=${user_id}`, err);
+          }
+          const p4 = performance.now();
 
-          // Response to client (created first, before cache put)
-          const response = new Response(responseBody, {
+          console.log(`[perf] unread_count breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} kv_lookup=${(p2 - p1).toFixed(1)} db=${(p3 - p2).toFixed(1)} kv_put=${(p4 - p3).toFixed(1)} total=${(p4 - p0).toFixed(1)} count=${unreadCount}`);
+
+          const responseBody = JSON.stringify({ unread_count: unreadCount, source: "db" });
+          return new Response(responseBody, {
             status: 200,
             headers: {
               "Content-Type": "application/json",
               "X-Request-Id": request_id,
               "X-Cache": "MISS",
-              "X-Cache-Key": cacheKeyHash.slice(0, 12),
               ...corsHeaders(req, env),
             },
           });
-
-          // Store in cache — create a clean Response (same pattern as blocks/relations)
-          try {
-            const responseToCache = new Response(responseBody, {
-              status: 200,
-              headers: {
-                "Content-Type": "application/json",
-                "Cache-Control": `public, max-age=${UNREAD_CACHE_TTL}`,
-              },
-            });
-            // Debug: log what we're about to cache
-            const hdrs = responseToCache.headers;
-            console.log(`[cache-debug] unread_count headers rid=${request_id} cc=${hdrs.get("cache-control")} vary=${hdrs.get("vary")} setCookiePresent=${hdrs.has("set-cookie")} ct=${hdrs.get("content-type")}`);
-
-            await cache.put(cacheReq, responseToCache);
-            console.log(`[cache] unread_count put ok=true rid=${request_id} hash=${cacheKeyHash.slice(0, 12)}`);
-          } catch (err) {
-            console.error(`[cache] unread_count put ok=false rid=${request_id} hash=${cacheKeyHash.slice(0, 12)}`, err);
-          }
-
-          return response;
         }
 
         // GET /api/debug/notifications?type=post_like&limit=20 (DEV ONLY - no auth)
