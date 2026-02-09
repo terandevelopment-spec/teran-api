@@ -1527,8 +1527,10 @@ export default {
           const user_id = await requireAuth(req, env);
           const p1 = performance.now();
 
-          // Stable cache key per user
-          const cacheUrl = `https://cache.internal/__cache/unread_count?me=${encodeURIComponent(user_id)}`;
+          // Stable cache key: hash of user_id (same pattern as blocks/relations)
+          const cacheKeyData = `unread_count:${user_id}`;
+          const cacheKeyHash = (await sha256Hex(cacheKeyData)).slice(0, 12);
+          const cacheUrl = `https://cache.internal/__cache/unread_count?me=${encodeURIComponent(user_id)}&key=${cacheKeyHash}`;
           const cacheReq = new Request(cacheUrl, { method: "GET" });
           const cache = caches.default;
           const p2 = performance.now();
@@ -1537,7 +1539,7 @@ export default {
           const cachedResponse = await cache.match(cacheReq);
           if (cachedResponse) {
             const p3 = performance.now();
-            console.log(`[cache] unread_count HIT rid=${request_id} url=${cacheUrl} total=${(p3 - p0).toFixed(1)}ms`);
+            console.log(`[cache] unread_count HIT rid=${request_id} url=${cacheUrl} key=${cacheKeyHash} me=${user_id} total=${(p3 - p0).toFixed(1)}ms`);
             const body = await cachedResponse.text();
             return new Response(body, {
               status: 200,
@@ -1550,7 +1552,7 @@ export default {
             });
           }
           const p3 = performance.now();
-          console.log(`[cache] unread_count MISS rid=${request_id} url=${cacheUrl}`);
+          console.log(`[cache] unread_count MISS rid=${request_id} url=${cacheUrl} key=${cacheKeyHash} me=${user_id}`);
 
           // DB query
           const { count, error } = await sb(env)
@@ -1578,9 +1580,9 @@ export default {
               },
             });
             await cache.put(cacheReq, responseToCache);
-            console.log(`[cache] unread_count put ok=true rid=${request_id}`);
+            console.log(`[cache] unread_count put ok=true rid=${request_id} key=${cacheKeyHash}`);
           } catch (err) {
-            console.error(`[cache] unread_count put ok=false rid=${request_id}`, err);
+            console.error(`[cache] unread_count put ok=false rid=${request_id} key=${cacheKeyHash}`, err);
           }
 
           return new Response(responseBody, {
