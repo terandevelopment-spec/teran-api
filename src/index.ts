@@ -1476,6 +1476,7 @@ export default {
         // GET /api/notifications/unread_count (KV-cached, 60s TTL, non-blocking put)
         if (path === "/api/notifications/unread_count" && req.method === "GET") {
           const KV_TTL = 60; // seconds (KV minimum is 60)
+          const KV_TIMEOUT_MS = 60; // ms — if KV GET takes longer, skip to DB
           const p0 = performance.now();
 
           const user_id = await requireAuth(req, env);
@@ -1484,13 +1485,21 @@ export default {
           // KV key: simple, deterministic, per-user
           const kvKey = `unread_count:${user_id}`;
 
-          // Try KV first
-          const cached = await env.UNREAD_KV.get(kvKey, "text");
+          // Try KV first, with timeout to avoid slow MISS blocking the response
+          const KV_TIMED_OUT = Symbol("KV_TIMED_OUT");
+          const kvResult = await Promise.race([
+            env.UNREAD_KV.get(kvKey, "text"),
+            new Promise<typeof KV_TIMED_OUT>((resolve) =>
+              setTimeout(() => resolve(KV_TIMED_OUT), KV_TIMEOUT_MS)
+            ),
+          ]);
           const p2 = performance.now();
+          const kvTimedOut = kvResult === KV_TIMED_OUT;
+          const cached = kvTimedOut ? null : kvResult;
 
           if (cached !== null) {
             // ─── KV HIT ───
-            console.log(`[kv] unread_count HIT rid=${request_id} me=${user_id} ttl=${KV_TTL} total=${(p2 - p0).toFixed(1)}ms`);
+            console.log(`[kv] unread_count HIT rid=${request_id} me=${user_id} ttl=${KV_TTL} kv_ms=${(p2 - p1).toFixed(1)} total=${(p2 - p0).toFixed(1)}ms`);
             const responseBody = JSON.stringify({ unread_count: parseInt(cached, 10), source: "kv" });
             return new Response(responseBody, {
               status: 200,
@@ -1503,8 +1512,12 @@ export default {
             });
           }
 
-          // ─── KV MISS ───
-          console.log(`[kv] unread_count MISS rid=${request_id} me=${user_id}`);
+          // ─── KV MISS or TIMEOUT ───
+          if (kvTimedOut) {
+            console.log(`[kv] unread_count TIMEOUT rid=${request_id} waited=${KV_TIMEOUT_MS}ms me=${user_id}`);
+          } else {
+            console.log(`[kv] unread_count MISS rid=${request_id} me=${user_id} kv_ms=${(p2 - p1).toFixed(1)}`);
+          }
 
           // DB query
           const { count, error } = await sb(env)
@@ -1525,7 +1538,8 @@ export default {
               .catch((err) => console.error(`[kv] unread_count put ok=false rid=${request_id} me=${user_id}`, err))
           );
 
-          console.log(`[perf] unread_count breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} kv_lookup=${(p2 - p1).toFixed(1)} db=${(p3 - p2).toFixed(1)} total=${(p3 - p0).toFixed(1)} count=${unreadCount} kv_put=async`);
+          const kvLabel = kvTimedOut ? "timeout" : "miss";
+          console.log(`[perf] unread_count breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} kv_lookup=${(p2 - p1).toFixed(1)}(${kvLabel}) db=${(p3 - p2).toFixed(1)} total=${(p3 - p0).toFixed(1)} count=${unreadCount} kv_put=async`);
 
           const responseBody = JSON.stringify({ unread_count: unreadCount, source: "db" });
           return new Response(responseBody, {
@@ -1533,7 +1547,7 @@ export default {
             headers: {
               "Content-Type": "application/json",
               "X-Request-Id": request_id,
-              "X-Cache": "MISS",
+              "X-Cache": kvTimedOut ? "TIMEOUT" : "MISS",
               ...corsHeaders(req, env),
             },
           });
