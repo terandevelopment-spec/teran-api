@@ -259,6 +259,31 @@ async function createNotification(
   }
 }
 
+// --------- room helpers ----------
+async function optionalAuth(req: Request, env: Env): Promise<string | null> {
+  const auth = req.headers.get("Authorization") || "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return null;
+  const payload = await jwtVerify(env, m[1]);
+  return typeof payload?.sub === "string" ? payload.sub : null;
+}
+
+async function checkRoomMembership(env: Env, roomId: string, userId: string): Promise<string | null> {
+  const { data } = await sb(env)
+    .from("room_members")
+    .select("role")
+    .eq("room_id", roomId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  return data?.role ?? null;
+}
+
+function generateInviteToken(): string {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+}
+
 // --------- routes ----------
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -363,6 +388,16 @@ export default {
             }
             // Apply room_id filter if provided
             if (room_id_param) {
+              // Room read policy enforcement (skip for 'global')
+              if (room_id_param !== "global") {
+                const { data: roomRow } = await sb(env).from("rooms").select("read_policy").eq("id", room_id_param).maybeSingle();
+                if (roomRow && roomRow.read_policy === "members_only") {
+                  const callerId = await optionalAuth(req, env);
+                  if (!callerId) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
+                  const memberRole = await checkRoomMembership(env, room_id_param, callerId);
+                  if (!memberRole) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
+                }
+              }
               q = q.eq("room_id", room_id_param);
             }
             // Determine limit (default 50, max 200)
@@ -528,6 +563,15 @@ export default {
           }
           const author_avatar = rawAuthorAvatar;
           const room_id = typeof body?.room_id === "string" ? body.room_id : null;
+
+          // Room post policy enforcement (skip for null or 'global')
+          if (room_id && room_id !== "global") {
+            const { data: roomRow } = await sb(env).from("rooms").select("post_policy").eq("id", room_id).maybeSingle();
+            if (roomRow && roomRow.post_policy === "members_only") {
+              const memberRole = await checkRoomMembership(env, room_id, user_id);
+              if (!memberRole) throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
+            }
+          }
 
           // Parse reply/share fields with robust numeric coercion
           const rawParentPostId = body?.parent_post_id;
@@ -3504,6 +3548,379 @@ export default {
                 ...corsHeaders(req, env),
               },
             });
+          }
+        }
+
+        // ═══════════════════════════════════════════
+        // ROOMS API
+        // ═══════════════════════════════════════════
+
+        // GET /api/rooms — list public rooms
+        if (path === "/api/rooms" && req.method === "GET") {
+          const { data, error } = await sb(env)
+            .from("rooms")
+            .select("id,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,created_at")
+            .eq("visibility", "public")
+            .order("created_at", { ascending: false })
+            .limit(100);
+          if (error) throw new Error(error.message);
+
+          // Attach member_count per room
+          const roomIds = (data || []).map((r: any) => r.id);
+          let countMap: Record<string, number> = {};
+          if (roomIds.length > 0) {
+            const { data: counts } = await sb(env)
+              .from("room_members")
+              .select("room_id")
+              .in("room_id", roomIds);
+            if (counts) {
+              for (const c of counts) {
+                countMap[c.room_id] = (countMap[c.room_id] || 0) + 1;
+              }
+            }
+          }
+
+          const rooms = (data || []).map((r: any) => ({
+            ...r,
+            member_count: countMap[r.id] || 0,
+          }));
+
+          return ok(req, env, request_id, { rooms });
+        }
+
+        // GET /api/rooms/:id — room detail
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)$/);
+          if (m && req.method === "GET") {
+            const roomId = m[1];
+            const { data: room, error } = await sb(env)
+              .from("rooms")
+              .select("*")
+              .eq("id", roomId)
+              .maybeSingle();
+            if (error) throw new Error(error.message);
+            if (!room) throw new HttpError(404, "NOT_FOUND", "Room not found");
+
+            // Private rooms: only members can see details
+            if ((room as any).visibility === "private_invite_only") {
+              const callerId = await optionalAuth(req, env);
+              if (!callerId) throw new HttpError(404, "NOT_FOUND", "Room not found");
+              const role = await checkRoomMembership(env, roomId, callerId);
+              if (!role) throw new HttpError(404, "NOT_FOUND", "Room not found");
+            }
+
+            // Attach member_count
+            const { count } = await sb(env)
+              .from("room_members")
+              .select("*", { count: "exact", head: true })
+              .eq("room_id", roomId);
+
+            // Check caller membership
+            const callerId = await optionalAuth(req, env);
+            let my_role: string | null = null;
+            if (callerId) {
+              my_role = await checkRoomMembership(env, roomId, callerId);
+            }
+
+            return ok(req, env, request_id, {
+              room: { ...(room as any), member_count: count ?? 0 },
+              my_role,
+            });
+          }
+        }
+
+        // POST /api/rooms — create room
+        if (path === "/api/rooms" && req.method === "POST") {
+          const user_id = await requireAuth(req, env);
+          const body = (await req.json().catch(() => null)) as any;
+
+          const name = typeof body?.name === "string" ? body.name.trim() : "";
+          if (!name) throw new HttpError(422, "VALIDATION_ERROR", "name is required");
+          if (name.length > 80) throw new HttpError(422, "VALIDATION_ERROR", "name max 80 chars");
+
+          const description = typeof body?.description === "string" ? body.description.trim().slice(0, 500) : null;
+          const emoji = typeof body?.emoji === "string" ? body.emoji.trim().slice(0, 8) : null;
+          const icon_key = typeof body?.icon_key === "string" ? body.icon_key.trim() : null;
+          if (icon_key && icon_key.startsWith("data:")) {
+            throw new HttpError(422, "VALIDATION_ERROR", "icon_key must not be a data URI");
+          }
+
+          const visibility = typeof body?.visibility === "string" && ["public", "private_invite_only"].includes(body.visibility)
+            ? body.visibility : "public";
+          const read_policy = typeof body?.read_policy === "string" && ["public", "members_only"].includes(body.read_policy)
+            ? body.read_policy : "public";
+          const post_policy = typeof body?.post_policy === "string" && ["public", "members_only"].includes(body.post_policy)
+            ? body.post_policy : "members_only";
+
+          const { data: room, error } = await sb(env)
+            .from("rooms")
+            .insert({
+              name, description, emoji, icon_key,
+              owner_id: user_id,
+              visibility, read_policy, post_policy,
+            })
+            .select()
+            .single();
+          if (error) throw new Error(error.message);
+
+          // Auto-add owner as member
+          await sb(env)
+            .from("room_members")
+            .insert({ room_id: (room as any).id, user_id, role: "owner" });
+
+          return ok(req, env, request_id, { room }, 201);
+        }
+
+        // PATCH /api/rooms/:id — owner update
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)$/);
+          if (m && req.method === "PATCH") {
+            const roomId = m[1];
+            const user_id = await requireAuth(req, env);
+
+            // Verify ownership
+            const ownerRole = await checkRoomMembership(env, roomId, user_id);
+            if (ownerRole !== "owner") throw new HttpError(403, "FORBIDDEN", "Only room owner can update");
+
+            const body = (await req.json().catch(() => null)) as any;
+            const updates: Record<string, any> = {};
+
+            if (typeof body?.name === "string") {
+              const n = body.name.trim();
+              if (!n) throw new HttpError(422, "VALIDATION_ERROR", "name cannot be empty");
+              if (n.length > 80) throw new HttpError(422, "VALIDATION_ERROR", "name max 80 chars");
+              updates.name = n;
+            }
+            if (body?.description !== undefined) {
+              updates.description = typeof body.description === "string" ? body.description.trim().slice(0, 500) : null;
+            }
+            if (body?.emoji !== undefined) {
+              updates.emoji = typeof body.emoji === "string" ? body.emoji.trim().slice(0, 8) : null;
+            }
+            if (body?.icon_key !== undefined) {
+              const ik = typeof body.icon_key === "string" ? body.icon_key.trim() : null;
+              if (ik && ik.startsWith("data:")) {
+                throw new HttpError(422, "VALIDATION_ERROR", "icon_key must not be a data URI");
+              }
+              updates.icon_key = ik;
+            }
+            if (typeof body?.visibility === "string") {
+              if (!["public", "private_invite_only"].includes(body.visibility)) {
+                throw new HttpError(422, "VALIDATION_ERROR", "Invalid visibility value");
+              }
+              updates.visibility = body.visibility;
+            }
+            if (typeof body?.read_policy === "string") {
+              if (!["public", "members_only"].includes(body.read_policy)) {
+                throw new HttpError(422, "VALIDATION_ERROR", "Invalid read_policy value");
+              }
+              updates.read_policy = body.read_policy;
+            }
+            if (typeof body?.post_policy === "string") {
+              if (!["public", "members_only"].includes(body.post_policy)) {
+                throw new HttpError(422, "VALIDATION_ERROR", "Invalid post_policy value");
+              }
+              updates.post_policy = body.post_policy;
+            }
+
+            if (Object.keys(updates).length === 0) {
+              throw new HttpError(422, "VALIDATION_ERROR", "No fields to update");
+            }
+            updates.updated_at = new Date().toISOString();
+
+            const { data: room, error } = await sb(env)
+              .from("rooms")
+              .update(updates)
+              .eq("id", roomId)
+              .select()
+              .single();
+            if (error) throw new Error(error.message);
+
+            return ok(req, env, request_id, { room });
+          }
+        }
+
+        // POST /api/rooms/:id/join — join public room
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)\/join$/);
+          if (m && req.method === "POST") {
+            const roomId = m[1];
+            const user_id = await requireAuth(req, env);
+
+            const { data: room } = await sb(env).from("rooms").select("visibility").eq("id", roomId).maybeSingle();
+            if (!room) throw new HttpError(404, "NOT_FOUND", "Room not found");
+            if ((room as any).visibility === "private_invite_only") {
+              throw new HttpError(403, "FORBIDDEN", "This room is invite-only. Use an invite link to join.");
+            }
+
+            // Upsert membership
+            const existing = await checkRoomMembership(env, roomId, user_id);
+            if (!existing) {
+              const { error } = await sb(env)
+                .from("room_members")
+                .insert({ room_id: roomId, user_id, role: "member" });
+              if (error) throw new Error(error.message);
+            }
+
+            return ok(req, env, request_id, { joined: true });
+          }
+        }
+
+        // POST /api/rooms/:id/leave — leave room
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)\/leave$/);
+          if (m && req.method === "POST") {
+            const roomId = m[1];
+            const user_id = await requireAuth(req, env);
+
+            const role = await checkRoomMembership(env, roomId, user_id);
+            if (!role) throw new HttpError(400, "BAD_REQUEST", "You are not a member of this room");
+            if (role === "owner") throw new HttpError(400, "BAD_REQUEST", "Owner cannot leave the room");
+
+            const { error } = await sb(env)
+              .from("room_members")
+              .delete()
+              .eq("room_id", roomId)
+              .eq("user_id", user_id);
+            if (error) throw new Error(error.message);
+
+            return ok(req, env, request_id, { left: true });
+          }
+        }
+
+        // GET /api/rooms/:id/members — owner-only members list
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)\/members$/);
+          if (m && req.method === "GET") {
+            const roomId = m[1];
+            const user_id = await requireAuth(req, env);
+
+            const myRole = await checkRoomMembership(env, roomId, user_id);
+            if (myRole !== "owner") throw new HttpError(403, "FORBIDDEN", "Only room owner can view members");
+
+            const { data, error } = await sb(env)
+              .from("room_members")
+              .select("user_id,role,created_at")
+              .eq("room_id", roomId)
+              .order("created_at", { ascending: true });
+            if (error) throw new Error(error.message);
+
+            return ok(req, env, request_id, { members: data || [] });
+          }
+        }
+
+        // POST /api/rooms/:id/kick — owner-only kick
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)\/kick$/);
+          if (m && req.method === "POST") {
+            const roomId = m[1];
+            const user_id = await requireAuth(req, env);
+
+            const myRole = await checkRoomMembership(env, roomId, user_id);
+            if (myRole !== "owner") throw new HttpError(403, "FORBIDDEN", "Only room owner can kick members");
+
+            const body = (await req.json().catch(() => null)) as any;
+            const targetUserId = typeof body?.user_id === "string" ? body.user_id : null;
+            if (!targetUserId) throw new HttpError(422, "VALIDATION_ERROR", "user_id is required");
+
+            const targetRole = await checkRoomMembership(env, roomId, targetUserId);
+            if (!targetRole) throw new HttpError(400, "BAD_REQUEST", "User is not a member");
+            if (targetRole === "owner") throw new HttpError(400, "BAD_REQUEST", "Cannot kick the owner");
+
+            const { error } = await sb(env)
+              .from("room_members")
+              .delete()
+              .eq("room_id", roomId)
+              .eq("user_id", targetUserId);
+            if (error) throw new Error(error.message);
+
+            return ok(req, env, request_id, { kicked: true });
+          }
+        }
+
+        // POST /api/rooms/:id/invite/new — owner generates invite token
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)\/invite\/new$/);
+          if (m && req.method === "POST") {
+            const roomId = m[1];
+            const user_id = await requireAuth(req, env);
+
+            const myRole = await checkRoomMembership(env, roomId, user_id);
+            if (myRole !== "owner") throw new HttpError(403, "FORBIDDEN", "Only room owner can create invites");
+
+            // Revoke existing tokens for this room
+            await sb(env)
+              .from("room_invites")
+              .update({ revoked: true })
+              .eq("room_id", roomId)
+              .eq("revoked", false);
+
+            // Create new token
+            const token = generateInviteToken();
+            const { data, error } = await sb(env)
+              .from("room_invites")
+              .insert({ room_id: roomId, token, revoked: false })
+              .select()
+              .single();
+            if (error) throw new Error(error.message);
+
+            return ok(req, env, request_id, { invite: data });
+          }
+        }
+
+        // POST /api/rooms/:id/invite/revoke — owner revokes invite
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)\/invite\/revoke$/);
+          if (m && req.method === "POST") {
+            const roomId = m[1];
+            const user_id = await requireAuth(req, env);
+
+            const myRole = await checkRoomMembership(env, roomId, user_id);
+            if (myRole !== "owner") throw new HttpError(403, "FORBIDDEN", "Only room owner can revoke invites");
+
+            const { error } = await sb(env)
+              .from("room_invites")
+              .update({ revoked: true })
+              .eq("room_id", roomId)
+              .eq("revoked", false);
+            if (error) throw new Error(error.message);
+
+            return ok(req, env, request_id, { revoked: true });
+          }
+        }
+
+        // POST /api/rooms/:id/join_by_invite — join via invite token
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)\/join_by_invite$/);
+          if (m && req.method === "POST") {
+            const roomId = m[1];
+            const user_id = await requireAuth(req, env);
+
+            const body = (await req.json().catch(() => null)) as any;
+            const token = typeof body?.token === "string" ? body.token.trim() : "";
+            if (!token) throw new HttpError(422, "VALIDATION_ERROR", "token is required");
+
+            // Validate invite
+            const { data: invite } = await sb(env)
+              .from("room_invites")
+              .select("id,room_id,revoked")
+              .eq("room_id", roomId)
+              .eq("token", token)
+              .maybeSingle();
+
+            if (!invite) throw new HttpError(403, "FORBIDDEN", "Invalid invite token");
+            if ((invite as any).revoked) throw new HttpError(403, "FORBIDDEN", "This invite has been revoked");
+
+            // Insert membership if not already a member
+            const existing = await checkRoomMembership(env, roomId, user_id);
+            if (!existing) {
+              const { error } = await sb(env)
+                .from("room_members")
+                .insert({ room_id: roomId, user_id, role: "member" });
+              if (error) throw new Error(error.message);
+            }
+
+            return ok(req, env, request_id, { joined: true });
           }
         }
 
