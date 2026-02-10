@@ -1538,19 +1538,20 @@ export default {
           return ok(req, env, request_id, { ok: true });
         }
 
-        // GET /api/notifications/unread_count (KV-cached, 60s TTL, non-blocking put)
+        // GET /api/notifications/unread_count (KV-cached, SWR pattern, 300s TTL)
+        // Fast path: serve from KV immediately, background-refresh via DB.
+        // Sync DB only on true KV MISS (no cached value at all).
         if (path === "/api/notifications/unread_count" && req.method === "GET") {
-          const KV_TTL = 60; // seconds (KV minimum is 60)
-          const KV_TIMEOUT_MS = 60; // ms — if KV GET takes longer, skip to DB
+          const KV_TTL = 300; // seconds (background revalidation keeps it fresh)
+          const KV_TIMEOUT_MS = 60; // ms — if KV GET takes longer, treat as MISS
           const p0 = performance.now();
 
           const user_id = await requireAuth(req, env);
           const p1 = performance.now();
 
-          // KV key: simple, deterministic, per-user
           const kvKey = `unread_count:${user_id}`;
 
-          // Try KV first, with timeout to avoid slow MISS blocking the response
+          // ── KV lookup with timeout ──
           const KV_TIMED_OUT = Symbol("KV_TIMED_OUT");
           const kvResult = await Promise.race([
             env.UNREAD_KV.get(kvKey, "text"),
@@ -1562,9 +1563,37 @@ export default {
           const kvTimedOut = kvResult === KV_TIMED_OUT;
           const cached = kvTimedOut ? null : kvResult;
 
+          // ── Helper: background DB refresh (fire-and-forget) ──
+          const backgroundRefresh = () => {
+            ctx.waitUntil(
+              (async () => {
+                const dbStart = performance.now();
+                try {
+                  const { count, error } = await sb(env)
+                    .from("notifications")
+                    .select("id", { count: "exact", head: true })
+                    .eq("recipient_user_id", user_id)
+                    .eq("is_read", false);
+                  const dbEnd = performance.now();
+                  if (error) {
+                    console.error(`[kv] unread_count bg_refresh db_error rid=${request_id} me=${user_id}`, error);
+                    return;
+                  }
+                  const freshCount = count ?? 0;
+                  await env.UNREAD_KV.put(kvKey, String(freshCount), { expirationTtl: KV_TTL });
+                  console.log(`[kv] unread_count bg_refresh ok rid=${request_id} me=${user_id} count=${freshCount} db_ms=${(dbEnd - dbStart).toFixed(1)}`);
+                } catch (err) {
+                  console.error(`[kv] unread_count bg_refresh fail rid=${request_id} me=${user_id}`, err);
+                }
+              })()
+            );
+          };
+
           if (cached !== null) {
-            // ─── KV HIT ───
-            console.log(`[kv] unread_count HIT rid=${request_id} me=${user_id} ttl=${KV_TTL} kv_ms=${(p2 - p1).toFixed(1)} total=${(p2 - p0).toFixed(1)}ms`);
+            // ── KV HIT: serve immediately, background-refresh (SWR) ──
+            backgroundRefresh();
+            const pDone = performance.now();
+            console.log(`[kv] unread_count SWR_SERVE rid=${request_id} me=${user_id} kv_ms=${(p2 - p1).toFixed(1)} total=${(pDone - p0).toFixed(1)}ms bg_refresh=started`);
             const responseBody = JSON.stringify({ unread_count: parseInt(cached, 10), source: "kv" });
             return new Response(responseBody, {
               status: 200,
@@ -1577,14 +1606,13 @@ export default {
             });
           }
 
-          // ─── KV MISS or TIMEOUT ───
+          // ── KV MISS or TIMEOUT: sync DB query (cold start) ──
           if (kvTimedOut) {
             console.log(`[kv] unread_count TIMEOUT rid=${request_id} waited=${KV_TIMEOUT_MS}ms me=${user_id}`);
           } else {
             console.log(`[kv] unread_count MISS rid=${request_id} me=${user_id} kv_ms=${(p2 - p1).toFixed(1)}`);
           }
 
-          // DB query
           const { count, error } = await sb(env)
             .from("notifications")
             .select("id", { count: "exact", head: true })
@@ -1596,7 +1624,7 @@ export default {
 
           const unreadCount = count ?? 0;
 
-          // Fire-and-forget KV put via waitUntil (non-blocking)
+          // Fire-and-forget KV put
           ctx.waitUntil(
             env.UNREAD_KV.put(kvKey, String(unreadCount), { expirationTtl: KV_TTL })
               .then(() => console.log(`[kv] unread_count put ok=true rid=${request_id} me=${user_id} count=${unreadCount}`))
