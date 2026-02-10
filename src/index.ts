@@ -371,9 +371,9 @@ export default {
             return ok(req, env, request_id, { posts: [] });
           }
 
-          // Parallel fetch: media, like_counts, liked_by_me
+          // Parallel fetch: media + likes (merged likes+likedByMe into 1 query)
           const parallelStart = Date.now();
-          let mediaMs = 0, likesMs = 0, likedByMeMs = 0;
+          let mediaMs = 0, likesMs = 0;
 
           const mediaQuery = (async () => {
             const t = Date.now();
@@ -385,32 +385,21 @@ export default {
             return data ?? [];
           })();
 
-          // Like counts: single batch query, count in JS
+          // Merged likes query: fetch post_id + actor_id in one roundtrip
+          // Compute like_count (group by post_id) and liked_by_me (filter actor_id) in JS
           const likesQuery = (async () => {
             const t = Date.now();
             const { data } = await sb(env)
               .from("post_likes")
-              .select("post_id")
+              .select("post_id, actor_id")
               .in("post_id", postIds);
             likesMs = Date.now() - t;
             return data ?? [];
           })();
 
-          const likedByMeQuery = actor_id_param ? (async () => {
-            const t = Date.now();
-            const { data } = await sb(env)
-              .from("post_likes")
-              .select("post_id")
-              .in("post_id", postIds)
-              .eq("actor_id", actor_id_param);
-            likedByMeMs = Date.now() - t;
-            return data ?? [];
-          })() : Promise.resolve([]);
-
-          const [mediaRows, likeRows, likedRows] = await Promise.all([
+          const [mediaRows, allLikeRows] = await Promise.all([
             mediaQuery,
             likesQuery,
-            likedByMeQuery,
           ]);
           const parallelMs = Date.now() - parallelStart;
           const p4 = performance.now();
@@ -418,9 +407,8 @@ export default {
           console.log(`[perf] /api/posts parallel_queries ${parallelMs}ms`, {
             media: mediaMs,
             likes: likesMs,
-            likedByMe: likedByMeMs,
             mediaCount: mediaRows.length,
-            likeRows: (likeRows as any[]).length,
+            likeRows: (allLikeRows as any[]).length,
           });
 
           // Process results
@@ -430,14 +418,14 @@ export default {
             mediaByPost[m.post_id].push(m);
           }
 
+          // Compute like_count and liked_by_me from merged result
           const likeCounts: Record<number, number> = {};
-          for (const row of likeRows as any[]) {
-            likeCounts[row.post_id] = (likeCounts[row.post_id] || 0) + 1;
-          }
-
           const likedByActorSet = new Set<number>();
-          for (const row of likedRows as any[]) {
-            likedByActorSet.add(row.post_id);
+          for (const row of allLikeRows as any[]) {
+            likeCounts[row.post_id] = (likeCounts[row.post_id] || 0) + 1;
+            if (actor_id_param && row.actor_id === actor_id_param) {
+              likedByActorSet.add(row.post_id);
+            }
           }
 
           // Enrich posts with media, like_count, liked_by_me
