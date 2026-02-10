@@ -315,8 +315,7 @@ export default {
           let q = sb(env)
             .from("posts")
             .select(selectFields)
-            .order("created_at", { ascending: false })
-            .order("id", { ascending: false }); // tie-breaker for stable pagination
+            .order("created_at", { ascending: false });
 
           // Apply filters - priority: id > user_id > author_id > default
           if (id_param) {
@@ -355,7 +354,13 @@ export default {
           const { data: posts, error } = await q;
           const postsQueryMs = Date.now() - t1;
           const p3 = performance.now();
-          console.log(`[perf] /api/posts posts_query ${postsQueryMs}ms`, { id: id_param, count: posts?.length });
+
+          // Granular logging + slow-query alert
+          const filterDesc = id_param ? `id=${id_param}` : [user_id_param && `user_id=${user_id_param}`, author_id_param && `author_id=${author_id_param}`, room_id_param && `room_id=${room_id_param}`].filter(Boolean).join(",") || "feed";
+          console.log(`[perf] /api/posts posts_query ${postsQueryMs}ms`, { id: id_param, count: posts?.length, filter: filterDesc });
+          if (postsQueryMs > 400) {
+            console.log(`[perf] /api/posts SLOW_QUERY rid=${request_id} select_ms=${postsQueryMs} filter=${filterDesc} limit=${limit_param || 50} rows=${posts?.length ?? 0}`);
+          }
           if (error) throw error;
 
           // Fast path: no posts => return immediately
