@@ -292,6 +292,7 @@ export default {
 
         // /api/posts (GET) - filter by ?id=, ?user_id=, ?author_id=, ?room_id=, ?limit=, ?actor_id=
         if (path === "/api/posts" && req.method === "GET") {
+          const FEED_CACHE_TTL = 8; // seconds
           const handlerStart = Date.now();
           const p0 = performance.now();
 
@@ -304,7 +305,33 @@ export default {
           const actor_id_param = url.searchParams.get("actor_id")?.trim() || null;
           const p1 = performance.now();
 
-          // No Cache API for feed — fast enough with indexes, avoids subrequest limit
+          // ── Edge cache: unfiltered feed only ──
+          const isFeed = !id_param && !user_id_param && !author_id_param && !room_id_param;
+          let feedCacheKey: Request | null = null;
+          const cache = caches.default;
+
+          if (isFeed) {
+            const cacheUrl = new URL("https://cache.internal/posts/feed");
+            cacheUrl.searchParams.set("limit", limit_param || "50");
+            if (actor_id_param) cacheUrl.searchParams.set("actor", actor_id_param);
+            feedCacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+
+            const cached = await cache.match(feedCacheKey);
+            if (cached) {
+              const hitBody = await cached.text();
+              const pDone = performance.now();
+              console.log(`[perf] /api/posts cache=HIT rid=${request_id} total=${(pDone - p0).toFixed(1)}ms limit=${limit_param || 50} actor=${actor_id_param || "none"} payloadBytes=${hitBody.length}`);
+              return new Response(hitBody, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Request-Id": request_id,
+                  "X-Cache": "HIT",
+                  ...corsHeaders(req, env),
+                },
+              });
+            }
+          }
 
           // Build base query with conditional select:
           // - Feed lists: lightweight select (content included for card preview)
@@ -452,13 +479,29 @@ export default {
             posts: enrichedPosts.length,
             payloadBytes: responseBody.length,
           });
-          console.log(`[perf] /api/posts breakdown rid=${request_id} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} parallel=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${(p5 - p0).toFixed(1)} rows=${enrichedPosts.length}`);
+          console.log(`[perf] /api/posts breakdown rid=${request_id} cache=MISS params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} parallel=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${(p5 - p0).toFixed(1)} rows=${enrichedPosts.length}`);
+
+          // ── Store in edge cache (feed only, fire-and-forget) ──
+          if (isFeed && feedCacheKey) {
+            ctx.waitUntil(
+              cache.put(feedCacheKey, new Response(responseBody, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Cache-Control": `public, max-age=${FEED_CACHE_TTL}`,
+                },
+              }))
+                .then(() => console.log(`[cache] posts/feed put ok rid=${request_id} limit=${limit_param || 50} actor=${actor_id_param || "none"} ttl=${FEED_CACHE_TTL}s bytes=${responseBody.length}`))
+                .catch((err) => console.error(`[cache] posts/feed put fail rid=${request_id}`, err))
+            );
+          }
 
           return new Response(responseBody, {
             status: 200,
             headers: {
               "Content-Type": "application/json",
               "X-Request-Id": request_id,
+              "X-Cache": isFeed ? "MISS" : "BYPASS",
               ...corsHeaders(req, env),
             },
           });
