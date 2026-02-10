@@ -2866,12 +2866,12 @@ export default {
           }
         }
 
-        // GET /api/news/comments/counts?news_ids=id1,id2,...
+        // GET /api/news/comments/counts?news_ids=id1,id2,...  (Cache API, 60s TTL)
         if (path === "/api/news/comments/counts" && req.method === "GET") {
+          const NEWS_CACHE_TTL = 60; // seconds
           const t0 = Date.now();
           const rid = request_id;
           let idsCount = 0;
-          let isError = 0;
           try {
             const newsIdsParam = url.searchParams.get("news_ids") || "";
             const newsIds = newsIdsParam
@@ -2880,14 +2880,34 @@ export default {
               .filter(s => s.length > 0)
               .slice(0, 200);
             idsCount = newsIds.length;
-            const tParse = Date.now();
 
             if (newsIds.length === 0) {
-              console.log(`[perf] news/comments/counts rid=${rid} parse=${tParse - t0}ms db=0ms transform=0ms total=${Date.now() - t0}ms payloadBytes=14 ids=0 error=0`);
+              console.log(`[perf] news/comments/counts rid=${rid} cache=SKIP total=${Date.now() - t0}ms ids=0 error=0`);
               return ok(req, env, request_id, { counts: {} });
             }
 
-            // Get counts grouped by news_id
+            // Stable cache key: sorted IDs
+            const sortedKey = [...newsIds].sort().join(",");
+            const cacheKey = new Request(`https://cache.internal/news/comments/counts?ids=${sortedKey}`, { method: "GET" });
+            const cache = caches.default;
+            const cached = await cache.match(cacheKey);
+            const tCache = Date.now();
+
+            if (cached) {
+              const hitBody = await cached.text();
+              console.log(`[perf] news/comments/counts rid=${rid} cache=HIT total=${Date.now() - t0}ms ids=${idsCount} payloadBytes=${hitBody.length}`);
+              return new Response(hitBody, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Request-Id": request_id,
+                  "X-Cache": "HIT",
+                  ...corsHeaders(req, env),
+                },
+              });
+            }
+
+            // Cache MISS — query DB
             const tDb0 = Date.now();
             const { data: rows, error } = await sb(env)
               .from("news_comments")
@@ -2901,26 +2921,47 @@ export default {
               countMap[row.news_id] = (countMap[row.news_id] || 0) + 1;
             }
 
-            // Build response with 0 for ids that had no comments
             const counts: Record<string, number> = {};
             for (const id of newsIds) {
               counts[id] = countMap[id] || 0;
             }
             const tEnd = Date.now();
 
-            const responseBody = { counts };
-            const payloadBytes = JSON.stringify(responseBody).length;
-            console.log(`[perf] news/comments/counts rid=${rid} parse=${tParse - t0}ms db=${tDb1 - tDb0}ms transform=${tEnd - tDb1}ms total=${tEnd - t0}ms payloadBytes=${payloadBytes} ids=${idsCount} error=0`);
-            return ok(req, env, request_id, responseBody);
+            const responseBody = { counts, request_id };
+            const body = JSON.stringify(responseBody);
+
+            // Store in edge cache (fire-and-forget)
+            ctx.waitUntil(
+              cache.put(cacheKey, new Response(body, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Cache-Control": `public, max-age=${NEWS_CACHE_TTL}`,
+                },
+              }))
+                .then(() => console.log(`[cache] news/comments/counts put ok rid=${rid} ids=${idsCount}`))
+                .catch((err) => console.error(`[cache] news/comments/counts put fail rid=${rid}`, err))
+            );
+
+            console.log(`[perf] news/comments/counts rid=${rid} cache=MISS cacheCheck=${tCache - t0}ms db=${tDb1 - tDb0}ms transform=${tEnd - tDb1}ms total=${tEnd - t0}ms payloadBytes=${body.length} ids=${idsCount} error=0`);
+            return new Response(body, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+                "X-Cache": "MISS",
+                ...corsHeaders(req, env),
+              },
+            });
           } catch (err: any) {
-            isError = 1;
             console.log(`[perf] news/comments/counts rid=${rid} total=${Date.now() - t0}ms ids=${idsCount} error=1 msg=${err?.message?.slice(0, 100)}`);
             throw err;
           }
         }
 
-        // GET /api/news/comments/recent?news_ids=id1,id2,...&limit=10
+        // GET /api/news/comments/recent?news_ids=id1,id2,...&limit=10  (Cache API, 60s TTL)
         if (path === "/api/news/comments/recent" && req.method === "GET") {
+          const NEWS_CACHE_TTL = 60; // seconds
           const t0 = Date.now();
           const rid = request_id;
           let idsCount = 0;
@@ -2943,14 +2984,34 @@ export default {
               }
             }
             limitUsed = limit;
-            const tParse = Date.now();
 
             if (newsIds.length === 0) {
-              console.log(`[perf] news/comments/recent rid=${rid} parse=${tParse - t0}ms db=0ms transform=0ms total=${Date.now() - t0}ms payloadBytes=14 ids=0 limit=${limitUsed} error=0`);
+              console.log(`[perf] news/comments/recent rid=${rid} cache=SKIP total=${Date.now() - t0}ms ids=0 limit=${limitUsed} error=0`);
               return ok(req, env, request_id, { recent: {} });
             }
 
-            // Fetch all comments for these news_ids, newest first
+            // Stable cache key: sorted IDs + limit
+            const sortedKey = [...newsIds].sort().join(",");
+            const cacheKey = new Request(`https://cache.internal/news/comments/recent?ids=${sortedKey}&limit=${limit}`, { method: "GET" });
+            const cache = caches.default;
+            const cached = await cache.match(cacheKey);
+            const tCache = Date.now();
+
+            if (cached) {
+              const hitBody = await cached.text();
+              console.log(`[perf] news/comments/recent rid=${rid} cache=HIT total=${Date.now() - t0}ms ids=${idsCount} limit=${limitUsed} payloadBytes=${hitBody.length}`);
+              return new Response(hitBody, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Request-Id": request_id,
+                  "X-Cache": "HIT",
+                  ...corsHeaders(req, env),
+                },
+              });
+            }
+
+            // Cache MISS — query DB
             const fetchLimit = newsIds.length * limit * 2;
             const tDb0 = Date.now();
             const { data: allComments, error } = await sb(env)
@@ -2962,7 +3023,6 @@ export default {
             const tDb1 = Date.now();
             if (error) throw error;
 
-            // Group by news_id and take first N per group
             const recent: Record<string, Array<{ id: number; content: string; created_at: string }>> = {};
             for (const id of newsIds) {
               recent[id] = [];
@@ -2978,10 +3038,32 @@ export default {
             }
             const tEnd = Date.now();
 
-            const responseBody = { recent };
-            const payloadBytes = JSON.stringify(responseBody).length;
-            console.log(`[perf] news/comments/recent rid=${rid} parse=${tParse - t0}ms db=${tDb1 - tDb0}ms transform=${tEnd - tDb1}ms total=${tEnd - t0}ms payloadBytes=${payloadBytes} ids=${idsCount} limit=${limitUsed} rows=${(allComments ?? []).length} error=0`);
-            return ok(req, env, request_id, responseBody);
+            const responseBody = { recent, request_id };
+            const body = JSON.stringify(responseBody);
+
+            // Store in edge cache (fire-and-forget)
+            ctx.waitUntil(
+              cache.put(cacheKey, new Response(body, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Cache-Control": `public, max-age=${NEWS_CACHE_TTL}`,
+                },
+              }))
+                .then(() => console.log(`[cache] news/comments/recent put ok rid=${rid} ids=${idsCount} limit=${limitUsed}`))
+                .catch((err) => console.error(`[cache] news/comments/recent put fail rid=${rid}`, err))
+            );
+
+            console.log(`[perf] news/comments/recent rid=${rid} cache=MISS cacheCheck=${tCache - t0}ms db=${tDb1 - tDb0}ms transform=${tEnd - tDb1}ms total=${tEnd - t0}ms payloadBytes=${body.length} ids=${idsCount} limit=${limitUsed} rows=${(allComments ?? []).length} error=0`);
+            return new Response(body, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+                "X-Cache": "MISS",
+                ...corsHeaders(req, env),
+              },
+            });
           } catch (err: any) {
             console.log(`[perf] news/comments/recent rid=${rid} total=${Date.now() - t0}ms ids=${idsCount} limit=${limitUsed} error=1 msg=${err?.message?.slice(0, 100)}`);
             throw err;
