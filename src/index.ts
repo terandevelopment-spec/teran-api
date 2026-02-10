@@ -2854,86 +2854,124 @@ export default {
 
         // GET /api/news/comments/counts?news_ids=id1,id2,...
         if (path === "/api/news/comments/counts" && req.method === "GET") {
-          const newsIdsParam = url.searchParams.get("news_ids") || "";
-          const newsIds = newsIdsParam
-            .split(",")
-            .map(s => s.trim())
-            .filter(s => s.length > 0)
-            .slice(0, 200);
+          const t0 = Date.now();
+          const rid = request_id;
+          let idsCount = 0;
+          let isError = 0;
+          try {
+            const newsIdsParam = url.searchParams.get("news_ids") || "";
+            const newsIds = newsIdsParam
+              .split(",")
+              .map(s => s.trim())
+              .filter(s => s.length > 0)
+              .slice(0, 200);
+            idsCount = newsIds.length;
+            const tParse = Date.now();
 
-          if (newsIds.length === 0) {
-            return ok(req, env, request_id, { counts: {} });
+            if (newsIds.length === 0) {
+              console.log(`[perf] news/comments/counts rid=${rid} parse=${tParse - t0}ms db=0ms transform=0ms total=${Date.now() - t0}ms payloadBytes=14 ids=0 error=0`);
+              return ok(req, env, request_id, { counts: {} });
+            }
+
+            // Get counts grouped by news_id
+            const tDb0 = Date.now();
+            const { data: rows, error } = await sb(env)
+              .from("news_comments")
+              .select("news_id")
+              .in("news_id", newsIds);
+            const tDb1 = Date.now();
+            if (error) throw error;
+
+            const countMap: Record<string, number> = {};
+            for (const row of rows ?? []) {
+              countMap[row.news_id] = (countMap[row.news_id] || 0) + 1;
+            }
+
+            // Build response with 0 for ids that had no comments
+            const counts: Record<string, number> = {};
+            for (const id of newsIds) {
+              counts[id] = countMap[id] || 0;
+            }
+            const tEnd = Date.now();
+
+            const responseBody = { counts };
+            const payloadBytes = JSON.stringify(responseBody).length;
+            console.log(`[perf] news/comments/counts rid=${rid} parse=${tParse - t0}ms db=${tDb1 - tDb0}ms transform=${tEnd - tDb1}ms total=${tEnd - t0}ms payloadBytes=${payloadBytes} ids=${idsCount} error=0`);
+            return ok(req, env, request_id, responseBody);
+          } catch (err: any) {
+            isError = 1;
+            console.log(`[perf] news/comments/counts rid=${rid} total=${Date.now() - t0}ms ids=${idsCount} error=1 msg=${err?.message?.slice(0, 100)}`);
+            throw err;
           }
-
-          // Get counts grouped by news_id
-          const { data: rows, error } = await sb(env)
-            .from("news_comments")
-            .select("news_id")
-            .in("news_id", newsIds);
-          if (error) throw error;
-
-          const countMap: Record<string, number> = {};
-          for (const row of rows ?? []) {
-            countMap[row.news_id] = (countMap[row.news_id] || 0) + 1;
-          }
-
-          // Build response with 0 for ids that had no comments
-          const counts: Record<string, number> = {};
-          for (const id of newsIds) {
-            counts[id] = countMap[id] || 0;
-          }
-
-          return ok(req, env, request_id, { counts });
         }
 
         // GET /api/news/comments/recent?news_ids=id1,id2,...&limit=10
         if (path === "/api/news/comments/recent" && req.method === "GET") {
-          const newsIdsParam = url.searchParams.get("news_ids") || "";
-          const newsIds = newsIdsParam
-            .split(",")
-            .map(s => s.trim())
-            .filter(s => s.length > 0)
-            .slice(0, 100);
+          const t0 = Date.now();
+          const rid = request_id;
+          let idsCount = 0;
+          let limitUsed = 10;
+          try {
+            const newsIdsParam = url.searchParams.get("news_ids") || "";
+            const newsIds = newsIdsParam
+              .split(",")
+              .map(s => s.trim())
+              .filter(s => s.length > 0)
+              .slice(0, 100);
+            idsCount = newsIds.length;
 
-          const limitParam = url.searchParams.get("limit");
-          let limit = 10;
-          if (limitParam) {
-            const parsed = Number(limitParam);
-            if (Number.isFinite(parsed) && parsed > 0) {
-              limit = Math.min(parsed, 50);
+            const limitParam = url.searchParams.get("limit");
+            let limit = 10;
+            if (limitParam) {
+              const parsed = Number(limitParam);
+              if (Number.isFinite(parsed) && parsed > 0) {
+                limit = Math.min(parsed, 50);
+              }
             }
-          }
+            limitUsed = limit;
+            const tParse = Date.now();
 
-          if (newsIds.length === 0) {
-            return ok(req, env, request_id, { recent: {} });
-          }
-
-          // Fetch all comments for these news_ids, newest first
-          const fetchLimit = newsIds.length * limit * 2;
-          const { data: allComments, error } = await sb(env)
-            .from("news_comments")
-            .select("id, news_id, content, created_at")
-            .in("news_id", newsIds)
-            .order("created_at", { ascending: false })
-            .limit(fetchLimit);
-          if (error) throw error;
-
-          // Group by news_id and take first N per group
-          const recent: Record<string, Array<{ id: number; content: string; created_at: string }>> = {};
-          for (const id of newsIds) {
-            recent[id] = [];
-          }
-          for (const c of allComments ?? []) {
-            if (recent[c.news_id] && recent[c.news_id].length < limit) {
-              recent[c.news_id].push({
-                id: c.id,
-                content: c.content,
-                created_at: c.created_at,
-              });
+            if (newsIds.length === 0) {
+              console.log(`[perf] news/comments/recent rid=${rid} parse=${tParse - t0}ms db=0ms transform=0ms total=${Date.now() - t0}ms payloadBytes=14 ids=0 limit=${limitUsed} error=0`);
+              return ok(req, env, request_id, { recent: {} });
             }
-          }
 
-          return ok(req, env, request_id, { recent });
+            // Fetch all comments for these news_ids, newest first
+            const fetchLimit = newsIds.length * limit * 2;
+            const tDb0 = Date.now();
+            const { data: allComments, error } = await sb(env)
+              .from("news_comments")
+              .select("id, news_id, content, created_at")
+              .in("news_id", newsIds)
+              .order("created_at", { ascending: false })
+              .limit(fetchLimit);
+            const tDb1 = Date.now();
+            if (error) throw error;
+
+            // Group by news_id and take first N per group
+            const recent: Record<string, Array<{ id: number; content: string; created_at: string }>> = {};
+            for (const id of newsIds) {
+              recent[id] = [];
+            }
+            for (const c of allComments ?? []) {
+              if (recent[c.news_id] && recent[c.news_id].length < limit) {
+                recent[c.news_id].push({
+                  id: c.id,
+                  content: c.content,
+                  created_at: c.created_at,
+                });
+              }
+            }
+            const tEnd = Date.now();
+
+            const responseBody = { recent };
+            const payloadBytes = JSON.stringify(responseBody).length;
+            console.log(`[perf] news/comments/recent rid=${rid} parse=${tParse - t0}ms db=${tDb1 - tDb0}ms transform=${tEnd - tDb1}ms total=${tEnd - t0}ms payloadBytes=${payloadBytes} ids=${idsCount} limit=${limitUsed} rows=${(allComments ?? []).length} error=0`);
+            return ok(req, env, request_id, responseBody);
+          } catch (err: any) {
+            console.log(`[perf] news/comments/recent rid=${rid} total=${Date.now() - t0}ms ids=${idsCount} limit=${limitUsed} error=1 msg=${err?.message?.slice(0, 100)}`);
+            throw err;
+          }
         }
 
         // --------- BBC RSS Proxy ----------
