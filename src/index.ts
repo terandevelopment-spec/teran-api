@@ -801,59 +801,124 @@ export default {
           return ok(req, env, request_id, { counts });
         }
 
-        // GET /api/comments/preview?post_ids=1,2,3&per_post=1 - Lightweight preview for feed
+        // GET /api/comments/preview?post_ids=1,2,3&per_post=1 (Cache API, 60s TTL)
         // Returns minimal fields: id, post_id, content, author_name, author_avatar, created_at
         // No media, no liked_by_me, no heavy joins
         if (path === "/api/comments/preview" && req.method === "GET") {
-          const postIdsParam = url.searchParams.get("post_ids") || "";
-          const perPostParam = url.searchParams.get("per_post");
-          const perPost = Math.min(3, Math.max(1, parseInt(perPostParam || "1", 10) || 1));
+          const PREVIEW_CACHE_TTL = 60; // seconds
+          const t0 = Date.now();
+          const rid = request_id;
+          let idsCount = 0;
+          let perPostUsed = 1;
+          try {
+            const postIdsParam = url.searchParams.get("post_ids") || "";
+            const perPostParam = url.searchParams.get("per_post");
+            const perPost = Math.min(3, Math.max(1, parseInt(perPostParam || "1", 10) || 1));
+            perPostUsed = perPost;
 
-          const postIds = postIdsParam
-            .split(",")
-            .map(s => parseInt(s.trim(), 10))
-            .filter(n => Number.isFinite(n) && n > 0)
-            .slice(0, 100); // Limit to 100 posts
+            const postIds = postIdsParam
+              .split(",")
+              .map(s => parseInt(s.trim(), 10))
+              .filter(n => Number.isFinite(n) && n > 0)
+              .slice(0, 100);
+            idsCount = postIds.length;
 
-          if (postIds.length === 0) {
-            return ok(req, env, request_id, { previews: {} });
-          }
+            if (postIds.length === 0) {
+              console.log(`[perf] comments/preview rid=${rid} cache=SKIP total=${Date.now() - t0}ms ids=0 per_post=${perPostUsed} error=0`);
+              return ok(req, env, request_id, { previews: {} });
+            }
 
-          // Fetch recent comments for these posts (with buffer for grouping)
-          const fetchLimit = postIds.length * perPost * 3;
-          const { data: rows, error } = await sb(env)
-            .from("comments")
-            .select("id, post_id, content, author_name, author_avatar, created_at")
-            .in("post_id", postIds)
-            .order("created_at", { ascending: false })
-            .limit(fetchLimit);
-          if (error) throw error;
+            // Stable cache key: sorted IDs + per_post
+            const sortedKey = [...postIds].sort((a, b) => a - b).join(",");
+            const cacheKeyUrl = new URL("https://cache.internal/comments/preview");
+            cacheKeyUrl.searchParams.set("ids", sortedKey);
+            cacheKeyUrl.searchParams.set("per_post", String(perPost));
+            const cacheKey = new Request(cacheKeyUrl.toString(), { method: "GET" });
+            const cache = caches.default;
+            const cached = await cache.match(cacheKey);
+            const tCache = Date.now();
 
-          // Group by post_id and keep only perPost per group
-          const previews: Record<string, Array<{
-            id: number;
-            content: string;
-            author_name: string | null;
-            author_avatar: string | null;
-            created_at: string;
-          }>> = {};
-          for (const id of postIds) {
-            previews[String(id)] = [];
-          }
-          for (const row of rows ?? []) {
-            const key = String(row.post_id);
-            if (previews[key] && previews[key].length < perPost) {
-              previews[key].push({
-                id: row.id,
-                content: row.content,
-                author_name: row.author_name,
-                author_avatar: row.author_avatar,
-                created_at: row.created_at,
+            if (cached) {
+              const hitBody = await cached.text();
+              console.log(`[perf] comments/preview rid=${rid} cache=HIT total=${Date.now() - t0}ms ids=${idsCount} per_post=${perPostUsed} payloadBytes=${hitBody.length}`);
+              return new Response(hitBody, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Request-Id": request_id,
+                  "X-Cache": "HIT",
+                  ...corsHeaders(req, env),
+                },
               });
             }
-          }
 
-          return ok(req, env, request_id, { previews });
+            // Cache MISS — query DB
+            const fetchLimit = postIds.length * perPost * 3;
+            const tDb0 = Date.now();
+            const { data: rows, error } = await sb(env)
+              .from("comments")
+              .select("id, post_id, content, author_name, author_avatar, created_at")
+              .in("post_id", postIds)
+              .order("created_at", { ascending: false })
+              .limit(fetchLimit);
+            const tDb1 = Date.now();
+            if (error) throw error;
+
+            // Group by post_id and keep only perPost per group
+            const previews: Record<string, Array<{
+              id: number;
+              content: string;
+              author_name: string | null;
+              author_avatar: string | null;
+              created_at: string;
+            }>> = {};
+            for (const id of postIds) {
+              previews[String(id)] = [];
+            }
+            for (const row of rows ?? []) {
+              const key = String(row.post_id);
+              if (previews[key] && previews[key].length < perPost) {
+                previews[key].push({
+                  id: row.id,
+                  content: row.content,
+                  author_name: row.author_name,
+                  author_avatar: row.author_avatar,
+                  created_at: row.created_at,
+                });
+              }
+            }
+            const tEnd = Date.now();
+
+            const responseBody = { previews, request_id };
+            const body = JSON.stringify(responseBody);
+
+            // Store in edge cache
+            ctx.waitUntil(
+              cache.put(cacheKey, new Response(body, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Cache-Control": `public, max-age=${PREVIEW_CACHE_TTL}`,
+                },
+              }))
+                .then(() => console.log(`[cache] comments/preview put ok rid=${rid} ids=${idsCount}`))
+                .catch((err) => console.error(`[cache] comments/preview put fail rid=${rid}`, err))
+            );
+
+            console.log(`[perf] comments/preview rid=${rid} cache=MISS cacheCheck=${tCache - t0}ms db=${tDb1 - tDb0}ms transform=${tEnd - tDb1}ms total=${tEnd - t0}ms payloadBytes=${body.length} ids=${idsCount} per_post=${perPostUsed} rows=${(rows ?? []).length} error=0`);
+            return new Response(body, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+                "X-Cache": "MISS",
+                ...corsHeaders(req, env),
+              },
+            });
+          } catch (err: any) {
+            console.log(`[perf] comments/preview rid=${rid} total=${Date.now() - t0}ms ids=${idsCount} per_post=${perPostUsed} error=1 msg=${err?.message?.slice(0, 100)}`);
+            throw err;
+          }
         }
 
         // /api/comments (GET) ?post_id=123 (REQUIRED)
@@ -1903,39 +1968,101 @@ export default {
           return ok(req, env, request_id, { saves: saves ?? [] });
         }
 
-        // GET /api/saves/counts?post_ids=1,2,3 - Get save counts for multiple posts (public)
+        // GET /api/saves/counts?post_ids=1,2,3 (Cache API, 60s TTL)
         if (path === "/api/saves/counts" && req.method === "GET") {
-          const postIdsParam = url.searchParams.get("post_ids") || "";
-          const postIds = postIdsParam
-            .split(",")
-            .map(s => parseInt(s.trim(), 10))
-            .filter(n => Number.isFinite(n) && n > 0)
-            .slice(0, 200); // Limit to 200
+          const SAVES_CACHE_TTL = 60; // seconds
+          const t0 = Date.now();
+          const rid = request_id;
+          let idsCount = 0;
+          try {
+            const postIdsParam = url.searchParams.get("post_ids") || "";
+            const postIds = postIdsParam
+              .split(",")
+              .map(s => parseInt(s.trim(), 10))
+              .filter(n => Number.isFinite(n) && n > 0)
+              .slice(0, 200);
+            idsCount = postIds.length;
 
-          if (postIds.length === 0) {
-            throw new HttpError(400, "BAD_REQUEST", "post_ids is required (comma-separated integers)");
+            if (postIds.length === 0) {
+              throw new HttpError(400, "BAD_REQUEST", "post_ids is required (comma-separated integers)");
+            }
+
+            // Stable cache key: sorted IDs
+            const sortedKey = [...postIds].sort((a, b) => a - b).join(",");
+            const cacheKeyUrl = new URL("https://cache.internal/saves/counts");
+            cacheKeyUrl.searchParams.set("ids", sortedKey);
+            const cacheKey = new Request(cacheKeyUrl.toString(), { method: "GET" });
+            const cache = caches.default;
+            const cached = await cache.match(cacheKey);
+            const tCache = Date.now();
+
+            if (cached) {
+              const hitBody = await cached.text();
+              console.log(`[perf] saves/counts rid=${rid} cache=HIT total=${Date.now() - t0}ms ids=${idsCount} payloadBytes=${hitBody.length}`);
+              return new Response(hitBody, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Request-Id": request_id,
+                  "X-Cache": "HIT",
+                  ...corsHeaders(req, env),
+                },
+              });
+            }
+
+            // Cache MISS — query DB
+            const tDb0 = Date.now();
+            const { data: rows, error } = await sb(env)
+              .from("saves")
+              .select("post_id")
+              .in("post_id", postIds);
+            const tDb1 = Date.now();
+            if (error) throw error;
+
+            // Count occurrences
+            const countMap: Record<number, number> = {};
+            for (const row of rows ?? []) {
+              countMap[row.post_id] = (countMap[row.post_id] || 0) + 1;
+            }
+
+            // Fill zeros for requested IDs not in result
+            const counts: Record<string, number> = {};
+            for (const id of postIds) {
+              counts[String(id)] = countMap[id] || 0;
+            }
+            const tEnd = Date.now();
+
+            const responseBody = { counts, request_id };
+            const body = JSON.stringify(responseBody);
+
+            // Store in edge cache
+            ctx.waitUntil(
+              cache.put(cacheKey, new Response(body, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Cache-Control": `public, max-age=${SAVES_CACHE_TTL}`,
+                },
+              }))
+                .then(() => console.log(`[cache] saves/counts put ok rid=${rid} ids=${idsCount}`))
+                .catch((err) => console.error(`[cache] saves/counts put fail rid=${rid}`, err))
+            );
+
+            console.log(`[perf] saves/counts rid=${rid} cache=MISS cacheCheck=${tCache - t0}ms db=${tDb1 - tDb0}ms transform=${tEnd - tDb1}ms total=${tEnd - t0}ms payloadBytes=${body.length} ids=${idsCount} error=0`);
+            return new Response(body, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+                "X-Cache": "MISS",
+                ...corsHeaders(req, env),
+              },
+            });
+          } catch (err: any) {
+            if (err instanceof HttpError) throw err;
+            console.log(`[perf] saves/counts rid=${rid} total=${Date.now() - t0}ms ids=${idsCount} error=1 msg=${err?.message?.slice(0, 100)}`);
+            throw err;
           }
-
-          // Aggregate count per post_id
-          const { data: rows, error } = await sb(env)
-            .from("saves")
-            .select("post_id")
-            .in("post_id", postIds);
-          if (error) throw error;
-
-          // Count occurrences
-          const countMap: Record<number, number> = {};
-          for (const row of rows ?? []) {
-            countMap[row.post_id] = (countMap[row.post_id] || 0) + 1;
-          }
-
-          // Fill zeros for requested IDs not in result
-          const counts: Record<string, number> = {};
-          for (const id of postIds) {
-            counts[String(id)] = countMap[id] || 0;
-          }
-
-          return ok(req, env, request_id, { counts });
         }
 
         // =====================================================
