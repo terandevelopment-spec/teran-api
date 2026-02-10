@@ -2988,10 +2988,13 @@ export default {
           }
         }
 
-        // --------- BBC RSS Proxy ----------
+        // --------- BBC RSS Proxy (Cache API, 120s TTL) ----------
         // GET /api/rss?category=<category>
         // Returns news articles in NewsData.io-compatible format from BBC RSS feeds
         if (path === "/api/rss" && req.method === "GET") {
+          const RSS_CACHE_TTL = 120; // seconds
+          const t0 = Date.now();
+
           // Category -> BBC RSS URL mapping (allowlist)
           const RSS_FEEDS: Record<string, string> = {
             technology: "http://feeds.bbci.co.uk/news/technology/rss.xml",
@@ -3021,6 +3024,30 @@ export default {
             });
           }
 
+          // ── Cache API: check edge cache first ──
+          const cacheKey = new Request(`https://cache.internal/rss?category=${category}`, { method: "GET" });
+          const cache = caches.default;
+          const cached = await cache.match(cacheKey);
+          const tCache = Date.now();
+
+          if (cached) {
+            // Clone so we can add per-request headers without mutating cached copy
+            const hitBody = await cached.text();
+            console.log(`[perf] rss rid=${request_id} cache=HIT total=${Date.now() - t0}ms category=${category} payloadBytes=${hitBody.length}`);
+            return new Response(hitBody, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+                "X-Cache": "HIT",
+                "X-Category": category,
+                "Cache-Control": `public, max-age=${RSS_CACHE_TTL}`,
+                ...corsHeaders(req, env),
+              },
+            });
+          }
+
+          // ── Cache MISS: fetch + parse upstream RSS ──
           const rssUrl = RSS_FEEDS[category];
 
           try {
@@ -3036,6 +3063,7 @@ export default {
               },
             });
             clearTimeout(timeoutId);
+            const tFetch = Date.now();
 
             if (!rssResponse.ok) {
               console.error(`[RSS] Fetch failed: ${rssUrl} -> ${rssResponse.status}`);
@@ -3137,18 +3165,41 @@ export default {
               if (!b.pubDate) return -1;
               return new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime();
             });
+            const tParse = Date.now();
 
-            // Build response
-            const response = new Response(JSON.stringify({
+            // Build response body
+            const body = JSON.stringify({
               status: "success",
               results: items,
               request_id,
-            }), {
+            });
+
+            // Store in Cache API (fire-and-forget via waitUntil)
+            const cacheResponse = new Response(body, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "Cache-Control": `public, max-age=${RSS_CACHE_TTL}`,
+                "X-Category": category,
+              },
+            });
+            ctx.waitUntil(
+              cache.put(cacheKey, cacheResponse)
+                .then(() => console.log(`[cache] rss put ok category=${category} rid=${request_id}`))
+                .catch((err) => console.error(`[cache] rss put fail category=${category} rid=${request_id}`, err))
+            );
+
+            const tEnd = Date.now();
+            console.log(`[perf] rss rid=${request_id} cache=MISS category=${category} cacheCheck=${tCache - t0}ms fetch=${tFetch - tCache}ms parse=${tParse - tFetch}ms total=${tEnd - t0}ms payloadBytes=${body.length} items=${items.length}`);
+
+            // Build response
+            const response = new Response(body, {
               status: 200,
               headers: {
                 "Content-Type": "application/json",
                 "X-Request-Id": request_id,
-                "Cache-Control": "public, max-age=600", // 10 minute cache
+                "X-Cache": "MISS",
+                "Cache-Control": `public, max-age=${RSS_CACHE_TTL}`,
                 "X-Category": category,
                 ...corsHeaders(req, env),
               },
