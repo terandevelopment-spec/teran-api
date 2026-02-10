@@ -3107,15 +3107,17 @@ export default {
           }
 
           // ── Cache API: check edge cache first ──
-          const cacheKey = new Request(`https://cache.internal/rss?category=${category}`, { method: "GET" });
+          const cacheUrl = new URL("https://cache.internal/rss");
+          cacheUrl.searchParams.set("category", category);
+          const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
           const cache = caches.default;
           const cached = await cache.match(cacheKey);
           const tCache = Date.now();
+          const colo = (req as any).cf?.colo || "unknown";
 
           if (cached) {
-            // Clone so we can add per-request headers without mutating cached copy
             const hitBody = await cached.text();
-            console.log(`[perf] rss rid=${request_id} cache=HIT total=${Date.now() - t0}ms category=${category} payloadBytes=${hitBody.length}`);
+            console.log(`[perf] rss rid=${request_id} cache=HIT total=${Date.now() - t0}ms category=${category} payloadBytes=${hitBody.length} colo=${colo} key=${cacheKey.url}`);
             return new Response(hitBody, {
               status: 200,
               headers: {
@@ -3256,23 +3258,23 @@ export default {
               request_id,
             });
 
-            // Store in Cache API (fire-and-forget via waitUntil)
+            // Store in Cache API (await to ensure entry is written before next request)
             const cacheResponse = new Response(body, {
               status: 200,
               headers: {
                 "Content-Type": "application/json",
                 "Cache-Control": `public, max-age=${RSS_CACHE_TTL}`,
-                "X-Category": category,
               },
             });
-            ctx.waitUntil(
-              cache.put(cacheKey, cacheResponse)
-                .then(() => console.log(`[cache] rss put ok category=${category} rid=${request_id}`))
-                .catch((err) => console.error(`[cache] rss put fail category=${category} rid=${request_id}`, err))
-            );
+            try {
+              await cache.put(cacheKey, cacheResponse);
+              console.log(`[cache] rss put ok category=${category} rid=${request_id} key=${cacheKey.url} colo=${colo}`);
+            } catch (putErr: any) {
+              console.error(`[cache] rss put fail category=${category} rid=${request_id}`, putErr);
+            }
 
             const tEnd = Date.now();
-            console.log(`[perf] rss rid=${request_id} cache=MISS category=${category} cacheCheck=${tCache - t0}ms fetch=${tFetch - tCache}ms parse=${tParse - tFetch}ms total=${tEnd - t0}ms payloadBytes=${body.length} items=${items.length}`);
+            console.log(`[perf] rss rid=${request_id} cache=MISS category=${category} cacheCheck=${tCache - t0}ms fetch=${tFetch - tCache}ms parse=${tParse - tFetch}ms total=${tEnd - t0}ms payloadBytes=${body.length} items=${items.length} colo=${colo} key=${cacheKey.url}`);
 
             // Build response
             const response = new Response(body, {
