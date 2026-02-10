@@ -356,10 +356,11 @@ export default {
           const p3 = performance.now();
 
           // Granular logging + slow-query alert
+          // NOTE: no { count: "exact" } is used — entire posts_query time IS select_ms, count_ms=0
           const filterDesc = id_param ? `id=${id_param}` : [user_id_param && `user_id=${user_id_param}`, author_id_param && `author_id=${author_id_param}`, room_id_param && `room_id=${room_id_param}`].filter(Boolean).join(",") || "feed";
-          console.log(`[perf] /api/posts posts_query ${postsQueryMs}ms`, { id: id_param, count: posts?.length, filter: filterDesc });
+          console.log(`[perf] /api/posts posts_query_split rid=${request_id} select_ms=${postsQueryMs} count_ms=0 filter=${filterDesc} limit=${limit_param || 50} rows=${posts?.length ?? 0}`);
           if (postsQueryMs > 400) {
-            console.log(`[perf] /api/posts SLOW_QUERY rid=${request_id} select_ms=${postsQueryMs} filter=${filterDesc} limit=${limit_param || 50} rows=${posts?.length ?? 0}`);
+            console.log(`[perf] /api/posts SLOW_QUERY rid=${request_id} select_ms=${postsQueryMs} count_ms=0 filter=${filterDesc} limit=${limit_param || 50} rows=${posts?.length ?? 0}`);
           }
           if (error) throw error;
 
