@@ -1715,7 +1715,7 @@ export default {
           const content_type = typeof body?.content_type === "string" ? body.content_type : null;
 
           // Validate kind
-          const validKinds = ["image_original", "image_thumb", "video_original", "video_thumb", "video", "thumb"] as const;
+          const validKinds = ["image_original", "image_thumb", "video_original", "video_thumb", "video", "thumb", "avatar"] as const;
           if (!kind || !validKinds.includes(kind as any)) {
             throw new HttpError(422, "VALIDATION_ERROR", `kind must be one of: ${validKinds.join(", ")}`);
           }
@@ -1729,6 +1729,7 @@ export default {
           const isImage = kind.startsWith("image_");
           const isVideo = kind.startsWith("video_") || kind === "video";
           const isThumb = kind === "thumb"; // thumbs are images but go to thumb/ prefix
+          const isAvatar = kind === "avatar"; // avatars are images, go to avatar/ prefix
           if (isImage && !content_type.startsWith("image/")) {
             throw new HttpError(422, "VALIDATION_ERROR", "content_type must start with image/ for image kinds");
           }
@@ -1737,6 +1738,9 @@ export default {
           }
           if (isThumb && !content_type.startsWith("image/")) {
             throw new HttpError(422, "VALIDATION_ERROR", "content_type must start with image/ for thumb kind");
+          }
+          if (isAvatar && !content_type.startsWith("image/")) {
+            throw new HttpError(422, "VALIDATION_ERROR", "content_type must start with image/ for avatar kind");
           }
 
           // Server-side video size limit (50MB)
@@ -1751,7 +1755,7 @@ export default {
           let keyPrefix = kind;
           if (kind === "thumb") keyPrefix = "thumb";
 
-          const ext = content_type.split("/")[1]?.split(";")[0] || (isImage || isThumb ? "jpg" : "mp4");
+          const ext = content_type.split("/")[1]?.split(";")[0] || (isImage || isThumb || isAvatar ? "jpg" : "mp4");
           const timestamp = Date.now();
           const uniqueId = crypto.randomUUID();
           const key = `${keyPrefix}/${user_id}/${timestamp}_${uniqueId}.${ext}`;
@@ -2556,6 +2560,10 @@ export default {
             bio: typeof body?.bio === "string" ? body.bio : null,
             avatar: typeof body?.avatar === "string" ? body.avatar : null,
           };
+          // Reject data URIs — avatar must be an R2 key or icon ID
+          if (incoming.avatar && incoming.avatar.startsWith("data:")) {
+            throw new HttpError(422, "VALIDATION_ERROR", "avatar must be a URL or key, not a data URI");
+          }
           const p1 = performance.now();
 
           console.log(`[profile-sync] incoming rid=${request_id} user=${trimmedUserId} dn=${incoming.display_name} avatar=${incoming.avatar?.slice(0, 30) ?? "null"}`);
