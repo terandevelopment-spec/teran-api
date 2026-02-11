@@ -3561,7 +3561,7 @@ export default {
         if (path === "/api/rooms" && req.method === "GET") {
           const { data, error } = await sb(env)
             .from("rooms")
-            .select("id,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,created_at")
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,created_at")
             .eq("visibility", "public")
             .order("created_at", { ascending: false })
             .limit(100);
@@ -3631,6 +3631,20 @@ export default {
           }
         }
 
+        // GET /api/rooms/lookup — find room by room_key (unlisted discovery)
+        if (path === "/api/rooms/lookup" && req.method === "GET") {
+          const key = url.searchParams.get("key")?.trim();
+          if (!key) throw new HttpError(400, "VALIDATION_ERROR", "key is required");
+          const { data, error } = await sb(env)
+            .from("rooms")
+            .select("id,room_key,name,description,icon_key")
+            .eq("room_key", key)
+            .maybeSingle();
+          if (error) throw new Error(error.message);
+          if (!data) throw new HttpError(404, "NOT_FOUND", "Room not found");
+          return ok(req, env, request_id, { room: data });
+        }
+
         // POST /api/rooms — create room
         if (path === "/api/rooms" && req.method === "POST") {
           const user_id = await requireAuth(req, env);
@@ -3641,25 +3655,20 @@ export default {
           if (name.length > 80) throw new HttpError(422, "VALIDATION_ERROR", "name max 80 chars");
 
           const description = typeof body?.description === "string" ? body.description.trim().slice(0, 500) : null;
-          const emoji = typeof body?.emoji === "string" ? body.emoji.trim().slice(0, 8) : null;
           const icon_key = typeof body?.icon_key === "string" ? body.icon_key.trim() : null;
           if (icon_key && icon_key.startsWith("data:")) {
             throw new HttpError(422, "VALIDATION_ERROR", "icon_key must not be a data URI");
           }
 
-          const visibility = typeof body?.visibility === "string" && ["public", "private_invite_only"].includes(body.visibility)
-            ? body.visibility : "public";
-          const read_policy = typeof body?.read_policy === "string" && ["public", "members_only"].includes(body.read_policy)
-            ? body.read_policy : "public";
-          const post_policy = typeof body?.post_policy === "string" && ["public", "members_only"].includes(body.post_policy)
-            ? body.post_policy : "members_only";
+          // Generate random room_key (16 hex chars)
+          const room_key = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
 
           const { data: room, error } = await sb(env)
             .from("rooms")
             .insert({
-              name, description, emoji, icon_key,
+              name, description, icon_key, room_key,
               owner_id: user_id,
-              visibility, read_policy, post_policy,
+              visibility: "public", read_policy: "public", post_policy: "public",
             })
             .select()
             .single();
