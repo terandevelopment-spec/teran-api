@@ -548,8 +548,11 @@ export default {
 
           const body = (await req.json().catch(() => null)) as any;
           const content = typeof body?.content === "string" ? body.content.trim() : "";
-          if (!content) {
-            throw new HttpError(422, "VALIDATION_ERROR", "content required");
+
+          // Parse media early so we can validate content OR media requirement
+          const mediaInput = Array.isArray(body?.media) ? body.media : [];
+          if (!content && mediaInput.length === 0) {
+            throw new HttpError(422, "VALIDATION_ERROR", "content or media required");
           }
 
           // Parse optional author fields from request
@@ -585,8 +588,7 @@ export default {
           const rawSharedPostId = body?.shared_post_id;
           const shared_post_id = rawSharedPostId != null ? (Number.isFinite(Number(rawSharedPostId)) ? Number(rawSharedPostId) : null) : null;
 
-          // Parse optional media array
-          const mediaInput = Array.isArray(body?.media) ? body.media : [];
+          // Media limits
           const MAX_IMAGES = 4;
           const MAX_VIDEOS = 1;
 
