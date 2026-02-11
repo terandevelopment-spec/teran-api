@@ -3590,6 +3590,20 @@ export default {
           return ok(req, env, request_id, { rooms });
         }
 
+        // GET /api/rooms/lookup — find room by room_key (unlisted discovery)
+        if (path === "/api/rooms/lookup" && req.method === "GET") {
+          const key = url.searchParams.get("key")?.trim();
+          if (!key) throw new HttpError(400, "VALIDATION_ERROR", "key is required");
+          const { data, error } = await sb(env)
+            .from("rooms")
+            .select("id,room_key,name,description,icon_key")
+            .eq("room_key", key)
+            .maybeSingle();
+          if (error) throw new Error(error.message);
+          if (!data) throw new HttpError(404, "NOT_FOUND", "Room not found");
+          return ok(req, env, request_id, { room: data });
+        }
+
         // GET /api/rooms/:id — room detail
         {
           const m = path.match(/^\/api\/rooms\/([^/]+)$/);
@@ -3629,20 +3643,6 @@ export default {
               my_role,
             });
           }
-        }
-
-        // GET /api/rooms/lookup — find room by room_key (unlisted discovery)
-        if (path === "/api/rooms/lookup" && req.method === "GET") {
-          const key = url.searchParams.get("key")?.trim();
-          if (!key) throw new HttpError(400, "VALIDATION_ERROR", "key is required");
-          const { data, error } = await sb(env)
-            .from("rooms")
-            .select("id,room_key,name,description,icon_key")
-            .eq("room_key", key)
-            .maybeSingle();
-          if (error) throw new Error(error.message);
-          if (!data) throw new HttpError(404, "NOT_FOUND", "Room not found");
-          return ok(req, env, request_id, { room: data });
         }
 
         // POST /api/rooms — create room
