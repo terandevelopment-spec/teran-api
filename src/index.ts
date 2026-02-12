@@ -8,6 +8,7 @@ export interface Env {
   CORS_ORIGIN?: string; // optional: "http://localhost:5173" etc
   R2_MEDIA: R2Bucket;    // R2 bucket for media uploads
   UNREAD_KV: KVNamespace; // KV for unread_count cache
+  OPENAI_API_KEY: string;  // OpenAI API key for genre classification
 }
 
 // --------- request_id + response helpers ----------
@@ -361,7 +362,7 @@ export default {
           // Build base query with conditional select:
           // - Feed lists: lightweight select (content included for card preview)
           // - Single post by id: include full data for PostDetail
-          const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id";
+          const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre";
           const selectFields = id_param ? "*" : feedSelectFields;
 
           let q = sb(env)
@@ -726,6 +727,64 @@ export default {
             } else {
               console.log(`[notif][${request_id}] skipping self-reply`, { parent_post_id, user_id });
             }
+          }
+
+          // ── Async AI genre classification (threads only) ──
+          if (!room_id && !parent_post_id && env.OPENAI_API_KEY) {
+            const postId = data.id;
+            const classifyTitle = title || "";
+            const classifyContent = (content || "").slice(0, 800);
+            ctx.waitUntil((async () => {
+              const VALID_GENRES = ["Chat", "Learn", "Tech", "Work", "Health", "Relationships", "Society", "Create", "Sports"];
+              try {
+                console.log(`[genre] classify_start`, { postId, request_id });
+                const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+                  },
+                  body: JSON.stringify({
+                    model: "gpt-4o-mini",
+                    temperature: 0,
+                    max_tokens: 30,
+                    messages: [
+                      {
+                        role: "system",
+                        content: `You are a post classifier. Choose exactly one genre from: ${VALID_GENRES.join(", ")}. Output JSON only: {"genre":"<value>"} or {"genre":null} if unsure. No extra text.`,
+                      },
+                      {
+                        role: "user",
+                        content: classifyTitle + (classifyContent ? "\n\n" + classifyContent : ""),
+                      },
+                    ],
+                  }),
+                });
+                if (!aiRes.ok) {
+                  const errText = await aiRes.text().catch(() => "unknown");
+                  console.error(`[genre] classify_error openai_status=${aiRes.status}`, { postId, request_id, errText });
+                  return;
+                }
+                const aiData = await aiRes.json() as any;
+                const raw = aiData?.choices?.[0]?.message?.content?.trim() || "";
+                let genre: string | null = null;
+                try {
+                  const parsed = JSON.parse(raw);
+                  if (parsed?.genre && VALID_GENRES.includes(parsed.genre)) {
+                    genre = parsed.genre;
+                  }
+                } catch {
+                  console.warn(`[genre] classify_parse_fail`, { postId, request_id, raw });
+                  return;
+                }
+                if (genre) {
+                  await sb(env).from("posts").update({ genre }).eq("id", postId);
+                }
+                console.log(`[genre] classify_result`, { postId, request_id, genre });
+              } catch (err: any) {
+                console.error(`[genre] classify_error`, { postId, request_id, message: err?.message });
+              }
+            })());
           }
 
           return ok(req, env, request_id, { post: { ...data, media: mediaRows } }, 201);
