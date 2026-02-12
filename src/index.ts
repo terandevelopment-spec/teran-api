@@ -3592,15 +3592,24 @@ export default {
 
         // GET /api/rooms/lookup — find room by room_key (unlisted discovery)
         if (path === "/api/rooms/lookup" && req.method === "GET") {
+          console.log("[ROOM_LOOKUP] hit", { request_id, method: req.method, path, url: url.toString() });
           const key = url.searchParams.get("key")?.trim();
+          console.log("[ROOM_LOOKUP] key:", key);
           if (!key) throw new HttpError(400, "VALIDATION_ERROR", "key is required");
           const { data, error } = await sb(env)
             .from("rooms")
             .select("id,room_key,name,description,icon_key")
             .eq("room_key", key)
             .maybeSingle();
-          if (error) throw new Error(error.message);
-          if (!data) throw new HttpError(404, "NOT_FOUND", "Room not found");
+          if (error) {
+            console.log("[ROOM_LOOKUP] error", { key, message: error.message });
+            throw new Error(error.message);
+          }
+          if (!data) {
+            console.log("[ROOM_LOOKUP] not_found", { key });
+            throw new HttpError(404, "NOT_FOUND", "Room not found");
+          }
+          console.log("[ROOM_LOOKUP] found", { id: (data as any).id, room_key: (data as any).room_key, name: (data as any).name });
           return ok(req, env, request_id, { room: data });
         }
 
