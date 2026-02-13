@@ -730,12 +730,102 @@ export default {
           }
 
           // ── Async AI genre classification (threads only) ──
+          // Chain: Anchors dictionary → OpenAI → Chat fallback
           if (!room_id && !parent_post_id && env.OPENAI_API_KEY) {
             const postId = data.id;
             const classifyTitle = title || "";
             const classifyContent = (content || "").slice(0, 800);
             ctx.waitUntil((async () => {
-              const VALID_GENRES = ["Chat", "Learn", "Tech", "Work", "Health", "Relationships", "Society", "Create", "Sports"];
+              const VALID_GENRES = new Set(["Chat", "Learn", "Tech", "Work", "Health", "Relationships", "Society", "Create", "Sports"]);
+              const FALLBACK_GENRE = "Chat";
+              const inputText = (classifyTitle + "\n\n" + classifyContent).toLowerCase();
+
+              // Best-effort update helper — never throws
+              const persistGenre = async (g: string) => {
+                try {
+                  await sb(env).from("posts").update({ genre: g }).eq("id", postId);
+                } catch (ue: any) {
+                  console.error(`[genre] update_error`, { postId, request_id, genre: g, message: ue?.message });
+                }
+              };
+
+              // ── Anchors dictionary (priority order, first match wins) ──
+              const ANCHOR_MAP: [string, string[]][] = [
+                ["Relationships", [
+                  "cheat", "cheating", "affair", "unfaithful", "infidelity",
+                  "breakup", "break up", "divorce", "separated",
+                  "dating", "tinder", "bumble", "hinge",
+                  "boyfriend", "girlfriend", "fiance", "fiancée", "husband", "wife",
+                  "boundary", "boundaries", "trust issues", "betrayal",
+                ]],
+                ["Health", [
+                  "workout", "gym", "lifting", "strength training", "hypertrophy",
+                  "squat", "deadlift", "bench press", "pull-up", "push-up",
+                  "calories", "macros", "protein", "cut", "bulk", "body fat",
+                  "sleep apnea", "insomnia", "migraine", "injury", "rehab",
+                ]],
+                ["Tech", [
+                  "react", "react native", "expo", "vite",
+                  "typescript", "javascript", "node", "npm",
+                  "api", "endpoint", "webhook", "oauth", "jwt",
+                  "supabase", "postgres", "sql", "rls",
+                  "cloudflare", "workers", "wrangler", "pages",
+                ]],
+                ["Work", [
+                  "salary", "compensation", "raise", "promotion",
+                  "job offer", "interview", "resume", "recruiter",
+                  "startup", "founder", "cofounder", "pitch deck",
+                  "revenue", "profit", "burn rate", "runway",
+                  "investing", "portfolio", "stocks", "crypto",
+                ]],
+                ["Society", [
+                  "election", "voting", "parliament", "congress",
+                  "policy", "regulation", "law", "bill", "amendment",
+                  "tax", "inflation", "recession", "unemployment",
+                  "war", "conflict", "sanctions", "geopolitics",
+                  "immigration", "climate change", "inequality",
+                ]],
+                ["Create", [
+                  "song", "beat", "lyrics", "chorus", "hook", "verse",
+                  "mixing", "mastering", "bpm", "808", "hi-hat",
+                  "drawing", "illustration", "painting", "sculpture",
+                  "writing a novel", "screenplay", "script", "storyboard",
+                  "logo", "typography", "ui design", "graphic design",
+                ]],
+                ["Sports", [
+                  "match", "game day", "tournament", "playoffs",
+                  "league", "season", "roster", "draft",
+                  "coach", "team", "opponent", "halftime",
+                  "fifa", "nba", "nfl", "mlb", "ufc",
+                ]],
+                ["Learn", [
+                  "explain like i'm five", "eli5",
+                  "difference between", "pros and cons", "compare",
+                  "what is", "how does", "why does",
+                  "beginner guide", "tutorial", "step by step",
+                  "theory", "concept", "definition",
+                ]],
+              ];
+
+              function genreFromAnchors(text: string): string | null {
+                for (const [genre, anchors] of ANCHOR_MAP) {
+                  for (const anchor of anchors) {
+                    if (text.includes(anchor)) return genre;
+                  }
+                }
+                return null;
+              }
+
+              // ── Step 1: Try anchors ──
+              const dictGenre = genreFromAnchors(inputText);
+              if (dictGenre) {
+                console.log(`[genre] dict_match`, { postId, request_id, matched: true, finalGenre: dictGenre });
+                await persistGenre(dictGenre);
+                return;
+              }
+              console.log(`[genre] dict_match`, { postId, request_id, matched: false, finalGenre: null });
+
+              // ── Step 2: OpenAI classifier ──
               try {
                 console.log(`[genre] classify_start`, { postId, request_id });
                 const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -751,7 +841,27 @@ export default {
                     messages: [
                       {
                         role: "system",
-                        content: `You are a post classifier. Choose exactly one genre from: ${VALID_GENRES.join(", ")}. Output JSON only: {"genre":"<value>"} or {"genre":null} if unsure. No extra text.`,
+                        content: [
+                          `You are a strict genre classifier for short social posts. Choose exactly ONE genre from: ${[...VALID_GENRES].join(", ")}.`,
+                          `Use the post's meaning and context (not just keywords). You MAY use general world knowledge for proper nouns (artists, politicians, companies, sports teams, etc.).`,
+                          `Definitions + typical examples:`,
+                          `1) Relationships – Interpersonal relationships: dating, cheating, breakup, marriage, family, friends, workplace relationships, trust, boundaries, conflict, reconciliation. Examples: "My partner cheated", "I fought with my brother", "How do I set boundaries with a friend?"`,
+                          `2) Health – Body/mind/habits: workouts, training, nutrition, sleep, recovery, injury, stress/anxiety, routines. Examples: "3-day strength program?", "How to fix my sleep schedule", "Recovering from an injury"`,
+                          `3) Tech – Software/engineering/tools: coding, bugs, APIs, deployments, databases, devices, AI tooling and development. Examples: "React re-render issue", "Supabase RLS question", "Cloudflare Workers deploy error"`,
+                          `4) Work – Career/money/business: jobs, interviews, salary, workplace issues (non-relationship aspect), startups, marketing, pricing, investing/finance. Examples: "Negotiating a raise", "Should I join a startup?", "Subscription pricing strategy"`,
+                          `5) Society – News/politics/systems/global issues: elections, policy, economy, institutions, geopolitics, social problems. Examples: "Election incentives online", "Tax policy impact", "Why platforms reward outrage?"`,
+                          `6) Create – Creative work and culture: music/art/writing/design/filmmaking, creative projects, creative process, artists and works. Examples: "Writing lyrics", "Beat making", "Aphex Twin discussion", "Designing a logo"`,
+                          `7) Sports – Sports and competition: teams, matches, leagues, training for a sport, watching sports, tactics. Examples: "NBA playoffs", "Soccer training plan", "How to improve my serve"`,
+                          `8) Learn – Learning/explanations/how-to/analysis: asking for definitions, explanations, comparisons, tutorials, conceptual breakdowns. Examples: "What is X?", "Difference between A and B?", "Explain this concept step-by-step"`,
+                          `9) Chat – Casual conversation, diary-like posts, jokes, reactions, small talk, quick advice when no other category clearly fits. Examples: "Random rant about notifications", "Just sharing a thought", "What do you think about this?"`,
+                          `Decision rules:`,
+                          `- If the post is primarily about interpersonal conflict/repair/trust/boundaries (including family) -> Relationships.`,
+                          `- If it's about workouts/nutrition/sleep/mental health habits -> Health.`,
+                          `- If it's about making/performing/discussing art/music/creative works or artists -> Create.`,
+                          `- If it's politics/news/systems/global issues -> Society.`,
+                          `- If unsure between multiple genres, choose the best fit; if still unsure, choose Chat.`,
+                          `- Output MUST be strict JSON ONLY with no extra keys and no prose: {"genre":"<ONE_OF_THE_9>"}`,
+                        ].join("\n"),
                       },
                       {
                         role: "user",
@@ -763,26 +873,30 @@ export default {
                 if (!aiRes.ok) {
                   const errText = await aiRes.text().catch(() => "unknown");
                   console.error(`[genre] classify_error openai_status=${aiRes.status}`, { postId, request_id, errText });
+                  await persistGenre(FALLBACK_GENRE);
+                  console.log(`[genre] classify_result`, { postId, request_id, returnedGenre: null, finalGenre: FALLBACK_GENRE, fallback: true });
                   return;
                 }
                 const aiData = await aiRes.json() as any;
                 const raw = aiData?.choices?.[0]?.message?.content?.trim() || "";
-                let genre: string | null = null;
+                let returnedGenre: string | null = null;
                 try {
                   const parsed = JSON.parse(raw);
-                  if (parsed?.genre && VALID_GENRES.includes(parsed.genre)) {
-                    genre = parsed.genre;
+                  const g = typeof parsed?.genre === "string" ? parsed.genre.trim() : null;
+                  if (g && VALID_GENRES.has(g)) {
+                    returnedGenre = g;
                   }
                 } catch {
                   console.warn(`[genre] classify_parse_fail`, { postId, request_id, raw });
-                  return;
                 }
-                if (genre) {
-                  await sb(env).from("posts").update({ genre }).eq("id", postId);
-                }
-                console.log(`[genre] classify_result`, { postId, request_id, genre });
+                const finalGenre = returnedGenre || FALLBACK_GENRE;
+                const fallback = !returnedGenre;
+                await persistGenre(finalGenre);
+                console.log(`[genre] classify_result`, { postId, request_id, returnedGenre, finalGenre, fallback });
               } catch (err: any) {
                 console.error(`[genre] classify_error`, { postId, request_id, message: err?.message });
+                await persistGenre(FALLBACK_GENRE);
+                console.log(`[genre] classify_fallback_after_error`, { postId, request_id, finalGenre: FALLBACK_GENRE });
               }
             })());
           }
