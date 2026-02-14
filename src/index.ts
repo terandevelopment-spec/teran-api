@@ -2830,6 +2830,66 @@ export default {
         }
 
         // =====================================================
+        // PROFILE SETTINGS (tab visibility) API
+        // =====================================================
+
+        // GET /api/profile-settings?user_id=... — public, returns tab visibility flags
+        if (path === "/api/profile-settings" && req.method === "GET") {
+          const user_id = url.searchParams.get("user_id");
+          if (!user_id || typeof user_id !== "string" || user_id.trim() === "") {
+            throw new HttpError(400, "BAD_REQUEST", "user_id is required");
+          }
+
+          const { data, error } = await sb(env)
+            .from("profile_settings")
+            .select("posts_public, threads_public, rooms_public")
+            .eq("user_id", user_id.trim())
+            .maybeSingle();
+
+          if (error) throw error;
+
+          // Return defaults if no row exists
+          const settings = data ?? {
+            posts_public: true,
+            threads_public: true,
+            rooms_public: true,
+          };
+
+          return ok(req, env, request_id, { settings });
+        }
+
+        // PUT /api/profile-settings — auth required, upsert own settings
+        if (path === "/api/profile-settings" && req.method === "PUT") {
+          const user_id = await requireAuth(req, env);
+
+          const body = (await req.json().catch(() => null)) as any;
+          const settings = {
+            user_id,
+            posts_public: typeof body?.posts_public === "boolean" ? body.posts_public : true,
+            threads_public: typeof body?.threads_public === "boolean" ? body.threads_public : true,
+            rooms_public: typeof body?.rooms_public === "boolean" ? body.rooms_public : true,
+            saved_public: false, // always private
+            updated_at: new Date().toISOString(),
+          };
+
+          const { error } = await sb(env)
+            .from("profile_settings")
+            .upsert(settings, { onConflict: "user_id" });
+
+          if (error) throw error;
+
+          console.log(`[profile-settings] upsert rid=${request_id} user=${user_id} posts=${settings.posts_public} threads=${settings.threads_public} rooms=${settings.rooms_public}`);
+
+          return ok(req, env, request_id, {
+            settings: {
+              posts_public: settings.posts_public,
+              threads_public: settings.threads_public,
+              rooms_public: settings.rooms_public,
+            },
+          });
+        }
+
+        // =====================================================
         // PROFILE GALLERY API
         // =====================================================
 
@@ -3730,12 +3790,29 @@ export default {
         // ROOMS API
         // ═══════════════════════════════════════════
 
-        // GET /api/rooms — list public rooms
+        // GET /api/rooms — list public rooms, or rooms by owner_id
         if (path === "/api/rooms" && req.method === "GET") {
-          const { data, error } = await sb(env)
+          const owner_id_param = url.searchParams.get("owner_id")?.trim() || null;
+
+          let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,created_at")
-            .eq("visibility", "public")
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,created_at");
+
+          if (owner_id_param) {
+            // Profile rooms tab: filter by owner_id
+            q = q.eq("owner_id", owner_id_param);
+
+            // Non-owners only see public rooms
+            const callerId = await optionalAuth(req, env);
+            if (callerId !== owner_id_param) {
+              q = q.eq("visibility", "public");
+            }
+          } else {
+            // Default: list all public rooms
+            q = q.eq("visibility", "public");
+          }
+
+          const { data, error } = await q
             .order("created_at", { ascending: false })
             .limit(100);
           if (error) throw new Error(error.message);
