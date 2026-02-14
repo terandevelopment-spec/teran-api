@@ -329,10 +329,16 @@ export default {
           const room_id_param = url.searchParams.get("room_id");
           const limit_param = url.searchParams.get("limit");
           const actor_id_param = url.searchParams.get("actor_id")?.trim() || null;
+          // ── NEW scope filters ──
+          const post_type_param = url.searchParams.get("post_type");       // e.g. "status" or "status,thread"
+          const root_only_param = url.searchParams.get("root_only");       // "1" or "true"
+          const parent_post_id_param = url.searchParams.get("parent_post_id"); // integer
+          const room_scope_param = url.searchParams.get("room_scope");     // "global"|"rooms"|"any"
           const p1 = performance.now();
 
-          // ── Edge cache: unfiltered feed only ──
-          const isFeed = !id_param && !user_id_param && !author_id_param && !room_id_param;
+          // ── Edge cache: unfiltered feed only (disable for scoped requests) ──
+          const hasNewFilters = !!post_type_param || !!root_only_param || !!parent_post_id_param || !!room_scope_param;
+          const isFeed = !id_param && !user_id_param && !author_id_param && !room_id_param && !hasNewFilters;
           let feedCacheKey: Request | null = null;
           const cache = caches.default;
 
@@ -387,21 +393,67 @@ export default {
             else if (author_id_param) {
               q = q.eq("author_id", author_id_param);
             }
-            // Apply room_id filter if provided
-            if (room_id_param) {
-              // Room read policy enforcement (skip for 'global')
-              if (room_id_param !== "global") {
-                const { data: roomRow } = await sb(env).from("rooms").select("read_policy").eq("id", room_id_param).maybeSingle();
-                if (roomRow && roomRow.read_policy === "members_only") {
-                  const callerId = await optionalAuth(req, env);
-                  if (!callerId) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
-                  const memberRole = await checkRoomMembership(env, room_id_param, callerId);
-                  if (!memberRole) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
+
+            // ── post_type filter ──
+            if (post_type_param) {
+              const VALID_POST_TYPES = ["status", "thread", "share"];
+              const types = post_type_param.split(",").map(t => t.trim()).filter(Boolean);
+              for (const t of types) {
+                if (!VALID_POST_TYPES.includes(t)) {
+                  throw new HttpError(400, "BAD_REQUEST", `invalid post_type: ${t}`);
                 }
               }
-              q = q.eq("room_id", room_id_param);
+              if (types.length === 1) {
+                q = q.eq("post_type", types[0]);
+              } else if (types.length > 1) {
+                q = q.in("post_type", types);
+              }
             }
-            // Determine limit (default 50, max 200)
+
+            // ── root_only / parent_post_id filter ──
+            if (parent_post_id_param) {
+              const parsedPpid = Number(parent_post_id_param);
+              if (!Number.isFinite(parsedPpid)) {
+                throw new HttpError(400, "BAD_REQUEST", "parent_post_id must be a valid integer");
+              }
+              q = q.eq("parent_post_id", parsedPpid);
+            } else if (root_only_param === "1" || root_only_param === "true") {
+              q = q.is("parent_post_id", null);
+            }
+
+            // ── room_scope / room_id filter ──
+            // room_id takes precedence for specific-room queries;
+            // room_scope adds global/rooms scoping for profile tabs.
+            if (room_id_param && room_id_param !== "global") {
+              // Specific room: enforce membership policy
+              const { data: roomRow } = await sb(env).from("rooms").select("read_policy").eq("id", room_id_param).maybeSingle();
+              if (roomRow && roomRow.read_policy === "members_only") {
+                const callerId = await optionalAuth(req, env);
+                if (!callerId) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
+                const memberRole = await checkRoomMembership(env, room_id_param, callerId);
+                if (!memberRole) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
+              }
+              q = q.eq("room_id", room_id_param);
+            } else {
+              // Determine effective room scope
+              let effectiveScope = "any";
+              if (room_id_param === "global") effectiveScope = "global";
+              else if (room_scope_param) {
+                if (!["global", "rooms", "any"].includes(room_scope_param)) {
+                  throw new HttpError(400, "BAD_REQUEST", `invalid room_scope: ${room_scope_param}`);
+                }
+                effectiveScope = room_scope_param;
+              }
+              if (effectiveScope === "global") {
+                // Global posts: room_id is either NULL or 'global'
+                q = q.or("room_id.is.null,room_id.eq.global");
+              } else if (effectiveScope === "rooms") {
+                q = q.not("room_id", "is", null).neq("room_id", "global");
+              }
+              // effectiveScope === "any": no room filter
+            }
+
+            // Determine limit (default 50, max 200) — applied AFTER all filters
             let lim = 50;
             if (limit_param) {
               const parsed = parseInt(limit_param, 10);
@@ -420,7 +472,7 @@ export default {
 
           // Granular logging + slow-query alert
           // NOTE: no { count: "exact" } is used — entire posts_query time IS select_ms, count_ms=0
-          const filterDesc = id_param ? `id=${id_param}` : [user_id_param && `user_id=${user_id_param}`, author_id_param && `author_id=${author_id_param}`, room_id_param && `room_id=${room_id_param}`].filter(Boolean).join(",") || "feed";
+          const filterDesc = id_param ? `id=${id_param}` : [user_id_param && `user_id=${user_id_param}`, author_id_param && `author_id=${author_id_param}`, room_id_param && `room_id=${room_id_param}`, post_type_param && `post_type=${post_type_param}`, root_only_param && `root_only=${root_only_param}`, parent_post_id_param && `parent_post_id=${parent_post_id_param}`, room_scope_param && `room_scope=${room_scope_param}`].filter(Boolean).join(",") || "feed";
           console.log(`[perf] /api/posts posts_query_split rid=${request_id} select_ms=${postsQueryMs} count_ms=0 filter=${filterDesc} limit=${limit_param || 50} rows=${posts?.length ?? 0}`);
           if (postsQueryMs > 400) {
             console.log(`[perf] /api/posts SLOW_QUERY rid=${request_id} select_ms=${postsQueryMs} count_ms=0 filter=${filterDesc} limit=${limit_param || 50} rows=${posts?.length ?? 0}`);
