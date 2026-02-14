@@ -1826,10 +1826,21 @@ export default {
           const user_id = await requireAuth(req, env);
 
           const body = (await req.json().catch(() => null)) as any;
+          const markAll = body?.all === true;
           const ids = Array.isArray(body?.ids) ? body.ids.filter((id: any) => typeof id === "number") : null;
           const group_key = typeof body?.group_key === "string" ? body.group_key : null;
 
-          if (ids && ids.length > 0) {
+          if (markAll) {
+            // Mark ALL unread notifications for this user as read
+            await sb(env)
+              .from("notifications")
+              .update({ is_read: true })
+              .eq("recipient_user_id", user_id)
+              .eq("is_read", false);
+            // Invalidate KV cache so next unread_count poll returns 0
+            const kvKey = `unread_count:${user_id}`;
+            await env.UNREAD_KV.put(kvKey, "0", { expirationTtl: 300 });
+          } else if (ids && ids.length > 0) {
             await sb(env)
               .from("notifications")
               .update({ is_read: true })
