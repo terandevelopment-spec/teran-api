@@ -487,9 +487,9 @@ export default {
             return ok(req, env, request_id, { posts: [] });
           }
 
-          // Parallel fetch: media + likes (merged likes+likedByMe into 1 query)
+          // Parallel fetch: media + likes + comment counts
           const parallelStart = Date.now();
-          let mediaMs = 0, likesMs = 0;
+          let mediaMs = 0, likesMs = 0, commentCountMs = 0;
 
           const mediaQuery = (async () => {
             const t = Date.now();
@@ -513,9 +513,23 @@ export default {
             return data ?? [];
           })();
 
-          const [mediaRows, allLikeRows] = await Promise.all([
+          // Comment counts via RPC (direct replies only)
+          const commentCountsQuery = (async () => {
+            const t = Date.now();
+            const { data, error: rpcErr } = await sb(env)
+              .rpc("get_comment_counts", { parent_ids: postIds });
+            commentCountMs = Date.now() - t;
+            if (rpcErr) {
+              console.error(`[perf] /api/posts comment_counts RPC error rid=${request_id}`, rpcErr);
+              return [];
+            }
+            return data ?? [];
+          })();
+
+          const [mediaRows, allLikeRows, commentCountRows] = await Promise.all([
             mediaQuery,
             likesQuery,
+            commentCountsQuery,
           ]);
           const parallelMs = Date.now() - parallelStart;
           const p4 = performance.now();
@@ -523,8 +537,10 @@ export default {
           console.log(`[perf] /api/posts parallel_queries ${parallelMs}ms`, {
             media: mediaMs,
             likes: likesMs,
+            commentCounts: commentCountMs,
             mediaCount: mediaRows.length,
             likeRows: (allLikeRows as any[]).length,
+            commentCountRows: (commentCountRows as any[]).length,
           });
 
           // Process results
@@ -544,7 +560,13 @@ export default {
             }
           }
 
-          // Enrich posts with media, like_count, liked_by_me
+          // Build comment count map from RPC result
+          const commentCounts: Record<number, number> = {};
+          for (const row of commentCountRows as any[]) {
+            commentCounts[row.parent_post_id] = Number(row.comment_count) || 0;
+          }
+
+          // Enrich posts with media, like_count, liked_by_me, comment_count
           const enrichedPosts = (posts ?? []).map((p: any) => {
             let avatar = p.author_avatar;
             if (typeof avatar === "string" && avatar.startsWith("data:")) {
@@ -556,6 +578,7 @@ export default {
               media: mediaByPost[p.id] || [],
               like_count: likeCounts[p.id] || 0,
               liked_by_me: likedByActorSet.has(p.id),
+              comment_count: commentCounts[p.id] || 0,
             };
           });
           const p5 = performance.now();
