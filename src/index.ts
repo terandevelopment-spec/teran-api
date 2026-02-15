@@ -2820,6 +2820,12 @@ export default {
         // USER PROFILE API (Stage 1: READ-ONLY)
         // =====================================================
 
+        // Allowed genre IDs for persona_tags validation
+        const ALLOWED_PERSONA_TAG_IDS = new Set([
+          'Chat', 'Learn', 'Tech', 'Work', 'Health',
+          'Relationships', 'Society', 'Create', 'Sports',
+        ]);
+
         // GET /api/profile?user_id=...
         if (path === "/api/profile" && req.method === "GET") {
           const user_id = url.searchParams.get("user_id");
@@ -2829,7 +2835,7 @@ export default {
 
           const { data, error } = await sb(env)
             .from("user_profiles")
-            .select("user_id, display_name, bio, avatar")
+            .select("user_id, display_name, bio, avatar, persona_tags")
             .eq("user_id", user_id)
             .maybeSingle();
 
@@ -2842,10 +2848,14 @@ export default {
               display_name: null,
               bio: null,
               avatar: null,
+              persona_tags: [],
             });
           }
 
-          return ok(req, env, request_id, data);
+          return ok(req, env, request_id, {
+            ...data,
+            persona_tags: data.persona_tags ?? [],
+          });
         }
 
         // PUT /api/profile (sync persona — DB-only, no KV)
@@ -2860,7 +2870,7 @@ export default {
           }
 
           const trimmedUserId = user_id.trim();
-          const incoming = {
+          const incoming: Record<string, any> = {
             display_name: typeof body?.display_name === "string" ? body.display_name : "Anonymous",
             bio: typeof body?.bio === "string" ? body.bio : null,
             avatar: typeof body?.avatar === "string" ? body.avatar : null,
@@ -2869,6 +2879,22 @@ export default {
           if (incoming.avatar && incoming.avatar.startsWith("data:")) {
             throw new HttpError(422, "VALIDATION_ERROR", "avatar must be a URL or key, not a data URI");
           }
+
+          // Validate persona_tags (optional field)
+          if (body?.persona_tags !== undefined) {
+            if (!Array.isArray(body.persona_tags)) {
+              throw new HttpError(422, "VALIDATION_ERROR", "persona_tags must be an array");
+            }
+            const cleaned = [...new Set(
+              body.persona_tags.map((x: any) => String(x).trim()).filter(Boolean)
+            )].slice(0, 3);
+            for (const t of cleaned) {
+              if (!ALLOWED_PERSONA_TAG_IDS.has(t)) {
+                throw new HttpError(422, "VALIDATION_ERROR", `invalid persona tag: ${t}`);
+              }
+            }
+            incoming.persona_tags = cleaned;
+          }
           const p1 = performance.now();
 
           console.log(`[profile-sync] incoming rid=${request_id} user=${trimmedUserId} dn=${incoming.display_name} avatar=${incoming.avatar?.slice(0, 30) ?? "null"}`);
@@ -2876,7 +2902,7 @@ export default {
           // ── DB read: minimal columns ──
           const { data: current, error: readErr } = await sb(env)
             .from("user_profiles")
-            .select("display_name, bio, avatar")
+            .select("display_name, bio, avatar, persona_tags")
             .eq("user_id", trimmedUserId)
             .maybeSingle();
           const p2 = performance.now();
@@ -2884,11 +2910,14 @@ export default {
           if (readErr) throw readErr;
 
           // ── Compare: skip write if nothing changed ──
+          const tagsMatch = incoming.persona_tags === undefined ||
+            (current && JSON.stringify(current.persona_tags ?? []) === JSON.stringify(incoming.persona_tags));
           if (
             current &&
             current.display_name === incoming.display_name &&
             (current.bio ?? null) === (incoming.bio ?? null) &&
-            (current.avatar ?? null) === (incoming.avatar ?? null)
+            (current.avatar ?? null) === (incoming.avatar ?? null) &&
+            tagsMatch
           ) {
             console.log(`[profile-sync] skip rid=${request_id} reason=DB_MATCH user=${trimmedUserId}`);
             console.log(`[perf] profile breakdown rid=${request_id} parse=${(p1 - p0).toFixed(1)} db_read=${(p2 - p1).toFixed(1)} total=${(p2 - p0).toFixed(1)} decision=SKIP_WRITE`);
