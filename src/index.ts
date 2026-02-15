@@ -2815,6 +2815,39 @@ export default {
           return ok(req, env, request_id, { echoed_user_ids });
         }
 
+        // GET /api/echoes/incoming_counts?user_ids=a,b,c — How many users echo each target
+        if (path === "/api/echoes/incoming_counts" && req.method === "GET") {
+          const handlerStart = Date.now();
+          const callerId = await requireAuth(req, env);
+
+          const raw = url.searchParams.get("user_ids") || "";
+          const ids = [...new Set(
+            raw.split(",").map(s => s.trim()).filter(Boolean)
+          )].slice(0, 200);
+
+          if (ids.length === 0) {
+            throw new HttpError(400, "BAD_REQUEST", "user_ids is required");
+          }
+
+          // Query all echo rows targeting these user_ids (minimal column)
+          const { data: rows, error } = await sb(env)
+            .from("echoes")
+            .select("echoed_user_id")
+            .in("echoed_user_id", ids);
+          if (error) throw error;
+
+          // Build counts map: initialize all requested IDs to 0, then tally
+          const counts: Record<string, number> = Object.fromEntries(ids.map(id => [id, 0]));
+          for (const r of rows ?? []) {
+            if (counts[r.echoed_user_id] !== undefined) {
+              counts[r.echoed_user_id]++;
+            }
+          }
+
+          console.log(`[perf] /api/echoes/incoming_counts rid=${request_id} ids=${ids.length} rows=${(rows ?? []).length} t=${Date.now() - handlerStart}ms`);
+          return ok(req, env, request_id, { counts });
+        }
+
 
         // =====================================================
         // USER PROFILE API (Stage 1: READ-ONLY)
