@@ -4185,6 +4185,12 @@ export default {
             throw new HttpError(422, "VALIDATION_ERROR", "category is required and must be one of: " + [...ROOM_CATEGORY_KEYS].join(", "));
           }
 
+          // Visibility: 'public' (default) | 'private'
+          const ALLOWED_VISIBILITY = new Set(["public", "private"]);
+          const visibility = typeof body?.visibility === "string" && ALLOWED_VISIBILITY.has(body.visibility)
+            ? body.visibility
+            : "public";
+
           // Generate random room_key (16 hex chars)
           const room_key = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
 
@@ -4193,7 +4199,7 @@ export default {
             .insert({
               name, description, icon_key, category, room_key,
               owner_id: user_id,
-              visibility: "public", read_policy: "public", post_policy: "public",
+              visibility, read_policy: "public", post_policy: "public",
             })
             .select()
             .single();
@@ -4285,8 +4291,8 @@ export default {
 
             const { data: room } = await sb(env).from("rooms").select("visibility").eq("id", roomId).maybeSingle();
             if (!room) throw new HttpError(404, "NOT_FOUND", "Room not found");
-            if ((room as any).visibility === "private_invite_only") {
-              throw new HttpError(403, "FORBIDDEN", "This room is invite-only. Use an invite link to join.");
+            if ((room as any).visibility === "private_invite_only" || (room as any).visibility === "private") {
+              throw new HttpError(403, "FORBIDDEN", "Private room. Join via invite link.");
             }
 
             // Upsert membership
