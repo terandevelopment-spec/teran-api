@@ -2945,6 +2945,104 @@ export default {
         }
 
         // =====================================================
+        // USER DISCOVERY API (search + recommended)
+        // =====================================================
+
+        // Helper: clamp and validate limit param
+        const clampLimit = (raw: string | null, defaultVal = 20, max = 50): number => {
+          if (!raw) return defaultVal;
+          const n = parseInt(raw, 10);
+          if (isNaN(n) || n < 1) return defaultVal;
+          return Math.min(n, max);
+        };
+
+        // Minimal safe field list for user discovery
+        const USER_DISCOVERY_FIELDS = "user_id, display_name, avatar, persona_tags";
+
+        // GET /api/users/search?q=...&limit=...
+        if (path === "/api/users/search" && req.method === "GET") {
+          const p0 = performance.now();
+          const rawQ = url.searchParams.get("q");
+          const q = typeof rawQ === "string" ? rawQ.trim() : "";
+
+          if (q.length < 1 || q.length > 50) {
+            throw new HttpError(400, "BAD_REQUEST", "q is required (1-50 chars)");
+          }
+
+          const lim = clampLimit(url.searchParams.get("limit"));
+
+          // Sanitize wildcards in user input for ILIKE
+          const safeQ = q.replace(/%/g, "\\%").replace(/_/g, "\\_");
+
+          // 1) Prefix matches (display_name starts with q)
+          const { data: prefixData, error: prefixErr } = await sb(env)
+            .from("user_profiles")
+            .select(USER_DISCOVERY_FIELDS)
+            .ilike("display_name", `${safeQ}%`)
+            .order("display_name", { ascending: true })
+            .limit(lim);
+
+          if (prefixErr) throw prefixErr;
+
+          const p1 = performance.now();
+
+          // 2) Contains matches (display_name contains q, excludes prefix dupes)
+          const prefixIds = new Set((prefixData || []).map((u: any) => u.user_id));
+          let containsData: any[] = [];
+
+          if ((prefixData || []).length < lim) {
+            const remaining = lim - (prefixData || []).length;
+            const { data: cData, error: cErr } = await sb(env)
+              .from("user_profiles")
+              .select(USER_DISCOVERY_FIELDS)
+              .ilike("display_name", `%${safeQ}%`)
+              .order("display_name", { ascending: true })
+              .limit(remaining + (prefixData || []).length); // fetch extra to filter dupes
+
+            if (cErr) throw cErr;
+            containsData = (cData || []).filter((u: any) => !prefixIds.has(u.user_id)).slice(0, remaining);
+          }
+
+          const p2 = performance.now();
+
+          const users = [...(prefixData || []), ...containsData].map((u: any) => ({
+            user_id: u.user_id,
+            display_name: u.display_name,
+            avatar: u.avatar,
+            persona_tags: u.persona_tags ?? [],
+          }));
+
+          console.log(`[users/search] rid=${request_id} q="${q}" prefix=${(prefixData || []).length} contains=${containsData.length} total=${users.length} t_prefix=${(p1 - p0).toFixed(1)} t_contains=${(p2 - p1).toFixed(1)}`);
+          return ok(req, env, request_id, { users });
+        }
+
+        // GET /api/users/recommended?limit=...
+        if (path === "/api/users/recommended" && req.method === "GET") {
+          const p0 = performance.now();
+          const lim = clampLimit(url.searchParams.get("limit"));
+
+          const { data, error } = await sb(env)
+            .from("user_profiles")
+            .select(USER_DISCOVERY_FIELDS)
+            .order("created_at", { ascending: false })
+            .limit(lim);
+
+          if (error) throw error;
+
+          const p1 = performance.now();
+
+          const users = (data || []).map((u: any) => ({
+            user_id: u.user_id,
+            display_name: u.display_name,
+            avatar: u.avatar,
+            persona_tags: u.persona_tags ?? [],
+          }));
+
+          console.log(`[users/recommended] rid=${request_id} count=${users.length} t=${(p1 - p0).toFixed(1)}`);
+          return ok(req, env, request_id, { users });
+        }
+
+        // =====================================================
         // PROFILE SETTINGS (tab visibility) API
         // =====================================================
 
