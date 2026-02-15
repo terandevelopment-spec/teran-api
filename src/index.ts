@@ -4036,13 +4036,19 @@ export default {
         // ROOMS API
         // ═══════════════════════════════════════════
 
+        const ROOM_CATEGORY_KEYS = new Set([
+          'local_region', 'work_career', 'learning_skills', 'games', 'creation', 'tech_gadgets',
+          'lifestyle_hobbies', 'health_mind', 'entertainment', 'sports', 'money_planning',
+          'love_relationships', 'philosophy_thinking', 'news_current', 'help_qa', 'lounge'
+        ]);
+
         // GET /api/rooms — list public rooms, or rooms by owner_id
         if (path === "/api/rooms" && req.method === "GET") {
           const owner_id_param = url.searchParams.get("owner_id")?.trim() || null;
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,created_at");
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at");
 
           if (owner_id_param) {
             // Profile rooms tab: filter by owner_id
@@ -4056,6 +4062,15 @@ export default {
           } else {
             // Default: list all public rooms
             q = q.eq("visibility", "public");
+          }
+
+          // Optional category filter
+          const categoryParam = url.searchParams.get("category")?.trim() || null;
+          if (categoryParam) {
+            if (!ROOM_CATEGORY_KEYS.has(categoryParam)) {
+              throw new HttpError(400, "BAD_REQUEST", "Invalid category");
+            }
+            q = q.eq("category", categoryParam);
           }
 
           const { data, error } = await q
@@ -4165,13 +4180,18 @@ export default {
             throw new HttpError(422, "VALIDATION_ERROR", "icon_key must not be a data URI");
           }
 
+          const category = typeof body?.category === "string" ? body.category.trim() : null;
+          if (!category || !ROOM_CATEGORY_KEYS.has(category)) {
+            throw new HttpError(422, "VALIDATION_ERROR", "category is required and must be one of: " + [...ROOM_CATEGORY_KEYS].join(", "));
+          }
+
           // Generate random room_key (16 hex chars)
           const room_key = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
 
           const { data: room, error } = await sb(env)
             .from("rooms")
             .insert({
-              name, description, icon_key, room_key,
+              name, description, icon_key, category, room_key,
               owner_id: user_id,
               visibility: "public", read_policy: "public", post_policy: "public",
             })
