@@ -4051,12 +4051,19 @@ export default {
             .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at");
 
           if (owner_id_param) {
-            // Profile rooms tab: filter by owner_id
-            q = q.eq("owner_id", owner_id_param);
-
-            // Non-owners only see public rooms
+            // Support "me" alias: resolve to the authenticated caller's user_id
+            let resolvedOwnerId = owner_id_param;
             const callerId = await optionalAuth(req, env);
-            if (callerId !== owner_id_param) {
+            if (owner_id_param === "me") {
+              if (!callerId) throw new HttpError(401, "UNAUTHORIZED", "Auth required for owner_id=me");
+              resolvedOwnerId = callerId;
+            }
+
+            q = q.eq("owner_id", resolvedOwnerId);
+
+            // Owner sees all visibility levels; non-owners see only public
+            const isOwner = !!callerId && callerId === resolvedOwnerId;
+            if (!isOwner) {
               q = q.eq("visibility", "public");
             }
           } else {
