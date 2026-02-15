@@ -4374,6 +4374,29 @@ export default {
           }
         }
 
+        // GET /api/rooms/:id/invite — owner fetches current active invite token
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)\/invite$/);
+          if (m && req.method === "GET") {
+            const roomId = m[1];
+            const user_id = await requireAuth(req, env);
+
+            const myRole = await checkRoomMembership(env, roomId, user_id);
+            if (myRole !== "owner") throw new HttpError(403, "FORBIDDEN", "Only room owner can view invites");
+
+            const { data: invite } = await sb(env)
+              .from("room_invites")
+              .select("id,room_id,token,created_at")
+              .eq("room_id", roomId)
+              .eq("revoked", false)
+              .order("created_at", { ascending: false })
+              .limit(1)
+              .maybeSingle();
+
+            return ok(req, env, request_id, { invite: invite || null });
+          }
+        }
+
         // POST /api/rooms/:id/invite/new — owner generates invite token
         {
           const m = path.match(/^\/api\/rooms\/([^/]+)\/invite\/new$/);
