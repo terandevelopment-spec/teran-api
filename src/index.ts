@@ -399,7 +399,7 @@ export default {
           // Build base query with conditional select:
           // - Feed lists: lightweight select (content included for card preview)
           // - Single post by id: include full data for PostDetail
-          const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre";
+          const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods";
           const selectFields = id_param ? "*" : feedSelectFields;
 
           let q = sb(env)
@@ -710,6 +710,21 @@ export default {
           const rawSharedPostId = body?.shared_post_id;
           const shared_post_id = rawSharedPostId != null ? (Number.isFinite(Number(rawSharedPostId)) ? Number(rawSharedPostId) : null) : null;
 
+          // ── Mode + Moods (optional, used by thread creation) ──
+          const VALID_MODES = new Set(["Ask", "Discuss", "Share", "Fun"]);
+          const VALID_MOODS = new Set(["Happy", "Laughing", "Curious", "Meh", "Sad", "Anxious", "Angry", "Frustrated", "Tired"]);
+          const MAX_MOODS = 2;
+
+          const rawMode = body?.mode;
+          const mode: string | null = typeof rawMode === "string" && VALID_MODES.has(rawMode) ? rawMode : null;
+
+          let moods: string[] = [];
+          if (Array.isArray(body?.moods)) {
+            moods = body.moods
+              .filter((m: unknown) => typeof m === "string" && VALID_MOODS.has(m as string))
+              .slice(0, MAX_MOODS);
+          }
+
           // Media limits
           const MAX_IMAGES = 4;
           const MAX_VIDEOS = 1;
@@ -784,6 +799,8 @@ export default {
               parent_post_id,
               post_type,
               shared_post_id,
+              mode,
+              moods,
             })
             .select("*")
             .single();
