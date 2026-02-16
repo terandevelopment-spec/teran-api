@@ -285,6 +285,33 @@ function generateInviteToken(): string {
   return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
 }
 
+// --------- cursor pagination helpers ----------
+function parseCursor(raw: string | null): { created_at: string; id: number } | null {
+  if (!raw || typeof raw !== "string") return null;
+  const idx = raw.lastIndexOf(":");
+  if (idx <= 0) return null;
+  const ts = raw.slice(0, idx);
+  const idStr = raw.slice(idx + 1);
+  const id = Number(idStr);
+  // Validate: ts must look like an ISO date, id must be a positive integer
+  if (!ts || isNaN(Date.parse(ts)) || !Number.isFinite(id) || id <= 0 || !Number.isInteger(id)) return null;
+  return { created_at: ts, id };
+}
+
+function buildNextCursor(items: any[], limit: number): string | null {
+  if (!items || items.length < limit) return null;
+  const last = items[items.length - 1];
+  if (!last?.created_at || !last?.id) return null;
+  return `${last.created_at}:${last.id}`;
+}
+
+function clampPaginationLimit(raw: string | null, defaultVal = 20, max = 200): number {
+  if (!raw) return defaultVal;
+  const n = parseInt(raw, 10);
+  if (isNaN(n) || n < 1) return defaultVal;
+  return Math.min(n, max);
+}
+
 // --------- routes ----------
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -334,11 +361,15 @@ export default {
           const root_only_param = url.searchParams.get("root_only");       // "1" or "true"
           const parent_post_id_param = url.searchParams.get("parent_post_id"); // integer
           const room_scope_param = url.searchParams.get("room_scope");     // "global"|"rooms"|"any"
+          const cursor_param = url.searchParams.get("cursor");             // pagination cursor
+          const isReplyQuery = !!parent_post_id_param;
+          const cursor = isReplyQuery ? parseCursor(cursor_param) : null;
           const p1 = performance.now();
 
           // ── Edge cache: unfiltered feed only (disable for scoped requests) ──
           const hasNewFilters = !!post_type_param || !!root_only_param || !!parent_post_id_param || !!room_scope_param;
-          const isFeed = !id_param && !user_id_param && !author_id_param && !room_id_param && !hasNewFilters;
+          // Feed cache: only for non-reply, non-cursored feed queries
+          const isFeed = !id_param && !user_id_param && !author_id_param && !isReplyQuery && !cursor && !room_id_param && !hasNewFilters;
           let feedCacheKey: Request | null = null;
           const cache = caches.default;
 
@@ -377,6 +408,7 @@ export default {
             .order("created_at", { ascending: false });
 
           // Apply filters - priority: id > user_id > author_id > default
+          let lim = 1; // will be set per branch below
           if (id_param) {
             // Single post by ID
             const parsedId = Number(id_param);
@@ -417,6 +449,12 @@ export default {
                 throw new HttpError(400, "BAD_REQUEST", "parent_post_id must be a valid integer");
               }
               q = q.eq("parent_post_id", parsedPpid);
+              // Apply cursor keyset filter for reply pagination
+              if (cursor) {
+                q = q.or(
+                  `created_at.lt.${cursor.created_at},and(created_at.eq.${cursor.created_at},id.lt.${cursor.id})`
+                );
+              }
             } else if (root_only_param === "1" || root_only_param === "true") {
               q = q.is("parent_post_id", null);
             }
@@ -453,14 +491,16 @@ export default {
               // effectiveScope === "any": no room filter
             }
 
-            // Determine limit (default 50, max 200) — applied AFTER all filters
-            let lim = 50;
+            // Determine limit — for reply queries default 20/max 200, otherwise 50/max 200
+            lim = isReplyQuery ? 20 : 50;
             if (limit_param) {
               const parsed = parseInt(limit_param, 10);
               if (!isNaN(parsed)) {
                 lim = Math.min(200, Math.max(1, parsed));
               }
             }
+            // Add secondary order by id for stable keyset pagination
+            q = q.order("id", { ascending: false });
             q = q.limit(lim);
           }
           const p2 = performance.now();
@@ -484,6 +524,9 @@ export default {
           if (postIds.length === 0) {
             console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms (empty)`);
             console.log(`[perf] /api/posts breakdown rid=${request_id} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} transform=0 total=${(p3 - p0).toFixed(1)} rows=0`);
+            if (isReplyQuery) {
+              return ok(req, env, request_id, { items: [], next_cursor: null });
+            }
             return ok(req, env, request_id, { posts: [] });
           }
 
@@ -583,7 +626,10 @@ export default {
           });
           const p5 = performance.now();
 
-          const responseBody = JSON.stringify({ posts: enrichedPosts });
+          const responsePayload = isReplyQuery
+            ? { items: enrichedPosts, next_cursor: buildNextCursor(enrichedPosts, lim) }
+            : { posts: enrichedPosts };
+          const responseBody = JSON.stringify(responsePayload);
           console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms`, {
             posts_query: postsQueryMs,
             parallel: parallelMs,
@@ -1252,8 +1298,8 @@ export default {
           }
         }
 
-        // /api/comments (GET) ?post_id=123 (REQUIRED)
-        // Returns comments with like_count, liked_by_me, and media
+        // /api/comments (GET) ?post_id=123 (REQUIRED) &limit=20&cursor=<ts>:<id>
+        // Returns { items: [...], next_cursor: string|null }
         if (path === "/api/comments" && req.method === "GET") {
           const handlerStart = Date.now();
           const post_id_param = url.searchParams.get("post_id");
@@ -1267,6 +1313,10 @@ export default {
             throw new HttpError(400, "BAD_REQUEST", "post_id must be a valid positive integer");
           }
 
+          // Pagination params
+          const limit = clampPaginationLimit(url.searchParams.get("limit"), 20, 200);
+          const cursor = parseCursor(url.searchParams.get("cursor"));
+
           // Try to get current user (optional auth for liked_by_me)
           let current_user_id: string | null = null;
           try {
@@ -1278,21 +1328,28 @@ export default {
             }
           } catch { /* ignore auth errors for GET */ }
 
-          // Query 1: Fetch comments (select only needed fields)
+          // Query 1: Fetch comments (select only needed fields) with keyset pagination
           let t1 = Date.now();
-          const { data: comments, error } = await sb(env)
+          let commentsQuery = sb(env)
             .from("comments")
             .select("id, post_id, user_id, content, parent_comment_id, author_id, author_name, author_avatar, created_at")
-            .eq("post_id", post_id)
+            .eq("post_id", post_id);
+          if (cursor) {
+            commentsQuery = commentsQuery.or(
+              `created_at.lt.${cursor.created_at},and(created_at.eq.${cursor.created_at},id.lt.${cursor.id})`
+            );
+          }
+          const { data: comments, error } = await commentsQuery
             .order("created_at", { ascending: false })
-            .limit(200);
-          console.log(`[perf] /api/comments comments_query ${Date.now() - t1}ms`, { post_id, count: comments?.length });
+            .order("id", { ascending: false })
+            .limit(limit);
+          console.log(`[perf] /api/comments comments_query ${Date.now() - t1}ms`, { post_id, limit, cursor: !!cursor, count: comments?.length });
           if (error) throw error;
 
           const commentList = comments ?? [];
           if (commentList.length === 0) {
             console.log(`[perf] /api/comments total ${Date.now() - handlerStart}ms (empty)`);
-            return ok(req, env, request_id, { comments: [] });
+            return ok(req, env, request_id, { items: [], next_cursor: null });
           }
 
           const commentIds = commentList.map((c: any) => c.id);
@@ -1348,8 +1405,9 @@ export default {
             media: mediaByComment[c.id] || [],
           }));
 
-          console.log(`[perf] /api/comments total ${Date.now() - handlerStart}ms`, { post_id, comments: commentList.length });
-          return ok(req, env, request_id, { comments: enrichedComments });
+          const next_cursor = buildNextCursor(commentList, limit);
+          console.log(`[perf] /api/comments total ${Date.now() - handlerStart}ms`, { post_id, comments: commentList.length, next_cursor: !!next_cursor });
+          return ok(req, env, request_id, { items: enrichedComments, next_cursor });
         }
 
         // /api/comments (POST) -> { post_id, content, author_id, author_name, author_avatar, media? }
@@ -3204,21 +3262,16 @@ export default {
         // NEWS COMMENTS ENDPOINTS
         // ============================================================
 
-        // GET /api/news/comments?news_id=<id>&limit=200
+        // GET /api/news/comments?news_id=<id>&limit=20&cursor=<ts>:<id>
         if (path === "/api/news/comments" && req.method === "GET") {
           const news_id = url.searchParams.get("news_id");
           if (!news_id || typeof news_id !== "string" || news_id.trim() === "") {
             throw new HttpError(400, "BAD_REQUEST", "news_id query parameter is required");
           }
 
-          const limitParam = url.searchParams.get("limit");
-          let limit = 200;
-          if (limitParam) {
-            const parsed = Number(limitParam);
-            if (Number.isFinite(parsed) && parsed > 0) {
-              limit = Math.min(parsed, 500);
-            }
-          }
+          // Pagination params
+          const limit = clampPaginationLimit(url.searchParams.get("limit"), 20, 200);
+          const cursor = parseCursor(url.searchParams.get("cursor"));
 
           // Try to get current user for liked_by_me
           let current_user_id: string | null = null;
@@ -3231,18 +3284,25 @@ export default {
             }
           } catch { /* ignore auth errors for GET */ }
 
-          // Fetch comments
-          const { data: comments, error } = await sb(env)
+          // Fetch comments with keyset pagination
+          let commentsQuery = sb(env)
             .from("news_comments")
             .select("*")
-            .eq("news_id", news_id.trim())
+            .eq("news_id", news_id.trim());
+          if (cursor) {
+            commentsQuery = commentsQuery.or(
+              `created_at.lt.${cursor.created_at},and(created_at.eq.${cursor.created_at},id.lt.${cursor.id})`
+            );
+          }
+          const { data: comments, error } = await commentsQuery
             .order("created_at", { ascending: false })
+            .order("id", { ascending: false })
             .limit(limit);
           if (error) throw error;
 
           const commentList = comments ?? [];
           if (commentList.length === 0) {
-            return ok(req, env, request_id, { comments: [] });
+            return ok(req, env, request_id, { items: [], next_cursor: null });
           }
 
           // Get like counts, liked_by_me, and media in parallel
@@ -3289,7 +3349,8 @@ export default {
             media: mediaByComment[c.id] || [],
           }));
 
-          return ok(req, env, request_id, { comments: enrichedComments });
+          const next_cursor = buildNextCursor(commentList, limit);
+          return ok(req, env, request_id, { items: enrichedComments, next_cursor });
         }
 
         // POST /api/news/comments - create a news comment
