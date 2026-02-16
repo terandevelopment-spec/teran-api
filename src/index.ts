@@ -3948,9 +3948,8 @@ export default {
         // ═══════════════════════════════════════════
 
         const ROOM_CATEGORY_KEYS = new Set([
-          'local_region', 'work_career', 'learning_skills', 'games', 'creation', 'tech_gadgets',
-          'lifestyle_hobbies', 'health_mind', 'entertainment', 'sports', 'money_planning',
-          'love_relationships', 'philosophy_thinking', 'news_current', 'help_qa', 'lounge'
+          'lounge', 'anime_manga', 'games', 'music', 'sports', 'creation',
+          'tech_gadgets', 'local_region', 'work_career', 'politics', 'spiritual'
         ]);
 
         // GET /api/rooms — list public rooms, or rooms by owner_id
@@ -4181,6 +4180,13 @@ export default {
                 throw new HttpError(422, "VALIDATION_ERROR", "Invalid post_policy value");
               }
               updates.post_policy = body.post_policy;
+            }
+            if (typeof body?.category === "string") {
+              const cat = body.category.trim();
+              if (!ROOM_CATEGORY_KEYS.has(cat)) {
+                throw new HttpError(422, "VALIDATION_ERROR", "Invalid category");
+              }
+              updates.category = cat;
             }
 
             if (Object.keys(updates).length === 0) {
