@@ -4097,16 +4097,21 @@ export default {
             throw new HttpError(422, "VALIDATION_ERROR", "icon_key must not be a data URI");
           }
 
-          const category = typeof body?.category === "string" ? body.category.trim() : null;
-          if (!category || !ROOM_CATEGORY_KEYS.has(category)) {
-            throw new HttpError(422, "VALIDATION_ERROR", "category is required and must be one of: " + [...ROOM_CATEGORY_KEYS].join(", "));
-          }
-
           // Visibility: 'public' (default) | 'private'
           const ALLOWED_VISIBILITY = new Set(["public", "private"]);
           const visibility = typeof body?.visibility === "string" && ALLOWED_VISIBILITY.has(body.visibility)
             ? body.visibility
             : "public";
+
+          // Category: required for public rooms, omitted for private
+          const rawCategory = typeof body?.category === "string" ? body.category.trim() : null;
+          let category: string | null = null;
+          if (visibility === "public") {
+            if (!rawCategory || !ROOM_CATEGORY_KEYS.has(rawCategory)) {
+              throw new HttpError(422, "VALIDATION_ERROR", "category is required for public rooms and must be one of: " + [...ROOM_CATEGORY_KEYS].join(", "));
+            }
+            category = rawCategory;
+          }
 
           // Generate random room_key (16 hex chars)
           const room_key = crypto.randomUUID().replace(/-/g, "").slice(0, 16);

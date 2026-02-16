@@ -18,7 +18,7 @@ ALTER TABLE public.rooms DROP CONSTRAINT IF EXISTS rooms_category_allowed;
 -- 3) Add new constraint with exactly 11 values
 ALTER TABLE public.rooms
 ADD CONSTRAINT rooms_category_allowed
-CHECK (category IN (
+CHECK (category IS NULL OR category IN (
   'lounge',
   'anime_manga',
   'games',
