@@ -159,6 +159,14 @@ function memSet(userId: string, count: number) {
   _unreadMem.set(userId, { count, ts: performance.now() });
 }
 
+// ── Diagnostic / perf log helpers (compact single-line JSON) ──
+function logDiag(tag: string, obj: unknown) {
+  console.log(`[diag] ${tag} ${JSON.stringify(obj)}`);
+}
+function logPerf(tag: string, obj: unknown) {
+  console.log(`[perf] ${tag} ${JSON.stringify(obj)}`);
+}
+
 
 function sb(env: Env) {
   // Reuse client if URL hasn't changed (same isolate)
@@ -435,7 +443,7 @@ export default {
             limit: limit_param || "default",
             cursor: cursor ? "set" : "none",
           };
-          console.log(`[diag] /api/posts query_shape`, JSON.stringify({ rid: request_id, select_cols: selectFields, filter: postsFilterShape }));
+          logDiag("/api/posts query_shape", { rid: request_id, select_cols: selectFields, filter: postsFilterShape });
 
           let q = sb(env)
             .from("posts")
@@ -617,12 +625,12 @@ export default {
           const postIds = (posts ?? []).map((p: any) => p.id);
 
           // Step 1 (cont): log ids shape after posts query returns
-          console.log(`[diag] /api/posts posts_result`, JSON.stringify({
+          logDiag("/api/posts posts_result", {
             rid: request_id, posts_rows: postIds.length,
             ids_count: postIds.length,
             first_id: postIds[0] ?? null, last_id: postIds[postIds.length - 1] ?? null,
             select_ms: +(p3 - p2).toFixed(1),
-          }));
+          });
 
           if (postIds.length === 0) {
             // Step 3: parallel_skipped for empty posts
@@ -647,12 +655,12 @@ export default {
           const commentCountsWhereShape = "rpc:get_comment_counts(parent_ids)";
 
           // Step 2: log pre-execution query shape for each parallel query
-          console.log(`[diag] /api/posts parallel_pre`, JSON.stringify({
+          logDiag("/api/posts parallel_pre", {
             rid: request_id, ids_count: postIds.length,
             media: { select_cols: mediaSelectCols, where_shape: mediaWhereShape, table: "media" },
             likes: { select_cols: likesSelectCols, where_shape: likesWhereShape, table: "post_likes" },
             commentCounts: { where_shape: commentCountsWhereShape, table: "rpc" },
-          }));
+          });
 
           const mediaQuery = (async () => {
             const t = Date.now();
@@ -776,7 +784,7 @@ export default {
           }
 
           // Step 4: breakdown3 — query-shape diagnostics for bottleneck identification
-          console.log(`[perf] /api/posts breakdown3`, JSON.stringify({
+          logPerf("/api/posts breakdown3", {
             rid: request_id,
             filter: postsFilterShape,
             posts_select_cols: selectFields,
@@ -793,7 +801,7 @@ export default {
             transform_ms: +(p5 - p4).toFixed(1),
             serialize_ms: +serializeMs.toFixed(1),
             total_ms: +postsTotal.toFixed(1),
-          }));
+          });
           if (isReplyQuery) {
             const serializeMs = performance.now();
             console.log(`[perf][replies_breakdown] rid=${request_id} parent_post_id=${parent_post_id_param} http_ms=${replyHttpMs} parse_ms=${replyParseMs} parallel_ms=${(p4 - p3).toFixed(1)} transform_ms=${(p5 - p4).toFixed(1)} serialize_ms=${(serializeMs - p5).toFixed(1)} total_ms=${(serializeMs - p0).toFixed(1)} rows=${enrichedPosts.length} payload_bytes=${responseBody.length}`);
