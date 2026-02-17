@@ -389,6 +389,7 @@ export default {
           const parent_post_id_param = url.searchParams.get("parent_post_id"); // integer
           const room_scope_param = url.searchParams.get("room_scope");     // "global"|"rooms"|"any"
           const cursor_param = url.searchParams.get("cursor");             // pagination cursor
+          const diag_param = url.searchParams.get("diag");                 // suspect isolation: "posts_only" | "only_parallel:media" etc.
           const isReplyQuery = !!parent_post_id_param;
           const cursor = isReplyQuery ? parseCursor(cursor_param) : null;
           const p1 = performance.now();
@@ -641,6 +642,73 @@ export default {
               return ok(req, env, request_id, { items: [], next_cursor: null });
             }
             return ok(req, env, request_id, { posts: [] });
+          }
+
+          // ── Suspect isolation: diag modes ──
+          const postsSelectMs = +(p3 - p2).toFixed(1);
+          if (diag_param === "posts_only") {
+            const totalMs = +(performance.now() - p0).toFixed(1);
+            logDiag("/api/posts mode=posts_only", {
+              rid: request_id, posts_select_ms: postsSelectMs, posts_rows: postIds.length,
+            });
+            logPerf("/api/posts diag_breakdown", {
+              rid: request_id, mode: "posts_only",
+              posts_select_ms: postsSelectMs, parallel_ms: 0, total_ms: totalMs,
+            });
+            const body = JSON.stringify({ posts: posts ?? [], diag: { mode: "posts_only" } });
+            return new Response(body, {
+              status: 200,
+              headers: { "Content-Type": "application/json", "X-Request-Id": request_id, ...corsHeaders(req, env) },
+            });
+          }
+
+          if (diag_param && diag_param.startsWith("only_parallel:")) {
+            const which = diag_param.slice("only_parallel:".length);
+            if (!["media", "likes", "commentCounts"].includes(which)) {
+              return new Response(JSON.stringify({ error: { code: "BAD_REQUEST", message: `invalid diag target: ${which}` } }), {
+                status: 400,
+                headers: { "Content-Type": "application/json", "X-Request-Id": request_id, ...corsHeaders(req, env) },
+              });
+            }
+            let parallelMs = 0;
+            let rowCount = 0;
+
+            if (which === "media") {
+              const t = Date.now();
+              const { data } = await sb(env).from("media")
+                .select("id, post_id, type, key, thumb_key, width, height, duration_ms")
+                .in("post_id", postIds);
+              parallelMs = Date.now() - t;
+              rowCount = (data ?? []).length;
+            } else if (which === "likes") {
+              const t = Date.now();
+              const { data } = await sb(env).from("post_likes")
+                .select("post_id, actor_id")
+                .in("post_id", postIds);
+              parallelMs = Date.now() - t;
+              rowCount = (data ?? []).length;
+            } else if (which === "commentCounts") {
+              const t = Date.now();
+              const { data } = await sb(env)
+                .rpc("get_comment_counts", { parent_ids: postIds });
+              parallelMs = Date.now() - t;
+              rowCount = (data ?? []).length;
+            }
+
+            const totalMs = +(performance.now() - p0).toFixed(1);
+            logDiag(`/api/posts mode=only_parallel which=${which}`, {
+              rid: request_id, posts_select_ms: postsSelectMs,
+              [`${which}_ms`]: parallelMs, [`${which}_rows`]: rowCount,
+            });
+            logPerf("/api/posts diag_breakdown", {
+              rid: request_id, mode: "only_parallel", which,
+              posts_select_ms: postsSelectMs, parallel_ms: parallelMs, total_ms: totalMs,
+            });
+            const body = JSON.stringify({ posts: posts ?? [], diag: { mode: "only_parallel", which } });
+            return new Response(body, {
+              status: 200,
+              headers: { "Content-Type": "application/json", "X-Request-Id": request_id, ...corsHeaders(req, env) },
+            });
           }
 
           // Parallel fetch: media + likes + comment counts
