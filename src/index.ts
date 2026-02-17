@@ -712,7 +712,9 @@ export default {
           const responsePayload = isReplyQuery
             ? { items: enrichedPosts, next_cursor: buildNextCursor(enrichedPosts, lim) }
             : { posts: enrichedPosts };
+          const tSerialize = performance.now();
           const responseBody = JSON.stringify(responsePayload);
+          const serializeMs = performance.now() - tSerialize;
           console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms`, {
             posts_query: postsQueryMs,
             parallel: parallelMs,
@@ -720,6 +722,21 @@ export default {
             payloadBytes: responseBody.length,
           });
           console.log(`[perf] /api/posts breakdown rid=${request_id} cache=MISS params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} parallel=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${(p5 - p0).toFixed(1)} rows=${enrichedPosts.length}`);
+          const postsTotal = performance.now() - p0;
+          if (postsTotal >= 300) {
+            console.log(`[perf] /api/posts breakdown2`, JSON.stringify({
+              rid: request_id,
+              filter: { post_type: post_type_param || "all", root_only: root_only_param || "false", room_scope: room_scope_param || "none", limit: limit_param || 50 },
+              posts_select_ms: +(p3 - p2).toFixed(1), posts_rows: postIds.length,
+              media_ms: mediaMs, media_rows: mediaRows.length,
+              likes_ms: likesMs, likes_rows: (allLikeRows as any[]).length,
+              comment_counts_ms: commentCountMs, comment_counts_rows: (commentCountRows as any[]).length,
+              transform_ms: +(p5 - p4).toFixed(1),
+              serialize_ms: +serializeMs.toFixed(1),
+              payload_bytes: responseBody.length,
+              total_ms: +postsTotal.toFixed(1),
+            }));
+          }
           if (isReplyQuery) {
             const serializeMs = performance.now();
             console.log(`[perf][replies_breakdown] rid=${request_id} parent_post_id=${parent_post_id_param} http_ms=${replyHttpMs} parse_ms=${replyParseMs} parallel_ms=${(p4 - p3).toFixed(1)} transform_ms=${(p5 - p4).toFixed(1)} serialize_ms=${(serializeMs - p5).toFixed(1)} total_ms=${(serializeMs - p0).toFixed(1)} rows=${enrichedPosts.length} payload_bytes=${responseBody.length}`);
@@ -1996,7 +2013,19 @@ export default {
             memSet(user_id, count); // keep in-memory fresh
             backgroundRefresh("swr");
             const pDone = performance.now();
-            console.log(`[perf][unread_count] rid=${request_id} me=${user_id} kv_reason=hit kv_get_ms=${kvGetMs} kv_attempts=${kvAttempts} count=${count} total_ms=${(pDone - p0).toFixed(1)} source=kv bg_refresh=started`);
+            const kvHitTotal = pDone - p0;
+            console.log(`[perf][unread_count] rid=${request_id} me=${user_id} kv_reason=hit kv_get_ms=${kvGetMs} kv_attempts=${kvAttempts} count=${count} total_ms=${kvHitTotal.toFixed(1)} source=kv bg_refresh=started`);
+            if (kvHitTotal >= 200) {
+              console.log(`[perf][unread_count] breakdown2`, JSON.stringify({
+                rid: request_id, me: user_id,
+                kv_reason: "hit", kv_attempts: kvAttempts,
+                auth_ms: +(p1 - p0).toFixed(1),
+                kv_get_ms: +kvGetMs,
+                db_fallback_ms: 0,
+                kv_put_mode: "none",
+                total_ms: +kvHitTotal.toFixed(1),
+              }));
+            }
             return new Response(JSON.stringify({ unread_count: count, source: "kv" }), {
               status: 200,
               headers: {
@@ -2035,20 +2064,37 @@ export default {
           // ── PATH 3: Sync DB fallback (KV miss or timeout with no stale) ──
           const kvLabel = kvTimedOut ? "timeout_fallback_db" : "miss";
           try {
+            const tDbFallback = performance.now();
             const r = await fetchUnreadCount();
             const p3 = performance.now();
+            const dbFallbackMs = p3 - tDbFallback;
 
             memSet(user_id, r.count);
 
             // Fire-and-forget KV put
+            const tKvPut = performance.now();
             ctx.waitUntil(
               env.UNREAD_KV.put(kvKey, String(r.count), { expirationTtl: KV_TTL })
                 .then(() => console.log(`[kv] unread_count put ok=true rid=${request_id} me=${user_id} count=${r.count}`))
                 .catch((err) => console.error(`[kv] unread_count put ok=false rid=${request_id} me=${user_id}`, err))
             );
+            const kvPutEnqueueMs = performance.now() - tKvPut;
 
-            console.log(`[perf][unread_count] rid=${request_id} me=${user_id} kv_reason=${kvLabel} kv_get_ms=${kvGetMs} kv_attempts=${kvAttempts} count=${r.count} http_ms=${r.httpMs} parse_ms=${r.parseMs} total_ms=${(p3 - p0).toFixed(1)} source=db kv_put=async`);
+            const dbTotal = p3 - p0;
+            console.log(`[perf][unread_count] rid=${request_id} me=${user_id} kv_reason=${kvLabel} kv_get_ms=${kvGetMs} kv_attempts=${kvAttempts} count=${r.count} http_ms=${r.httpMs} parse_ms=${r.parseMs} total_ms=${dbTotal.toFixed(1)} source=db kv_put=async`);
             console.log(`[perf][unread_count_http] rid=${request_id} me=${user_id} kv_reason=${kvLabel} http_ms=${r.httpMs} parse_ms=${r.parseMs} status=${r.status} server_timing="${r.serverTiming}" x_response_time="${r.xResponseTime}" cf_ray="${r.cfRay}" cf_cache="${r.cfCache}" content_range="${r.contentRange}"`);
+            if (dbTotal >= 200) {
+              console.log(`[perf][unread_count] breakdown2`, JSON.stringify({
+                rid: request_id, me: user_id,
+                kv_reason: kvLabel, kv_attempts: kvAttempts,
+                auth_ms: +(p1 - p0).toFixed(1),
+                kv_get_ms: +kvGetMs,
+                db_fallback_ms: +dbFallbackMs.toFixed(1),
+                db_http_ms: +r.httpMs, db_parse_ms: +r.parseMs,
+                kv_put_mode: "async", kv_put_enqueue_ms: +kvPutEnqueueMs.toFixed(1),
+                total_ms: +dbTotal.toFixed(1),
+              }));
+            }
 
             return new Response(JSON.stringify({ unread_count: r.count, source: "db" }), {
               status: 200,
@@ -3041,18 +3087,45 @@ export default {
           const PROFILE_CACHE_TTL = 300; // 5 minutes
           const kvKey = `profile:${user_id}`;
 
-          // KV cache check
-          const tKv = performance.now();
-          let cached: any = null;
+          // KV cache check — get as text first so we can measure parse separately
+          const tKvGet = performance.now();
+          let kvRaw: string | null = null;
+          let kvMissReason: string = "null";
           try {
-            cached = await env.PROFILE_KV.get(kvKey, "json");
-          } catch (_) { /* KV miss or error — fall through to DB */ }
-          const kvMs = performance.now() - tKv;
+            kvRaw = await env.PROFILE_KV.get(kvKey, "text");
+          } catch (e) {
+            kvMissReason = "error:" + String(e).slice(0, 60);
+          }
+          const kvGetMs = performance.now() - tKvGet;
+
+          // KV parse
+          const tKvParse = performance.now();
+          let cached: any = null;
+          if (kvRaw) {
+            try { cached = JSON.parse(kvRaw); } catch (_) { kvMissReason = "parse_error"; }
+          } else if (kvMissReason === "null") {
+            kvMissReason = "key_not_found";
+          }
+          const kvParseMs = performance.now() - tKvParse;
 
           if (cached) {
+            const tTransform = performance.now();
+            const result = { ...cached, persona_tags: cached.persona_tags ?? [] };
+            const transformMs = performance.now() - tTransform;
             const totalMs = performance.now() - tProfile;
-            console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "HIT", kv_ms: +kvMs.toFixed(1), total_ms: +totalMs.toFixed(1), caller }));
-            return ok(req, env, request_id, { ...cached, persona_tags: cached.persona_tags ?? [] });
+            console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "HIT", kv_ms: +kvGetMs.toFixed(1), total_ms: +totalMs.toFixed(1), caller }));
+            if (totalMs >= 300) {
+              console.log(`[perf] /api/profile breakdown2`, JSON.stringify({
+                rid: request_id, user_id, caller, cache: "HIT",
+                kv_key_prefix: "profile:",
+                kv_get_ms: +kvGetMs.toFixed(1),
+                kv_parse_ms: +kvParseMs.toFixed(1),
+                db_select_ms: 0, db_transform_ms: +transformMs.toFixed(1),
+                kv_put_mode: "none", kv_put_ms: 0,
+                total_ms: +totalMs.toFixed(1),
+              }));
+            }
+            return ok(req, env, request_id, result);
           }
 
           // KV MISS — DB fallback
@@ -3066,11 +3139,22 @@ export default {
 
           if (error) throw error;
 
+          const tTransform = performance.now();
           const totalMs = performance.now() - tProfile;
 
           // Return empty profile if not found (don't throw)
           if (!data) {
-            console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "MISS", kv_ms: +kvMs.toFixed(1), db_ms: +dbMs.toFixed(1), total_ms: +totalMs.toFixed(1), found: false, caller }));
+            console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "MISS", kv_ms: +kvGetMs.toFixed(1), db_ms: +dbMs.toFixed(1), total_ms: +totalMs.toFixed(1), found: false, caller }));
+            if (totalMs >= 300) {
+              console.log(`[perf] /api/profile breakdown2`, JSON.stringify({
+                rid: request_id, user_id, caller, cache: "MISS",
+                kv_miss_reason: kvMissReason, kv_key_prefix: "profile:",
+                kv_get_ms: +kvGetMs.toFixed(1), kv_parse_ms: +kvParseMs.toFixed(1),
+                db_select_ms: +dbMs.toFixed(1), db_transform_ms: 0,
+                kv_put_mode: "none", kv_put_ms: 0,
+                total_ms: +totalMs.toFixed(1),
+              }));
+            }
             return ok(req, env, request_id, {
               user_id,
               display_name: null,
@@ -3081,12 +3165,25 @@ export default {
           }
 
           // KV set (fire-and-forget)
+          const tKvPut = performance.now();
           ctx.waitUntil(
             env.PROFILE_KV.put(kvKey, JSON.stringify(data), { expirationTtl: PROFILE_CACHE_TTL })
               .catch((e: any) => console.error("[profile] KV put failed", { rid: request_id, user_id, error: String(e) }))
           );
+          const kvPutEnqueueMs = performance.now() - tKvPut;
+          const transformMs = performance.now() - tTransform;
 
-          console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "MISS", kv_ms: +kvMs.toFixed(1), db_ms: +dbMs.toFixed(1), total_ms: +totalMs.toFixed(1), found: true, caller }));
+          console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "MISS", kv_ms: +kvGetMs.toFixed(1), db_ms: +dbMs.toFixed(1), total_ms: +totalMs.toFixed(1), found: true, caller }));
+          if (totalMs >= 300) {
+            console.log(`[perf] /api/profile breakdown2`, JSON.stringify({
+              rid: request_id, user_id, caller, cache: "MISS",
+              kv_miss_reason: kvMissReason, kv_key_prefix: "profile:",
+              kv_get_ms: +kvGetMs.toFixed(1), kv_parse_ms: +kvParseMs.toFixed(1),
+              db_select_ms: +dbMs.toFixed(1), db_transform_ms: +transformMs.toFixed(1),
+              kv_put_mode: "async", kv_put_enqueue_ms: +kvPutEnqueueMs.toFixed(1),
+              total_ms: +totalMs.toFixed(1),
+            }));
+          }
           return ok(req, env, request_id, {
             ...data,
             persona_tags: data.persona_tags ?? [],
@@ -4416,7 +4513,9 @@ export default {
         if (path === "/api/rooms" && req.method === "POST") {
           const tCreateTotal = performance.now();
           const user_id = await requireAuth(req, env);
+          const tAuth = performance.now();
           const body = (await req.json().catch(() => null)) as any;
+          const tBodyParse = performance.now();
 
           const name = typeof body?.name === "string" ? body.name.trim() : "";
           if (!name) throw new HttpError(422, "VALIDATION_ERROR", "name is required");
@@ -4443,10 +4542,11 @@ export default {
             }
             category = rawCategory;
           }
+          const tValidate = performance.now();
 
           // Generate random room_key (16 hex chars)
           const room_key = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
-          const paramsMs = performance.now() - tCreateTotal;
+          const tKeygen = performance.now();
 
           const tDbInsertRoom = performance.now();
           const { data: room, error } = await sb(env)
@@ -4459,7 +4559,10 @@ export default {
             .select()
             .single();
           const dbInsertRoomMs = performance.now() - tDbInsertRoom;
-          if (error) throw new Error(error.message);
+          if (error) {
+            console.log(`[perf] /api/rooms(create) error`, JSON.stringify({ rid: request_id, step: "db_room_insert", code: (error as any).code, message: error.message }));
+            throw new Error(error.message);
+          }
 
           // Auto-add owner as member (background — not blocking response)
           const tBgStart = performance.now();
@@ -4471,9 +4574,27 @@ export default {
                 else console.log("[room_create] membership insert ok", { rid: request_id, room_id: (room as any).id, bg_ms: +(performance.now() - tBgStart).toFixed(1) });
               })
           );
+          const bgEnqueueMs = performance.now() - tBgStart;
 
+          const tResponse = performance.now();
           const totalMs = performance.now() - tCreateTotal;
-          console.log(`[perf] /api/rooms(create) breakdown`, JSON.stringify({ rid: request_id, room_key, visibility, params_ms: +paramsMs.toFixed(1), db_insert_room_ms: +dbInsertRoomMs.toFixed(1), membership: "deferred", total_ms: +totalMs.toFixed(1) }));
+          console.log(`[perf] /api/rooms(create) breakdown`, JSON.stringify({ rid: request_id, room_key, visibility, params_ms: +(tValidate - tCreateTotal).toFixed(1), db_insert_room_ms: +dbInsertRoomMs.toFixed(1), membership: "deferred", total_ms: +totalMs.toFixed(1) }));
+
+          // Breakdown2: detailed spans (only when slow)
+          if (totalMs >= 300) {
+            console.log(`[perf] /api/rooms(create) breakdown2`, JSON.stringify({
+              rid: request_id, me: user_id, room_key, visibility,
+              auth_ms: +(tAuth - tCreateTotal).toFixed(1),
+              body_parse_ms: +(tBodyParse - tAuth).toFixed(1),
+              validate_ms: +(tValidate - tBodyParse).toFixed(1),
+              keygen_ms: +(tKeygen - tValidate).toFixed(1),
+              db_room_insert_ms: +dbInsertRoomMs.toFixed(1),
+              membership_mode: "deferred",
+              bg_enqueue_ms: +bgEnqueueMs.toFixed(1),
+              response_ms: +(performance.now() - tResponse).toFixed(1),
+              total_ms: +totalMs.toFixed(1),
+            }));
+          }
 
           // Enriched response: includes member_count + my_role so client can skip room-detail fetch
           return ok(req, env, request_id, { room: { ...(room as any), member_count: 1 }, my_role: "owner" }, 201);
