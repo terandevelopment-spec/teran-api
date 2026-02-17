@@ -9,6 +9,7 @@ export interface Env {
   CORS_ORIGIN?: string; // optional: "http://localhost:5173" etc
   R2_MEDIA: R2Bucket;    // R2 bucket for media uploads
   UNREAD_KV: KVNamespace; // KV for unread_count cache
+  PROFILE_KV: KVNamespace; // KV for profile cache
   R2_ACCESS_KEY_ID: string;      // R2 S3-compat API token
   R2_SECRET_ACCESS_KEY: string;
   R2_ACCOUNT_ID: string;         // CF account id
@@ -3037,6 +3038,24 @@ export default {
             throw new HttpError(400, "BAD_REQUEST", "user_id is required");
           }
 
+          const PROFILE_CACHE_TTL = 300; // 5 minutes
+          const kvKey = `profile:${user_id}`;
+
+          // KV cache check
+          const tKv = performance.now();
+          let cached: any = null;
+          try {
+            cached = await env.PROFILE_KV.get(kvKey, "json");
+          } catch (_) { /* KV miss or error — fall through to DB */ }
+          const kvMs = performance.now() - tKv;
+
+          if (cached) {
+            const totalMs = performance.now() - tProfile;
+            console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "HIT", kv_ms: +kvMs.toFixed(1), total_ms: +totalMs.toFixed(1), caller }));
+            return ok(req, env, request_id, { ...cached, persona_tags: cached.persona_tags ?? [] });
+          }
+
+          // KV MISS — DB fallback
           const tDb = performance.now();
           const { data, error } = await sb(env)
             .from("user_profiles")
@@ -3051,7 +3070,7 @@ export default {
 
           // Return empty profile if not found (don't throw)
           if (!data) {
-            console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "NONE", db_ms: +dbMs.toFixed(1), total_ms: +totalMs.toFixed(1), found: false, caller }));
+            console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "MISS", kv_ms: +kvMs.toFixed(1), db_ms: +dbMs.toFixed(1), total_ms: +totalMs.toFixed(1), found: false, caller }));
             return ok(req, env, request_id, {
               user_id,
               display_name: null,
@@ -3061,7 +3080,13 @@ export default {
             });
           }
 
-          console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "NONE", db_ms: +dbMs.toFixed(1), total_ms: +totalMs.toFixed(1), found: true, caller }));
+          // KV set (fire-and-forget)
+          ctx.waitUntil(
+            env.PROFILE_KV.put(kvKey, JSON.stringify(data), { expirationTtl: PROFILE_CACHE_TTL })
+              .catch((e: any) => console.error("[profile] KV put failed", { rid: request_id, user_id, error: String(e) }))
+          );
+
+          console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "MISS", kv_ms: +kvMs.toFixed(1), db_ms: +dbMs.toFixed(1), total_ms: +totalMs.toFixed(1), found: true, caller }));
           return ok(req, env, request_id, {
             ...data,
             persona_tags: data.persona_tags ?? [],
@@ -3148,6 +3173,12 @@ export default {
           const p3 = performance.now();
 
           if (writeErr) throw writeErr;
+
+          // Invalidate profile KV cache after write
+          ctx.waitUntil(
+            env.PROFILE_KV.delete(`profile:${trimmedUserId}`)
+              .catch((e: any) => console.error("[profile] KV delete failed", { rid: request_id, user_id: trimmedUserId, error: String(e) }))
+          );
 
           console.log(`[profile-sync] write rid=${request_id} user=${trimmedUserId} dn=${incoming.display_name}`);
           console.log(`[perf] profile breakdown rid=${request_id} parse=${(p1 - p0).toFixed(1)} db_read=${(p2 - p1).toFixed(1)} db_write=${(p3 - p2).toFixed(1)} total=${(p3 - p0).toFixed(1)} decision=WRITE`);
@@ -4331,7 +4362,7 @@ export default {
             const roomId = m[1];
             const caller = req.headers.get("x-teran-caller") || "unknown";
 
-            // DB: fetch room
+            // 1) DB: fetch room (sequential — needed for visibility gate)
             const tDbRoom = performance.now();
             const { data: room, error } = await sb(env)
               .from("rooms")
@@ -4346,43 +4377,36 @@ export default {
               throw new HttpError(404, "NOT_FOUND", "Room not found");
             }
 
-            // Private rooms: only members can see details
-            let dbMembershipMs = 0;
+            // Private rooms: only members can see details (must check before parallel)
             if ((room as any).visibility === "private_invite_only") {
-              const tMem = performance.now();
-              const callerId = await optionalAuth(req, env);
-              if (!callerId) throw new HttpError(404, "NOT_FOUND", "Room not found");
-              const role = await checkRoomMembership(env, roomId, callerId);
-              dbMembershipMs = performance.now() - tMem;
-              if (!role) throw new HttpError(404, "NOT_FOUND", "Room not found");
+              const privCaller = await optionalAuth(req, env);
+              if (!privCaller) throw new HttpError(404, "NOT_FOUND", "Room not found");
+              const privRole = await checkRoomMembership(env, roomId, privCaller);
+              if (!privRole) throw new HttpError(404, "NOT_FOUND", "Room not found");
             }
 
-            // DB: member_count
-            const tDbCounts = performance.now();
-            const { count } = await sb(env)
-              .from("room_members")
-              .select("*", { count: "exact", head: true })
-              .eq("room_id", roomId);
-            const dbCountsMs = performance.now() - tDbCounts;
-
-            // Check caller membership
-            const tAuth = performance.now();
-            const callerId = await optionalAuth(req, env);
-            let my_role: string | null = null;
-            if (callerId) {
-              my_role = await checkRoomMembership(env, roomId, callerId);
-            }
-            const authMs = performance.now() - tAuth;
+            // 2) Parallel: member_count + caller membership
+            const tParallel = performance.now();
+            const [countResult, my_role] = await Promise.all([
+              sb(env)
+                .from("room_members")
+                .select("*", { count: "exact", head: true })
+                .eq("room_id", roomId),
+              (async (): Promise<string | null> => {
+                const uid = await optionalAuth(req, env);
+                return uid ? checkRoomMembership(env, roomId, uid) : null;
+              })(),
+            ]);
+            const parallelMs = performance.now() - tParallel;
 
             const payload = {
-              room: { ...(room as any), member_count: count ?? 0 },
+              room: { ...(room as any), member_count: countResult.count ?? 0 },
               my_role,
             };
             const payloadBytes = JSON.stringify(payload).length;
             const totalMs = performance.now() - tTotal;
 
-            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: "NONE", db_room_ms: +dbRoomMs.toFixed(1), db_counts_ms: +dbCountsMs.toFixed(1), db_membership_ms: +(dbMembershipMs + authMs).toFixed(1), transform_ms: 0, total_ms: +totalMs.toFixed(1), rows_room: 1, payload_bytes: payloadBytes, caller }));
-            console.log(`[perf] /api/rooms/:id total ${totalMs.toFixed(1)}ms`, JSON.stringify({ rid: request_id, room_id: roomId, cache: "NONE" }));
+            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: "NONE", db_room_ms: +dbRoomMs.toFixed(1), parallel_ms: +parallelMs.toFixed(1), total_ms: +totalMs.toFixed(1), rows_room: 1, payload_bytes: payloadBytes, caller }));
 
             return ok(req, env, request_id, payload);
           }
@@ -4437,17 +4461,22 @@ export default {
           const dbInsertRoomMs = performance.now() - tDbInsertRoom;
           if (error) throw new Error(error.message);
 
-          // Auto-add owner as member
-          const tDbInsertMember = performance.now();
-          await sb(env)
-            .from("room_members")
-            .insert({ room_id: (room as any).id, user_id, role: "owner" });
-          const dbInsertMemberMs = performance.now() - tDbInsertMember;
+          // Auto-add owner as member (background — not blocking response)
+          const tBgStart = performance.now();
+          ctx.waitUntil(
+            Promise.resolve(sb(env).from("room_members")
+              .insert({ room_id: (room as any).id, user_id, role: "owner" }))
+              .then(({ error: memErr }) => {
+                if (memErr) console.error("[room_create] membership insert failed", { rid: request_id, room_id: (room as any).id, error: memErr.message });
+                else console.log("[room_create] membership insert ok", { rid: request_id, room_id: (room as any).id, bg_ms: +(performance.now() - tBgStart).toFixed(1) });
+              })
+          );
 
           const totalMs = performance.now() - tCreateTotal;
-          console.log(`[perf] /api/rooms(create) breakdown`, JSON.stringify({ rid: request_id, room_key, visibility, params_ms: +paramsMs.toFixed(1), db_insert_room_ms: +dbInsertRoomMs.toFixed(1), db_insert_member_ms: +dbInsertMemberMs.toFixed(1), total_ms: +totalMs.toFixed(1) }));
+          console.log(`[perf] /api/rooms(create) breakdown`, JSON.stringify({ rid: request_id, room_key, visibility, params_ms: +paramsMs.toFixed(1), db_insert_room_ms: +dbInsertRoomMs.toFixed(1), membership: "deferred", total_ms: +totalMs.toFixed(1) }));
 
-          return ok(req, env, request_id, { room }, 201);
+          // Enriched response: includes member_count + my_role so client can skip room-detail fetch
+          return ok(req, env, request_id, { room: { ...(room as any), member_count: 1 }, my_role: "owner" }, 201);
         }
 
         // PATCH /api/rooms/:id — owner update

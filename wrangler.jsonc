@@ -24,6 +24,15 @@
 		{
 			"binding": "UNREAD_KV",
 			"id": "704a0aa3f72d4e1eb0ab8822ee8334a6"
+		},
+		{
+			"binding": "PROFILE_KV",
+			"id": "REPLACE_WITH_ACTUAL_KV_ID"
+		},
+		{
+			"binding": "y",
+			"id": "8c3912fc758c4adbb6ba63bbe0b14e41",
+			"remote": true
 		}
 	]
 	/**
