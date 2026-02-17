@@ -347,7 +347,10 @@ export default {
 
     // Preflight (don't log timing for OPTIONS)
     if (req.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders(req, env) });
+      return new Response(null, {
+        status: 204,
+        headers: { ...corsHeaders(req, env), "x-req-id": request_id },
+      });
     }
 
     const url = new URL(req.url);
@@ -5042,9 +5045,40 @@ export default {
       }
     };
 
-    const res = await handleRequest();
-    const ms = Date.now() - t0;
-    console.log(`${req.method} ${label} -> ${res.status} ${ms}ms${ms >= 300 ? " SLOW" : ""}`);
+    let res: Response;
+    try {
+      res = await handleRequest();
+    } catch (fatal) {
+      res = new Response(
+        JSON.stringify({ error: { code: "INTERNAL_ERROR", message: "unhandled" }, request_id }),
+        { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders(req, env) } }
+      );
+    } finally {
+      const ms = Date.now() - t0;
+      const headers = new Headers(res!.headers);
+      if (!headers.has("x-req-id")) headers.set("x-req-id", request_id);
+      res = new Response(res!.body, { status: res!.status, statusText: res!.statusText, headers });
+
+      const status = res.status;
+      console.log(`${req.method} ${label} -> ${status} ${ms}ms${ms >= 300 ? " SLOW" : ""}`);
+
+      if (status >= 500 || ms >= 2000) {
+        const cfData = (req as any).cf || {};
+        const cacheHeader = res.headers.get("X-Cache") || "UNKNOWN";
+        console.log(JSON.stringify({
+          tag: "spike",
+          req_id: request_id,
+          path: path,
+          method: req.method,
+          status: status,
+          ms: ms,
+          query: url.search,
+          cf_ray: req.headers.get("cf-ray") || cfData.ray || "",
+          colo: cfData.colo || "",
+          cache: cacheHeader,
+        }));
+      }
+    }
     return res;
   },
 };
