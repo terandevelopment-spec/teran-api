@@ -26,7 +26,7 @@ function corsHeaders(req: Request, env: Env) {
   return {
     "Access-Control-Allow-Origin": allowed === "null" ? "*" : allowed,
     "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, x-teran-caller",
     "Access-Control-Expose-Headers": "X-Cache, X-Cache-Key, X-Request-Id, Cache-Control",
     "Access-Control-Max-Age": "86400",
   };
@@ -412,6 +412,8 @@ export default {
                 },
               });
             }
+            // Cache MISS — log for hit-rate analysis
+            console.log(`[perf] /api/posts cache`, JSON.stringify({ rid: request_id, cache_key: feedCacheKey?.url || "none", ttl_s: FEED_CACHE_TTL, cache: "MISS" }));
           }
 
           // Build base query with conditional select:
@@ -4221,6 +4223,7 @@ export default {
 
         // GET /api/rooms — list public rooms, or rooms by owner_id
         if (path === "/api/rooms" && req.method === "GET") {
+          const tListTotal = performance.now();
           const owner_id_param = url.searchParams.get("owner_id")?.trim() || null;
 
           let q = sb(env)
@@ -4257,19 +4260,26 @@ export default {
             q = q.eq("category", categoryParam);
           }
 
+          const paramsMs = performance.now() - tListTotal;
+
+          const tDbRooms = performance.now();
           const { data, error } = await q
             .order("created_at", { ascending: false })
             .limit(100);
+          const dbRoomsMs = performance.now() - tDbRooms;
           if (error) throw new Error(error.message);
 
           // Attach member_count per room
           const roomIds = (data || []).map((r: any) => r.id);
           let countMap: Record<string, number> = {};
+          let dbCountsMs = 0;
           if (roomIds.length > 0) {
+            const tDbCounts = performance.now();
             const { data: counts } = await sb(env)
               .from("room_members")
               .select("room_id")
               .in("room_id", roomIds);
+            dbCountsMs = performance.now() - tDbCounts;
             if (counts) {
               for (const c of counts) {
                 countMap[c.room_id] = (countMap[c.room_id] || 0) + 1;
@@ -4277,10 +4287,15 @@ export default {
             }
           }
 
+          const tTransform = performance.now();
           const rooms = (data || []).map((r: any) => ({
             ...r,
             member_count: countMap[r.id] || 0,
           }));
+          const transformMs = performance.now() - tTransform;
+          const totalMs = performance.now() - tListTotal;
+
+          console.log(`[perf] /api/rooms(list) breakdown`, JSON.stringify({ rid: request_id, owner_id: owner_id_param || "none", category: categoryParam || "none", visibility_filter: owner_id_param ? "all" : "public", params_ms: +paramsMs.toFixed(1), db_rooms_ms: +dbRoomsMs.toFixed(1), db_counts_ms: +dbCountsMs.toFixed(1), transform_ms: +transformMs.toFixed(1), total_ms: +totalMs.toFixed(1), rows: rooms.length }));
 
           return ok(req, env, request_id, { rooms });
         }
@@ -4375,6 +4390,7 @@ export default {
 
         // POST /api/rooms — create room
         if (path === "/api/rooms" && req.method === "POST") {
+          const tCreateTotal = performance.now();
           const user_id = await requireAuth(req, env);
           const body = (await req.json().catch(() => null)) as any;
 
@@ -4406,7 +4422,9 @@ export default {
 
           // Generate random room_key (16 hex chars)
           const room_key = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+          const paramsMs = performance.now() - tCreateTotal;
 
+          const tDbInsertRoom = performance.now();
           const { data: room, error } = await sb(env)
             .from("rooms")
             .insert({
@@ -4416,12 +4434,18 @@ export default {
             })
             .select()
             .single();
+          const dbInsertRoomMs = performance.now() - tDbInsertRoom;
           if (error) throw new Error(error.message);
 
           // Auto-add owner as member
+          const tDbInsertMember = performance.now();
           await sb(env)
             .from("room_members")
             .insert({ room_id: (room as any).id, user_id, role: "owner" });
+          const dbInsertMemberMs = performance.now() - tDbInsertMember;
+
+          const totalMs = performance.now() - tCreateTotal;
+          console.log(`[perf] /api/rooms(create) breakdown`, JSON.stringify({ rid: request_id, room_key, visibility, params_ms: +paramsMs.toFixed(1), db_insert_room_ms: +dbInsertRoomMs.toFixed(1), db_insert_member_ms: +dbInsertMemberMs.toFixed(1), total_ms: +totalMs.toFixed(1) }));
 
           return ok(req, env, request_id, { room }, 201);
         }
