@@ -375,9 +375,13 @@ export default {
 
         // /api/posts (GET) - filter by ?id=, ?user_id=, ?author_id=, ?room_id=, ?limit=, ?actor_id=
         if (path === "/api/posts" && req.method === "GET") {
-          const FEED_CACHE_TTL = 8; // seconds
+          const FEED_CACHE_TTL = 8;
+          const SLOW_MS = 1000;
+          const VERY_SLOW_MS = 3000;
           const handlerStart = Date.now();
           const p0 = performance.now();
+          let cacheLookupMs = 0;
+          let cacheStatus = "BYPASS";
 
           // Parse all query params
           const id_param = url.searchParams.get("id");
@@ -410,11 +414,14 @@ export default {
             if (actor_id_param) cacheUrl.searchParams.set("actor", actor_id_param);
             feedCacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
+            const cacheT0 = performance.now();
             const cached = await cache.match(feedCacheKey);
+            cacheLookupMs = +(performance.now() - cacheT0).toFixed(1);
             if (cached) {
+              cacheStatus = "HIT";
               const hitBody = await cached.text();
               const pDone = performance.now();
-              console.log(`[perf] /api/posts cache=HIT rid=${request_id} total=${(pDone - p0).toFixed(1)}ms limit=${limit_param || 50} actor=${actor_id_param || "none"} payloadBytes=${hitBody.length}`);
+              console.log(`[perf] /api/posts cache=HIT rid=${request_id} total=${(pDone - p0).toFixed(1)}ms cache_lookup_ms=${cacheLookupMs} limit=${limit_param || 50} actor=${actor_id_param || "none"} payloadBytes=${hitBody.length}`);
               return new Response(hitBody, {
                 status: 200,
                 headers: {
@@ -425,8 +432,8 @@ export default {
                 },
               });
             }
-            // Cache MISS — log for hit-rate analysis
-            console.log(`[perf] /api/posts cache`, JSON.stringify({ rid: request_id, cache_key: feedCacheKey?.url || "none", ttl_s: FEED_CACHE_TTL, cache: "MISS" }));
+            cacheStatus = "MISS";
+            console.log(`[perf] /api/posts cache`, JSON.stringify({ rid: request_id, cache_key: feedCacheKey?.url || "none", ttl_s: FEED_CACHE_TTL, cache: "MISS", cache_lookup_ms: cacheLookupMs }));
           }
 
           // Build base query with conditional select:
@@ -551,6 +558,19 @@ export default {
             q = q.limit(lim);
           }
           const p2 = performance.now();
+
+          const queryFilters: string[] = [];
+          if (id_param) queryFilters.push(`id=eq.${id_param}`);
+          if (user_id_param) queryFilters.push(`user_id=eq.${user_id_param}`);
+          else if (author_id_param) queryFilters.push(`author_id=eq.${author_id_param}`);
+          if (post_type_param) queryFilters.push(`post_type=in.(${post_type_param})`);
+          if (parent_post_id_param) queryFilters.push(`parent_post_id=eq.${parent_post_id_param}`);
+          else if (root_only_param === "1" || root_only_param === "true") queryFilters.push(`parent_post_id=is.null`);
+          if (room_id_param && room_id_param !== "global") queryFilters.push(`room_id=eq.${room_id_param}`);
+          else if (room_scope_param === "global" || room_id_param === "global") queryFilters.push(`room_id=is.null|eq.global`);
+          else if (room_scope_param === "rooms") queryFilters.push(`room_id=not.is.null&neq.global`);
+          if (cursor) queryFilters.push(`cursor=${cursor.created_at}:${cursor.id}`);
+          const queryEvidence = `table=posts select=${selectFields} filters=[${queryFilters.join(",")}] order=created_at.desc,id.desc limit=${lim}`;
 
           let t1 = Date.now();
           let posts: any[] | null = null;
@@ -876,6 +896,58 @@ export default {
           if (isReplyQuery) {
             const serializeMs = performance.now();
             console.log(`[perf][replies_breakdown] rid=${request_id} parent_post_id=${parent_post_id_param} http_ms=${replyHttpMs} parse_ms=${replyParseMs} parallel_ms=${(p4 - p3).toFixed(1)} transform_ms=${(p5 - p4).toFixed(1)} serialize_ms=${(serializeMs - p5).toFixed(1)} total_ms=${(serializeMs - p0).toFixed(1)} rows=${enrichedPosts.length} payload_bytes=${responseBody.length}`);
+          }
+
+          if (postsTotal >= SLOW_MS) {
+            console.log(JSON.stringify({
+              tag: "slow",
+              rid: request_id,
+              total_ms: +postsTotal.toFixed(1),
+              cache_lookup_ms: cacheLookupMs,
+              select_ms: +postsQueryMs,
+              parallel_ms: parallelMs,
+              media_ms: mediaMs,
+              likes_ms: likesMs,
+              comment_counts_ms: commentCountMs,
+              cache_hit: cacheStatus,
+              cache_key: feedCacheKey?.url || "none",
+              rows: enrichedPosts.length,
+              payload_bytes: responseBody.length,
+            }));
+          }
+
+          if (postsTotal >= VERY_SLOW_MS) {
+            console.log(JSON.stringify({
+              tag: "very_slow",
+              rid: request_id,
+              total_ms: +postsTotal.toFixed(1),
+              cache_lookup_ms: cacheLookupMs,
+              select_ms: +postsQueryMs,
+              parallel_ms: parallelMs,
+              media_ms: mediaMs,
+              likes_ms: likesMs,
+              comment_counts_ms: commentCountMs,
+              transform_ms: +(p5 - p4).toFixed(1),
+              serialize_ms: +serializeMs.toFixed(1),
+              cache_hit: cacheStatus,
+              cache_key: feedCacheKey?.url || "none",
+              rows: enrichedPosts.length,
+              payload_bytes: responseBody.length,
+              shape: {
+                limit: lim,
+                cursor: cursor ? `${cursor.created_at}:${cursor.id}` : null,
+                root_only: root_only_param || "false",
+                room_scope: room_scope_param || "none",
+                room_id: room_id_param || "none",
+                post_type: post_type_param || "all",
+                select_cols: selectFields,
+                is_reply: isReplyQuery,
+              },
+              query_evidence: queryEvidence,
+              media_rows: mediaRows.length,
+              likes_rows: (allLikeRows as any[]).length,
+              comment_count_rows: (commentCountRows as any[]).length,
+            }));
           }
 
           // ── Store in edge cache (feed only, fire-and-forget) ──
