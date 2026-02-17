@@ -145,6 +145,20 @@ async function requireAuth(req: Request, env: Env): Promise<string> {
 let _sbClient: ReturnType<typeof createClient> | null = null;
 let _sbUrl: string | null = null;
 
+// ── In-memory stale cache for unread_count (per-isolate, survives across requests) ──
+const MEM_CACHE_TTL_MS = 120_000; // 120s — serves stale value when KV times out
+const _unreadMem = new Map<string, { count: number; ts: number }>();
+function memGet(userId: string): number | null {
+  const entry = _unreadMem.get(userId);
+  if (!entry) return null;
+  if (performance.now() - entry.ts > MEM_CACHE_TTL_MS) { _unreadMem.delete(userId); return null; }
+  return entry.count;
+}
+function memSet(userId: string, count: number) {
+  _unreadMem.set(userId, { count, ts: performance.now() });
+}
+
+
 function sb(env: Env) {
   // Reuse client if URL hasn't changed (same isolate)
   if (_sbClient && _sbUrl === env.SUPABASE_URL) return _sbClient;
@@ -1814,12 +1828,13 @@ export default {
           return ok(req, env, request_id, { ok: true });
         }
 
-        // GET /api/notifications/unread_count (KV-cached, SWR pattern, 300s TTL)
-        // Fast path: serve from KV immediately, background-refresh via DB.
-        // Sync DB only on true KV MISS (no cached value at all).
+        // GET /api/notifications/unread_count (KV-cached, SWR + stale-mem fallback)
+        // Priority: KV hit → stale mem (if KV timeout) → sync Supabase (cold start)
+        // Background refresh keeps KV + in-memory cache fresh.
         if (path === "/api/notifications/unread_count" && req.method === "GET") {
-          const KV_TTL = 300; // seconds (background revalidation keeps it fresh)
-          const KV_TIMEOUT_MS = 60; // ms — if KV GET takes longer, treat as MISS
+          const KV_TTL = 300;           // seconds for KV expiry
+          const KV_TIMEOUT_1 = 120;     // ms — first KV attempt
+          const KV_TIMEOUT_2 = 200;     // ms — second KV attempt (retry)
           const p0 = performance.now();
 
           const user_id = await requireAuth(req, env);
@@ -1827,51 +1842,98 @@ export default {
 
           const kvKey = `unread_count:${user_id}`;
 
-          // ── KV lookup with timeout ──
-          const KV_TIMED_OUT = Symbol("KV_TIMED_OUT");
-          const kvResult = await Promise.race([
-            env.UNREAD_KV.get(kvKey, "text"),
-            new Promise<typeof KV_TIMED_OUT>((resolve) =>
-              setTimeout(() => resolve(KV_TIMED_OUT), KV_TIMEOUT_MS)
-            ),
-          ]);
-          const p2 = performance.now();
-          const kvTimedOut = kvResult === KV_TIMED_OUT;
-          const cached = kvTimedOut ? null : kvResult;
+          // ── Helper: direct PostgREST fetch with HTTP timing + header capture ──
+          const fetchUnreadCount = async (): Promise<{
+            count: number;
+            httpMs: string; parseMs: string; status: number;
+            serverTiming: string; xResponseTime: string;
+            cfRay: string; cfCache: string; contentRange: string;
+          }> => {
+            const restUrl = `${env.SUPABASE_URL}/rest/v1/notifications?select=id&recipient_user_id=eq.${encodeURIComponent(user_id)}&is_read=eq.false`;
+            const tStart = performance.now();
+            const res = await fetch(restUrl, {
+              method: "HEAD",
+              headers: {
+                "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                "Prefer": "count=exact",
+              },
+            });
+            const tFetchEnd = performance.now();
 
-          // ── Helper: background DB refresh (fire-and-forget) ──
-          const backgroundRefresh = () => {
+            if (!res.ok) {
+              const errBody = await res.text().catch(() => "");
+              throw new Error(`PostgREST ${res.status}: ${errBody}`);
+            }
+
+            const cr = res.headers.get("content-range") ?? "";
+            const m = cr.match(/\/(\d+)$/);
+            const count = m ? parseInt(m[1], 10) : 0;
+            const tParseEnd = performance.now();
+
+            return {
+              count,
+              httpMs: (tFetchEnd - tStart).toFixed(1),
+              parseMs: (tParseEnd - tFetchEnd).toFixed(1),
+              status: res.status,
+              serverTiming: res.headers.get("server-timing") ?? "none",
+              xResponseTime: res.headers.get("x-response-time") ?? "none",
+              cfRay: res.headers.get("cf-ray") ?? "none",
+              cfCache: res.headers.get("cf-cache-status") ?? "none",
+              contentRange: cr,
+            };
+          };
+
+          // ── Helper: background refresh (updates KV + in-memory) ──
+          const backgroundRefresh = (reason: string) => {
             ctx.waitUntil(
               (async () => {
-                const dbStart = performance.now();
                 try {
-                  const { count, error } = await sb(env)
-                    .from("notifications")
-                    .select("id", { count: "exact", head: true })
-                    .eq("recipient_user_id", user_id)
-                    .eq("is_read", false);
-                  const dbEnd = performance.now();
-                  if (error) {
-                    console.error(`[kv] unread_count bg_refresh db_error rid=${request_id} me=${user_id}`, error);
-                    return;
-                  }
-                  const freshCount = count ?? 0;
-                  await env.UNREAD_KV.put(kvKey, String(freshCount), { expirationTtl: KV_TTL });
-                  console.log(`[kv] unread_count bg_refresh ok rid=${request_id} me=${user_id} count=${freshCount} db_ms=${(dbEnd - dbStart).toFixed(1)}`);
+                  const r = await fetchUnreadCount();
+                  memSet(user_id, r.count);
+                  await env.UNREAD_KV.put(kvKey, String(r.count), { expirationTtl: KV_TTL });
+                  console.log(`[bg_refresh] ok rid=${request_id} me=${user_id} reason=${reason} count=${r.count} http_ms=${r.httpMs} parse_ms=${r.parseMs} status=${r.status}`);
                 } catch (err) {
-                  console.error(`[kv] unread_count bg_refresh fail rid=${request_id} me=${user_id}`, err);
+                  console.error(`[bg_refresh] fail rid=${request_id} me=${user_id} reason=${reason}`, err);
                 }
               })()
             );
           };
 
+          // ── KV lookup: attempt 1 ──
+          const KV_TIMED_OUT = Symbol("KV_TIMED_OUT");
+          let kvResult = await Promise.race([
+            env.UNREAD_KV.get(kvKey, "text"),
+            new Promise<typeof KV_TIMED_OUT>((resolve) =>
+              setTimeout(() => resolve(KV_TIMED_OUT), KV_TIMEOUT_1)
+            ),
+          ]);
+          let kvAttempts = 1;
+
+          // ── KV retry: attempt 2 (only if first timed out) ──
+          if (kvResult === KV_TIMED_OUT) {
+            kvResult = await Promise.race([
+              env.UNREAD_KV.get(kvKey, "text"),
+              new Promise<typeof KV_TIMED_OUT>((resolve) =>
+                setTimeout(() => resolve(KV_TIMED_OUT), KV_TIMEOUT_2)
+              ),
+            ]);
+            kvAttempts = 2;
+          }
+
+          const p2 = performance.now();
+          const kvTimedOut = kvResult === KV_TIMED_OUT;
+          const cached = kvTimedOut ? null : kvResult;
+          const kvGetMs = (p2 - p1).toFixed(1);
+
+          // ── PATH 1: KV HIT — serve immediately, SWR background refresh ──
           if (cached !== null) {
-            // ── KV HIT: serve immediately, background-refresh (SWR) ──
-            backgroundRefresh();
+            const count = parseInt(cached as string, 10);
+            memSet(user_id, count); // keep in-memory fresh
+            backgroundRefresh("swr");
             const pDone = performance.now();
-            console.log(`[kv] unread_count SWR_SERVE rid=${request_id} me=${user_id} kv_ms=${(p2 - p1).toFixed(1)} total=${(pDone - p0).toFixed(1)}ms bg_refresh=started`);
-            const responseBody = JSON.stringify({ unread_count: parseInt(cached, 10), source: "kv" });
-            return new Response(responseBody, {
+            console.log(`[perf][unread_count] rid=${request_id} me=${user_id} kv_reason=hit kv_get_ms=${kvGetMs} kv_attempts=${kvAttempts} count=${count} total_ms=${(pDone - p0).toFixed(1)} source=kv bg_refresh=started`);
+            return new Response(JSON.stringify({ unread_count: count, source: "kv" }), {
               status: 200,
               headers: {
                 "Content-Type": "application/json",
@@ -1882,70 +1944,74 @@ export default {
             });
           }
 
-          // ── KV MISS or TIMEOUT: sync DB query (cold start) ──
+          // ── PATH 2: KV TIMEOUT — try in-memory stale serve ──
           if (kvTimedOut) {
-            console.log(`[kv] unread_count TIMEOUT rid=${request_id} waited=${KV_TIMEOUT_MS}ms me=${user_id}`);
+            const stale = memGet(user_id);
+            if (stale !== null) {
+              backgroundRefresh("timeout_stale_mem");
+              const pDone = performance.now();
+              console.log(`[perf][unread_count] rid=${request_id} me=${user_id} kv_reason=timeout_stale_mem kv_get_ms=${kvGetMs} kv_attempts=${kvAttempts} count=${stale} total_ms=${(pDone - p0).toFixed(1)} source=mem bg_refresh=started`);
+              return new Response(JSON.stringify({ unread_count: stale, source: "mem" }), {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Request-Id": request_id,
+                  "X-Cache": "STALE_MEM",
+                  ...corsHeaders(req, env),
+                },
+              });
+            }
+            // No stale value — must fall through to sync DB
+            console.log(`[kv] unread_count TIMEOUT_NO_MEM rid=${request_id} me=${user_id} kv_get_ms=${kvGetMs} kv_attempts=${kvAttempts}`);
           } else {
-            console.log(`[kv] unread_count MISS rid=${request_id} me=${user_id} kv_ms=${(p2 - p1).toFixed(1)}`);
+            // True KV MISS (key doesn't exist)
+            console.log(`[kv] unread_count MISS rid=${request_id} me=${user_id} kv_get_ms=${kvGetMs}`);
           }
 
-          // ── Direct fetch to PostgREST for HTTP-level timing + header capture ──
-          const restUrl = `${env.SUPABASE_URL}/rest/v1/notifications?select=id&recipient_user_id=eq.${encodeURIComponent(user_id)}&is_read=eq.false`;
-          const tFetchStart = performance.now();
-          const dbRes = await fetch(restUrl, {
-            method: "HEAD",
-            headers: {
-              "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-              "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-              "Prefer": "count=exact",
-            },
-          });
-          const tFetchEnd = performance.now();
+          // ── PATH 3: Sync DB fallback (KV miss or timeout with no stale) ──
+          const kvLabel = kvTimedOut ? "timeout_fallback_db" : "miss";
+          try {
+            const r = await fetchUnreadCount();
+            const p3 = performance.now();
 
-          // Parse count from content-range header (PostgREST HEAD + Prefer: count=exact)
-          const contentRange = dbRes.headers.get("content-range") ?? "";
-          // content-range format: "*/N" for HEAD requests (e.g. "*/3" means 3 rows)
-          const rangeMatch = contentRange.match(/\/(\d+)$/);
-          const unreadCount = rangeMatch ? parseInt(rangeMatch[1], 10) : 0;
-          const tParseEnd = performance.now();
-          const p3 = tParseEnd;
+            memSet(user_id, r.count);
 
-          if (!dbRes.ok) {
-            const errBody = await dbRes.text().catch(() => "");
-            throw new Error(`PostgREST ${dbRes.status}: ${errBody}`);
+            // Fire-and-forget KV put
+            ctx.waitUntil(
+              env.UNREAD_KV.put(kvKey, String(r.count), { expirationTtl: KV_TTL })
+                .then(() => console.log(`[kv] unread_count put ok=true rid=${request_id} me=${user_id} count=${r.count}`))
+                .catch((err) => console.error(`[kv] unread_count put ok=false rid=${request_id} me=${user_id}`, err))
+            );
+
+            console.log(`[perf][unread_count] rid=${request_id} me=${user_id} kv_reason=${kvLabel} kv_get_ms=${kvGetMs} kv_attempts=${kvAttempts} count=${r.count} http_ms=${r.httpMs} parse_ms=${r.parseMs} total_ms=${(p3 - p0).toFixed(1)} source=db kv_put=async`);
+            console.log(`[perf][unread_count_http] rid=${request_id} me=${user_id} kv_reason=${kvLabel} http_ms=${r.httpMs} parse_ms=${r.parseMs} status=${r.status} server_timing="${r.serverTiming}" x_response_time="${r.xResponseTime}" cf_ray="${r.cfRay}" cf_cache="${r.cfCache}" content_range="${r.contentRange}"`);
+
+            return new Response(JSON.stringify({ unread_count: r.count, source: "db" }), {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+                "X-Cache": kvTimedOut ? "TIMEOUT_DB" : "MISS_DB",
+                ...corsHeaders(req, env),
+              },
+            });
+          } catch (dbErr) {
+            console.error(`[unread_count] db_fallback_error rid=${request_id} me=${user_id} kv_reason=${kvLabel}`, dbErr);
+            // Last resort: return stale mem if it appeared since we started
+            const lastChance = memGet(user_id);
+            if (lastChance !== null) {
+              return new Response(JSON.stringify({ unread_count: lastChance, source: "mem_error" }), {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Request-Id": request_id,
+                  "X-Cache": "ERROR_MEM",
+                  ...corsHeaders(req, env),
+                },
+              });
+            }
+            throw dbErr; // re-throw to hit outer error handler
           }
-
-          // Capture response headers for diagnostics
-          const serverTiming = dbRes.headers.get("server-timing") ?? "none";
-          const xResponseTime = dbRes.headers.get("x-response-time") ?? "none";
-          const cfRay = dbRes.headers.get("cf-ray") ?? "none";
-          const cfCacheStatus = dbRes.headers.get("cf-cache-status") ?? "none";
-
-          const httpMs = (tFetchEnd - tFetchStart).toFixed(1);
-          const parseMs = (tParseEnd - tFetchEnd).toFixed(1);
-
-          // Fire-and-forget KV put
-          ctx.waitUntil(
-            env.UNREAD_KV.put(kvKey, String(unreadCount), { expirationTtl: KV_TTL })
-              .then(() => console.log(`[kv] unread_count put ok=true rid=${request_id} me=${user_id} count=${unreadCount}`))
-              .catch((err) => console.error(`[kv] unread_count put ok=false rid=${request_id} me=${user_id}`, err))
-          );
-
-          const kvLabel = kvTimedOut ? "timeout" : "miss";
-          console.log(`[perf] unread_count breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} kv_lookup=${(p2 - p1).toFixed(1)}(${kvLabel}) db=${(p3 - p2).toFixed(1)} total=${(p3 - p0).toFixed(1)} count=${unreadCount} kv_put=async`);
-          console.log(`[perf][unread_count] rid=${request_id} me=${user_id} db_ms=${(p3 - p2).toFixed(1)} count=${unreadCount} kv_reason=${kvLabel} kv_put_ms=async`);
-          console.log(`[perf][unread_count_http] rid=${request_id} me=${user_id} kv_reason=${kvLabel} http_ms=${httpMs} parse_ms=${parseMs} status=${dbRes.status} server_timing="${serverTiming}" x_response_time="${xResponseTime}" cf_ray="${cfRay}" cf_cache="${cfCacheStatus}" content_range="${contentRange}"`);
-
-          const responseBody = JSON.stringify({ unread_count: unreadCount, source: "db" });
-          return new Response(responseBody, {
-            status: 200,
-            headers: {
-              "Content-Type": "application/json",
-              "X-Request-Id": request_id,
-              "X-Cache": kvTimedOut ? "TIMEOUT" : "MISS",
-              ...corsHeaders(req, env),
-            },
-          });
         }
 
         // GET /api/debug/notifications?type=post_like&limit=20 (DEV ONLY - no auth)
