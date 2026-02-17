@@ -1,5 +1,6 @@
 // ~/Desktop/teran-api/src/index.ts
 import { createClient } from "@supabase/supabase-js";
+import { AwsClient } from "aws4fetch";
 
 export interface Env {
   SUPABASE_URL: string;
@@ -8,6 +9,9 @@ export interface Env {
   CORS_ORIGIN?: string; // optional: "http://localhost:5173" etc
   R2_MEDIA: R2Bucket;    // R2 bucket for media uploads
   UNREAD_KV: KVNamespace; // KV for unread_count cache
+  R2_ACCESS_KEY_ID: string;      // R2 S3-compat API token
+  R2_SECRET_ACCESS_KEY: string;
+  R2_ACCOUNT_ID: string;         // CF account id
 
 }
 
@@ -1969,20 +1973,31 @@ export default {
           const uniqueId = crypto.randomUUID();
           const key = `${keyPrefix}/${user_id}/${timestamp}_${uniqueId}.${ext}`;
 
-          // Generate presigned PUT URL using R2 createMultipartUpload is not needed
-          // R2 Workers binding doesn't have createPresignedUrl directly
-          // Instead we create a custom signed URL scheme using a signature
+          // Validate key prefix (defense-in-depth)
+          const allowedPrefixes = ["image_original/", "image_thumb/", "video_original/", "video_thumb/", "video/", "thumb/", "avatar/"];
+          if (!allowedPrefixes.some(p => key.startsWith(p))) {
+            throw new HttpError(422, "VALIDATION_ERROR", "Invalid key prefix");
+          }
 
-          // For Workers R2, generate a custom presigned URL using our own signing
-          // The client will PUT to /api/upload/{key} with a signature query param
-          const expiry = 60; // 60 seconds
-          const expiresAt = Math.floor(Date.now() / 1000) + expiry;
-          const signPayload = `PUT:${key}:${content_type}:${expiresAt}`;
-          const signature = await hmacSha256(env.JWT_SECRET, signPayload);
+          // ── Generate S3-compatible presigned PUT URL (direct-to-R2) ──
+          const aws = new AwsClient({
+            accessKeyId: env.R2_ACCESS_KEY_ID,
+            secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+          });
 
-          // Build internal upload URL
-          const baseUrl = new URL(req.url).origin;
-          const uploadUrl = `${baseUrl}/api/upload/${encodeURIComponent(key)}?expires=${expiresAt}&content_type=${encodeURIComponent(content_type)}&sig=${signature}`;
+          const endpoint = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+          const unsigned = new URL(`${endpoint}/teran-media/${key}`);
+
+          const signedReq = await aws.sign(unsigned.toString(), {
+            method: "PUT",
+            headers: { "Content-Type": content_type },
+            aws: { signQuery: true },
+          });
+
+          const uploadUrl = signedReq.url;
+          const expiresAt = Math.floor(Date.now() / 1000) + 120;
+
+          console.log(`[upload-url] rid=${request_id} kind=${kind} key=${key} direct_r2=true`);
 
           return ok(req, env, request_id, {
             key,
@@ -1995,6 +2010,7 @@ export default {
         {
           const uploadMatch = path.match(/^\/api\/upload\/(.+)$/);
           if (uploadMatch && req.method === "PUT") {
+            console.log(`[upload] legacy worker-proxy used`, { path, request_id });
             const uploadT0 = Date.now();
             const key = decodeURIComponent(uploadMatch[1]);
             const expiresStr = url.searchParams.get("expires");
