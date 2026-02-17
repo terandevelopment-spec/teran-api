@@ -1980,29 +1980,37 @@ export default {
           }
 
           // ── Generate S3-compatible presigned PUT URL (direct-to-R2) ──
+          const bucket = "teran-media";
+          const endpoint = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+          const objectUrl = `${endpoint}/${bucket}/${key}`;
+
           const aws = new AwsClient({
             accessKeyId: env.R2_ACCESS_KEY_ID,
             secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+            region: "auto",
+            service: "s3",
           });
 
-          const endpoint = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
-          const unsigned = new URL(`${endpoint}/teran-media/${key}`);
+          const expiresSeconds = 300;
+          const presignUrl = new URL(objectUrl);
+          presignUrl.searchParams.set("X-Amz-Expires", String(expiresSeconds));
 
-          const signedReq = await aws.sign(unsigned.toString(), {
-            method: "PUT",
-            headers: { "Content-Type": content_type },
-            aws: { signQuery: true },
-          });
+          const signedReq = await aws.sign(
+            new Request(presignUrl.toString(), {
+              method: "PUT",
+              headers: { "Content-Type": content_type },
+            }),
+            { aws: { signQuery: true } }
+          );
 
           const uploadUrl = signedReq.url;
-          const expiresAt = Math.floor(Date.now() / 1000) + 120;
 
           console.log(`[upload-url] rid=${request_id} kind=${kind} key=${key} direct_r2=true`);
 
           return ok(req, env, request_id, {
             key,
             uploadUrl,
-            expiresAt,
+            direct_r2: true,
           }, 201);
         }
 
@@ -2010,7 +2018,7 @@ export default {
         {
           const uploadMatch = path.match(/^\/api\/upload\/(.+)$/);
           if (uploadMatch && req.method === "PUT") {
-            console.log(`[upload] legacy worker-proxy used`, { path, request_id });
+            console.log(`[upload] DEPRECATED worker-proxy path hit key=${decodeURIComponent(uploadMatch[1])}`);
             const uploadT0 = Date.now();
             const key = decodeURIComponent(uploadMatch[1]);
             const expiresStr = url.searchParams.get("expires");
