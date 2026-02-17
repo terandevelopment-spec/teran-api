@@ -601,6 +601,9 @@ export default {
           if (postIds.length === 0) {
             console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms (empty)`);
             console.log(`[perf] /api/posts breakdown rid=${request_id} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} transform=0 total=${(p3 - p0).toFixed(1)} rows=0`);
+            if (room_id_param) {
+              console.log(`[perf] /api/posts room_id empty_shortcircuit`, JSON.stringify({ rid: request_id, room_id: room_id_param, limit: limit_param || 50, db_posts_ms: +(p3 - p2).toFixed(1), parallel_skipped: true, total_ms: +(p3 - p0).toFixed(1) }));
+            }
             if (isReplyQuery) {
               return ok(req, env, request_id, { items: [], next_cursor: null });
             }
@@ -3025,21 +3028,28 @@ export default {
 
         // GET /api/profile?user_id=...
         if (path === "/api/profile" && req.method === "GET") {
+          const tProfile = performance.now();
           const user_id = url.searchParams.get("user_id");
+          const caller = req.headers.get("x-teran-caller") || "unknown";
           if (!user_id || typeof user_id !== "string" || user_id.trim() === "") {
             throw new HttpError(400, "BAD_REQUEST", "user_id is required");
           }
 
+          const tDb = performance.now();
           const { data, error } = await sb(env)
             .from("user_profiles")
             .select("user_id, display_name, bio, avatar, persona_tags")
             .eq("user_id", user_id)
             .maybeSingle();
+          const dbMs = performance.now() - tDb;
 
           if (error) throw error;
 
+          const totalMs = performance.now() - tProfile;
+
           // Return empty profile if not found (don't throw)
           if (!data) {
+            console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "NONE", db_ms: +dbMs.toFixed(1), total_ms: +totalMs.toFixed(1), found: false, caller }));
             return ok(req, env, request_id, {
               user_id,
               display_name: null,
@@ -3049,6 +3059,7 @@ export default {
             });
           }
 
+          console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "NONE", db_ms: +dbMs.toFixed(1), total_ms: +totalMs.toFixed(1), found: true, caller }));
           return ok(req, env, request_id, {
             ...data,
             persona_tags: data.persona_tags ?? [],
@@ -4301,40 +4312,64 @@ export default {
         {
           const m = path.match(/^\/api\/rooms\/([^/]+)$/);
           if (m && req.method === "GET") {
+            const tTotal = performance.now();
             const roomId = m[1];
+            const caller = req.headers.get("x-teran-caller") || "unknown";
+
+            // DB: fetch room
+            const tDbRoom = performance.now();
             const { data: room, error } = await sb(env)
               .from("rooms")
               .select("*")
               .eq("id", roomId)
               .maybeSingle();
+            const dbRoomMs = performance.now() - tDbRoom;
             if (error) throw new Error(error.message);
-            if (!room) throw new HttpError(404, "NOT_FOUND", "Room not found");
+            if (!room) {
+              const totalMs = performance.now() - tTotal;
+              console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: "NONE", db_room_ms: +dbRoomMs.toFixed(1), db_counts_ms: 0, db_membership_ms: 0, transform_ms: 0, total_ms: +totalMs.toFixed(1), rows_room: 0, caller }));
+              throw new HttpError(404, "NOT_FOUND", "Room not found");
+            }
 
             // Private rooms: only members can see details
+            let dbMembershipMs = 0;
             if ((room as any).visibility === "private_invite_only") {
+              const tMem = performance.now();
               const callerId = await optionalAuth(req, env);
               if (!callerId) throw new HttpError(404, "NOT_FOUND", "Room not found");
               const role = await checkRoomMembership(env, roomId, callerId);
+              dbMembershipMs = performance.now() - tMem;
               if (!role) throw new HttpError(404, "NOT_FOUND", "Room not found");
             }
 
-            // Attach member_count
+            // DB: member_count
+            const tDbCounts = performance.now();
             const { count } = await sb(env)
               .from("room_members")
               .select("*", { count: "exact", head: true })
               .eq("room_id", roomId);
+            const dbCountsMs = performance.now() - tDbCounts;
 
             // Check caller membership
+            const tAuth = performance.now();
             const callerId = await optionalAuth(req, env);
             let my_role: string | null = null;
             if (callerId) {
               my_role = await checkRoomMembership(env, roomId, callerId);
             }
+            const authMs = performance.now() - tAuth;
 
-            return ok(req, env, request_id, {
+            const payload = {
               room: { ...(room as any), member_count: count ?? 0 },
               my_role,
-            });
+            };
+            const payloadBytes = JSON.stringify(payload).length;
+            const totalMs = performance.now() - tTotal;
+
+            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: "NONE", db_room_ms: +dbRoomMs.toFixed(1), db_counts_ms: +dbCountsMs.toFixed(1), db_membership_ms: +(dbMembershipMs + authMs).toFixed(1), transform_ms: 0, total_ms: +totalMs.toFixed(1), rows_room: 1, payload_bytes: payloadBytes, caller }));
+            console.log(`[perf] /api/rooms/:id total ${totalMs.toFixed(1)}ms`, JSON.stringify({ rid: request_id, room_id: roomId, cache: "NONE" }));
+
+            return ok(req, env, request_id, payload);
           }
         }
 
