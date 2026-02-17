@@ -670,6 +670,10 @@ export default {
 
         // /api/posts (POST)
         if (path === "/api/posts" && req.method === "POST") {
+          const t0 = performance.now();
+          const marks: Record<string, number> = {};
+          const mark = (k: string) => { marks[k] = performance.now(); };
+
           const user_id = await requireAuth(req, env);
 
           const body = (await req.json().catch(() => null)) as any;
@@ -790,6 +794,8 @@ export default {
             }
           }
 
+          mark("auth_done");
+
           const { data, error } = await sb(env)
             .from("posts")
             .insert({
@@ -809,6 +815,7 @@ export default {
             .select("*")
             .single();
           if (error) throw error;
+          mark("post_insert_done");
 
           // Insert media rows into unified 'media' table
           let mediaRows: any[] = [];
@@ -830,6 +837,7 @@ export default {
               .select("*");
             if (mediaError) throw mediaError;
             mediaRows = insertedMedia ?? [];
+            mark("media_insert_done");
           }
 
           // Create notification for replies (if this is a reply to another post)
@@ -844,6 +852,8 @@ export default {
             if (parentFetchError) {
               console.error(`[notif][${request_id}] failed to fetch parent post owner`, { parent_post_id, error: parentFetchError });
             }
+
+            mark("notif_prepare_done");
 
             // Use user_id (JWT sub) for notification recipient, NOT author_id (persona)
             if (parentPost?.user_id && parentPost.user_id !== user_id) {
@@ -864,6 +874,7 @@ export default {
                 post_id: parent_post_id, // Link to parent so notification opens the thread
                 group_key: `post_reply:${parent_post_id}`,
               }, request_id);
+              mark("notif_insert_done");
             } else if (!parentPost?.user_id) {
               console.warn(`[notif][${request_id}] parent post user_id not found, skipping notification`, { parent_post_id });
             } else {
@@ -871,6 +882,16 @@ export default {
             }
           }
 
+          mark("handler_done");
+          console.log(
+            `[perf][posts] rid=${request_id} post_type=${post_type} parent_post_id=${parent_post_id ?? "null"} ` +
+            `total_ms=${(marks.handler_done - t0).toFixed(1)} ` +
+            `auth_ms=${marks.auth_done ? (marks.auth_done - t0).toFixed(1) : "na"} ` +
+            `post_insert_ms=${marks.post_insert_done ? (marks.post_insert_done - (marks.auth_done ?? t0)).toFixed(1) : "na"} ` +
+            `media_insert_ms=${marks.media_insert_done ? (marks.media_insert_done - (marks.post_insert_done ?? marks.auth_done ?? t0)).toFixed(1) : "na"} ` +
+            `notif_prepare_ms=${marks.notif_prepare_done ? (marks.notif_prepare_done - (marks.media_insert_done ?? marks.post_insert_done ?? t0)).toFixed(1) : "na"} ` +
+            `notif_insert_ms=${marks.notif_insert_done ? (marks.notif_insert_done - (marks.notif_prepare_done ?? marks.post_insert_done ?? t0)).toFixed(1) : "na"}`
+          );
 
           return ok(req, env, request_id, { post: { ...data, media: mediaRows } }, 201);
         }
