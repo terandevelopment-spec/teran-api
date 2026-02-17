@@ -1995,6 +1995,7 @@ export default {
         {
           const uploadMatch = path.match(/^\/api\/upload\/(.+)$/);
           if (uploadMatch && req.method === "PUT") {
+            const uploadT0 = Date.now();
             const key = decodeURIComponent(uploadMatch[1]);
             const expiresStr = url.searchParams.get("expires");
             const content_type = url.searchParams.get("content_type");
@@ -2017,17 +2018,31 @@ export default {
               throw new HttpError(403, "FORBIDDEN", "Invalid signature");
             }
 
-            // Get body and upload to R2
+            // ── Upload diagnostics ──
+            const cf = (req as any).cf || {};
+            const contentLength = req.headers.get("content-length");
+            const reqHost = url.host;
+            const reqPath = url.pathname;
+            console.log(`[upload-diag] rid=${request_id} key=${key} content_type=${content_type} content_length=${contentLength ?? "unknown"} host=${reqHost} path=${reqPath} colo=${cf.colo ?? "?"} region=${cf.region ?? "?"} country=${cf.country ?? "?"} httpVersion=${cf.httpProtocol ?? "?"} tlsCipher=${cf.tlsCipher ?? "?"} tlsVersion=${cf.tlsVersion ?? "?"} clientTcpRtt=${cf.clientTcpRtt ?? "?"}ms`);
+
+            // Get body and upload to R2 (split timing)
+            const bodyT0 = Date.now();
             const body = await req.arrayBuffer();
+            const bodyMs = Date.now() - bodyT0;
             if (!body || body.byteLength === 0) {
               throw new HttpError(400, "BAD_REQUEST", "Empty body");
             }
 
+            const r2T0 = Date.now();
             await env.R2_MEDIA.put(key, body, {
               httpMetadata: {
                 contentType: content_type,
               },
             });
+            const r2Ms = Date.now() - r2T0;
+
+            const totalMs = Date.now() - uploadT0;
+            console.log(`[upload-diag] rid=${request_id} DONE key=${key} body_bytes=${body.byteLength} body_read_ms=${bodyMs} r2_put_ms=${r2Ms} total_ms=${totalMs} colo=${cf.colo ?? "?"}`);
 
             return ok(req, env, request_id, { key, uploaded: true }, 201);
           }
