@@ -423,6 +423,20 @@ export default {
           const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods";
           const selectFields = id_param ? "*" : feedSelectFields;
 
+          // Step 1: log normalized filter + select cols
+          const postsFilterShape = {
+            post_type: post_type_param || "all",
+            root_only: root_only_param || "false",
+            room_scope: room_scope_param || "none",
+            room_id: room_id_param || "none",
+            user_id: user_id_param ? "set" : "none",
+            author_id: author_id_param ? "set" : "none",
+            id: id_param ? "set" : "none",
+            limit: limit_param || "default",
+            cursor: cursor ? "set" : "none",
+          };
+          console.log(`[diag] /api/posts query_shape`, JSON.stringify({ rid: request_id, select_cols: selectFields, filter: postsFilterShape }));
+
           let q = sb(env)
             .from("posts")
             .select(selectFields)
@@ -601,12 +615,20 @@ export default {
 
           // Fast path: no posts => return immediately
           const postIds = (posts ?? []).map((p: any) => p.id);
+
+          // Step 1 (cont): log ids shape after posts query returns
+          console.log(`[diag] /api/posts posts_result`, JSON.stringify({
+            rid: request_id, posts_rows: postIds.length,
+            ids_count: postIds.length,
+            first_id: postIds[0] ?? null, last_id: postIds[postIds.length - 1] ?? null,
+            select_ms: +(p3 - p2).toFixed(1),
+          }));
+
           if (postIds.length === 0) {
+            // Step 3: parallel_skipped for empty posts
             console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms (empty)`);
             console.log(`[perf] /api/posts breakdown rid=${request_id} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} transform=0 total=${(p3 - p0).toFixed(1)} rows=0`);
-            if (room_id_param) {
-              console.log(`[perf] /api/posts room_id empty_shortcircuit`, JSON.stringify({ rid: request_id, room_id: room_id_param, limit: limit_param || 50, db_posts_ms: +(p3 - p2).toFixed(1), parallel_skipped: true, total_ms: +(p3 - p0).toFixed(1) }));
-            }
+            console.log(`[perf] /api/posts parallel_skipped`, JSON.stringify({ rid: request_id, reason: "empty_posts", room_id: room_id_param || "none", limit: limit_param || 50, db_posts_ms: +(p3 - p2).toFixed(1), total_ms: +(p3 - p0).toFixed(1) }));
             if (isReplyQuery) {
               return ok(req, env, request_id, { items: [], next_cursor: null });
             }
@@ -617,11 +639,26 @@ export default {
           const parallelStart = Date.now();
           let mediaMs = 0, likesMs = 0, commentCountMs = 0;
 
+          // Step 2: query shape constants for diagnostics
+          const mediaSelectCols = "id, post_id, type, key, thumb_key, width, height, duration_ms";
+          const mediaWhereShape = "post_id IN";
+          const likesSelectCols = "post_id, actor_id";
+          const likesWhereShape = "post_id IN";
+          const commentCountsWhereShape = "rpc:get_comment_counts(parent_ids)";
+
+          // Step 2: log pre-execution query shape for each parallel query
+          console.log(`[diag] /api/posts parallel_pre`, JSON.stringify({
+            rid: request_id, ids_count: postIds.length,
+            media: { select_cols: mediaSelectCols, where_shape: mediaWhereShape, table: "media" },
+            likes: { select_cols: likesSelectCols, where_shape: likesWhereShape, table: "post_likes" },
+            commentCounts: { where_shape: commentCountsWhereShape, table: "rpc" },
+          }));
+
           const mediaQuery = (async () => {
             const t = Date.now();
             const { data } = await sb(env)
               .from("media")
-              .select("id, post_id, type, key, thumb_key, width, height, duration_ms")
+              .select(mediaSelectCols)
               .in("post_id", postIds);
             mediaMs = Date.now() - t;
             return data ?? [];
@@ -633,7 +670,7 @@ export default {
             const t = Date.now();
             const { data } = await sb(env)
               .from("post_likes")
-              .select("post_id, actor_id")
+              .select(likesSelectCols)
               .in("post_id", postIds);
             likesMs = Date.now() - t;
             return data ?? [];
@@ -737,6 +774,26 @@ export default {
               total_ms: +postsTotal.toFixed(1),
             }));
           }
+
+          // Step 4: breakdown3 — query-shape diagnostics for bottleneck identification
+          console.log(`[perf] /api/posts breakdown3`, JSON.stringify({
+            rid: request_id,
+            filter: postsFilterShape,
+            posts_select_cols: selectFields,
+            posts_select_ms: +(p3 - p2).toFixed(1),
+            posts_rows: postIds.length,
+            ids_count: postIds.length,
+            ids_first: postIds[0] ?? null, ids_last: postIds[postIds.length - 1] ?? null,
+            media_where_shape: mediaWhereShape, media_select_cols: mediaSelectCols,
+            media_ms: mediaMs, media_rows: mediaRows.length,
+            likes_where_shape: likesWhereShape, likes_select_cols: likesSelectCols,
+            likes_ms: likesMs, likes_rows: (allLikeRows as any[]).length,
+            commentCounts_where_shape: commentCountsWhereShape,
+            commentCounts_ms: commentCountMs, commentCounts_rows: (commentCountRows as any[]).length,
+            transform_ms: +(p5 - p4).toFixed(1),
+            serialize_ms: +serializeMs.toFixed(1),
+            total_ms: +postsTotal.toFixed(1),
+          }));
           if (isReplyQuery) {
             const serializeMs = performance.now();
             console.log(`[perf][replies_breakdown] rid=${request_id} parent_post_id=${parent_post_id_param} http_ms=${replyHttpMs} parse_ms=${replyParseMs} parallel_ms=${(p4 - p3).toFixed(1)} transform_ms=${(p5 - p4).toFixed(1)} serialize_ms=${(serializeMs - p5).toFixed(1)} total_ms=${(serializeMs - p0).toFixed(1)} rows=${enrichedPosts.length} payload_bytes=${responseBody.length}`);
