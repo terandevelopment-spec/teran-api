@@ -2290,6 +2290,7 @@ export default {
 
             // ── Entry log ──
             console.log(`[media-diag] rid=${rid} key=${key} method=${req.method} host=${host} path=${path} range=${range} accept=${accept} cfRay=${cfRay} colo=${colo} city=${city} region=${region} country=${country} asn=${asn} httpVersion=${httpVersion}`);
+            console.log(`[media] legacy_proxy_used rid=${rid} key=${key} referer=${req.headers.get("Referer") || "none"}`);
 
             if (req.method === "OPTIONS") {
               return new Response(null, {
