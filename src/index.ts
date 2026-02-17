@@ -1889,16 +1889,40 @@ export default {
             console.log(`[kv] unread_count MISS rid=${request_id} me=${user_id} kv_ms=${(p2 - p1).toFixed(1)}`);
           }
 
-          const { count, error } = await sb(env)
-            .from("notifications")
-            .select("id", { count: "exact", head: true })
-            .eq("recipient_user_id", user_id)
-            .eq("is_read", false);
-          const p3 = performance.now();
+          // ── Direct fetch to PostgREST for HTTP-level timing + header capture ──
+          const restUrl = `${env.SUPABASE_URL}/rest/v1/notifications?select=id&recipient_user_id=eq.${encodeURIComponent(user_id)}&is_read=eq.false`;
+          const tFetchStart = performance.now();
+          const dbRes = await fetch(restUrl, {
+            method: "HEAD",
+            headers: {
+              "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+              "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+              "Prefer": "count=exact",
+            },
+          });
+          const tFetchEnd = performance.now();
 
-          if (error) throw error;
+          // Parse count from content-range header (PostgREST HEAD + Prefer: count=exact)
+          const contentRange = dbRes.headers.get("content-range") ?? "";
+          // content-range format: "*/N" for HEAD requests (e.g. "*/3" means 3 rows)
+          const rangeMatch = contentRange.match(/\/(\d+)$/);
+          const unreadCount = rangeMatch ? parseInt(rangeMatch[1], 10) : 0;
+          const tParseEnd = performance.now();
+          const p3 = tParseEnd;
 
-          const unreadCount = count ?? 0;
+          if (!dbRes.ok) {
+            const errBody = await dbRes.text().catch(() => "");
+            throw new Error(`PostgREST ${dbRes.status}: ${errBody}`);
+          }
+
+          // Capture response headers for diagnostics
+          const serverTiming = dbRes.headers.get("server-timing") ?? "none";
+          const xResponseTime = dbRes.headers.get("x-response-time") ?? "none";
+          const cfRay = dbRes.headers.get("cf-ray") ?? "none";
+          const cfCacheStatus = dbRes.headers.get("cf-cache-status") ?? "none";
+
+          const httpMs = (tFetchEnd - tFetchStart).toFixed(1);
+          const parseMs = (tParseEnd - tFetchEnd).toFixed(1);
 
           // Fire-and-forget KV put
           ctx.waitUntil(
@@ -1910,6 +1934,7 @@ export default {
           const kvLabel = kvTimedOut ? "timeout" : "miss";
           console.log(`[perf] unread_count breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} kv_lookup=${(p2 - p1).toFixed(1)}(${kvLabel}) db=${(p3 - p2).toFixed(1)} total=${(p3 - p0).toFixed(1)} count=${unreadCount} kv_put=async`);
           console.log(`[perf][unread_count] rid=${request_id} me=${user_id} db_ms=${(p3 - p2).toFixed(1)} count=${unreadCount} kv_reason=${kvLabel} kv_put_ms=async`);
+          console.log(`[perf][unread_count_http] rid=${request_id} me=${user_id} kv_reason=${kvLabel} http_ms=${httpMs} parse_ms=${parseMs} status=${dbRes.status} server_timing="${serverTiming}" x_response_time="${xResponseTime}" cf_ray="${cfRay}" cf_cache="${cfCacheStatus}" content_range="${contentRange}"`);
 
           const responseBody = JSON.stringify({ unread_count: unreadCount, source: "db" });
           return new Response(responseBody, {
