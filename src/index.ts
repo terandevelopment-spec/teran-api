@@ -2253,6 +2253,9 @@ export default {
         {
           const mediaMatch = path.match(/^\/api\/media\/(.+)$/);
           if (mediaMatch) {
+            const t0 = performance.now();
+            const rid = request_id;
+
             // Safely decode URL-encoded key (handle double-encoding)
             let key = mediaMatch[1];
             try {
@@ -2271,6 +2274,22 @@ export default {
             } catch {
               // If decode fails, use original key
             }
+
+            // ── Extract request + Cloudflare fields ──
+            const host = url.hostname;
+            const range = req.headers.get("Range") || "none";
+            const accept = req.headers.get("Accept") || "none";
+            const cfRay = req.headers.get("cf-ray") || "none";
+            const cf = (req as any).cf || {};
+            const colo = cf.colo || (cfRay !== "none" ? cfRay.split("-").pop() : "unknown");
+            const city = cf.city || "unknown";
+            const region = cf.region || "unknown";
+            const country = cf.country || "unknown";
+            const asn = cf.asn || "unknown";
+            const httpVersion = cf.httpProtocol || "unknown";
+
+            // ── Entry log ──
+            console.log(`[media-diag] rid=${rid} key=${key} method=${req.method} host=${host} path=${path} range=${range} accept=${accept} cfRay=${cfRay} colo=${colo} city=${city} region=${region} country=${country} asn=${asn} httpVersion=${httpVersion}`);
 
             if (req.method === "OPTIONS") {
               return new Response(null, {
@@ -2309,11 +2328,23 @@ export default {
               }
             }
 
-            const obj = r2Options
-              ? await env.R2_MEDIA.get(key, r2Options)
-              : await env.R2_MEDIA.get(key);
+            // ── R2 GET with timing ──
+            const tR2Start = performance.now();
+            let obj: R2ObjectBody | null;
+            try {
+              obj = r2Options
+                ? await env.R2_MEDIA.get(key, r2Options)
+                : await env.R2_MEDIA.get(key);
+            } catch (r2Err) {
+              const totalMs = performance.now() - t0;
+              console.log(`[media-diag] rid=${rid} ERROR key=${key} r2_get_ms=${(performance.now() - tR2Start).toFixed(1)} total_ms=${totalMs.toFixed(1)} err=${String(r2Err)}`);
+              throw r2Err;
+            }
+            const r2GetMs = performance.now() - tR2Start;
 
             if (!obj) {
+              const totalMs = performance.now() - t0;
+              console.log(`[media-diag] rid=${rid} DONE key=${key} status=404 r2_get_ms=${r2GetMs.toFixed(1)} total_ms=${totalMs.toFixed(1)} bytes_out=0 cache_control=none etag=none cfRay=${cfRay} colo=${colo}`);
               return new Response(JSON.stringify({
                 error: { code: "NOT_FOUND", message: "Media not found", key_decoded: key },
                 request_id
@@ -2363,6 +2394,8 @@ export default {
               headers["ETag"] = obj.etag;
             }
 
+            const etag = obj.etag || "none";
+
             // Handle partial content response
             if (rangeHeader && rangeStart !== undefined) {
               const start = rangeStart;
@@ -2370,10 +2403,16 @@ export default {
               const length = end - start + 1;
               headers["Content-Range"] = `bytes ${start}-${end}/${obj.size}`;
               headers["Content-Length"] = String(length);
+
+              const totalMs = performance.now() - t0;
+              console.log(`[media-diag] rid=${rid} DONE key=${key} status=206 r2_get_ms=${r2GetMs.toFixed(1)} total_ms=${totalMs.toFixed(1)} bytes_out=${length} obj_size=${obj.size} range=${start}-${end} cache_control="${cacheControl}" etag=${etag} cfRay=${cfRay} colo=${colo}`);
               return new Response(obj.body, { status: 206, headers });
             }
 
             headers["Content-Length"] = String(obj.size);
+
+            const totalMs = performance.now() - t0;
+            console.log(`[media-diag] rid=${rid} DONE key=${key} status=200 r2_get_ms=${r2GetMs.toFixed(1)} total_ms=${totalMs.toFixed(1)} bytes_out=${obj.size} cache_control="${cacheControl}" etag=${etag} cfRay=${cfRay} colo=${colo}`);
             return new Response(obj.body, { status: 200, headers });
           }
         }
