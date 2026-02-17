@@ -523,6 +523,11 @@ export default {
           }
           if (error) throw error;
 
+          // ── Replies-specific perf log ──
+          if (isReplyQuery) {
+            console.log(`[perf][replies] rid=${request_id} parent_post_id=${parent_post_id_param} limit=${lim} order=created_at_desc,id_desc select_ms=${postsQueryMs} rows=${posts?.length ?? 0}`);
+          }
+
           // Fast path: no posts => return immediately
           const postIds = (posts ?? []).map((p: any) => p.id);
           if (postIds.length === 0) {
