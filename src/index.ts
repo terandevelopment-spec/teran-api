@@ -2021,9 +2021,10 @@ export default {
             // ── Upload diagnostics ──
             const cf = (req as any).cf || {};
             const contentLength = req.headers.get("content-length");
+            const cfRay = req.headers.get("cf-ray") ?? "?";
             const reqHost = url.host;
             const reqPath = url.pathname;
-            console.log(`[upload-diag] rid=${request_id} key=${key} content_type=${content_type} content_length=${contentLength ?? "unknown"} host=${reqHost} path=${reqPath} colo=${cf.colo ?? "?"} region=${cf.region ?? "?"} country=${cf.country ?? "?"} httpVersion=${cf.httpProtocol ?? "?"} tlsCipher=${cf.tlsCipher ?? "?"} tlsVersion=${cf.tlsVersion ?? "?"} clientTcpRtt=${cf.clientTcpRtt ?? "?"}ms`);
+            console.log(`[upload-diag] rid=${request_id} key=${key} content_type=${content_type} content_length=${contentLength ?? "unknown"} host=${reqHost} path=${reqPath} cfRay=${cfRay} colo=${cf.colo ?? "?"} city=${cf.city ?? "?"} region=${cf.region ?? "?"} country=${cf.country ?? "?"} asn=${cf.asOrganization ?? cf.asn ?? "?"} httpVersion=${cf.httpProtocol ?? "?"} tlsCipher=${cf.tlsCipher ?? "?"} tlsVersion=${cf.tlsVersion ?? "?"} clientTcpRtt=${cf.clientTcpRtt ?? "?"}ms`);
 
             // Get body and upload to R2 (split timing)
             const bodyT0 = Date.now();
