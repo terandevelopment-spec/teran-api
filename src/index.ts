@@ -1909,6 +1909,7 @@ export default {
 
           const kvLabel = kvTimedOut ? "timeout" : "miss";
           console.log(`[perf] unread_count breakdown rid=${request_id} auth=${(p1 - p0).toFixed(1)} kv_lookup=${(p2 - p1).toFixed(1)}(${kvLabel}) db=${(p3 - p2).toFixed(1)} total=${(p3 - p0).toFixed(1)} count=${unreadCount} kv_put=async`);
+          console.log(`[perf][unread_count] rid=${request_id} me=${user_id} db_ms=${(p3 - p2).toFixed(1)} count=${unreadCount} kv_reason=${kvLabel} kv_put_ms=async`);
 
           const responseBody = JSON.stringify({ unread_count: unreadCount, source: "db" });
           return new Response(responseBody, {
