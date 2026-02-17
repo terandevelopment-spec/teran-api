@@ -524,8 +524,62 @@ export default {
           const p2 = performance.now();
 
           let t1 = Date.now();
-          const { data: posts, error } = await q;
-          const postsQueryMs = Date.now() - t1;
+          let posts: any[] | null = null;
+          let postsQueryMs = 0;
+          // HTTP-level metrics (reply queries only)
+          let replyHttpMs = "";
+          let replyParseMs = "";
+          let replyStatus = 0;
+          let replyHeaders: Record<string, string> = {};
+
+          if (isReplyQuery) {
+            // ── Direct PostgREST fetch for reply queries: HTTP timing + header capture ──
+            const parsedPpid = Number(parent_post_id_param);
+            let restUrl = `${env.SUPABASE_URL}/rest/v1/posts?select=${encodeURIComponent(feedSelectFields)}&parent_post_id=eq.${parsedPpid}&order=created_at.desc,id.desc&limit=${lim}`;
+            // Append keyset cursor filter if present
+            if (cursor) {
+              restUrl += `&or=(created_at.lt.${encodeURIComponent(cursor.created_at)},and(created_at.eq.${encodeURIComponent(cursor.created_at)},id.lt.${cursor.id}))`;
+            }
+
+            const tFetchStart = performance.now();
+            const res = await fetch(restUrl, {
+              method: "GET",
+              headers: {
+                "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                "Accept": "application/json",
+              },
+            });
+            const tFetchEnd = performance.now();
+
+            if (!res.ok) {
+              const errBody = await res.text().catch(() => "");
+              throw new Error(`PostgREST replies ${res.status}: ${errBody}`);
+            }
+
+            const rawBody = await res.text();
+            const tTextEnd = performance.now();
+            posts = JSON.parse(rawBody);
+            const tParseEnd = performance.now();
+
+            postsQueryMs = Math.round(tParseEnd - tFetchStart);
+            replyHttpMs = (tFetchEnd - tFetchStart).toFixed(1);
+            replyParseMs = ((tTextEnd - tFetchEnd) + (tParseEnd - tTextEnd)).toFixed(1);
+            replyStatus = res.status;
+            replyHeaders = {
+              serverTiming: res.headers.get("server-timing") ?? "none",
+              xResponseTime: res.headers.get("x-response-time") ?? "none",
+              cfRay: res.headers.get("cf-ray") ?? "none",
+              cfCache: res.headers.get("cf-cache-status") ?? "none",
+              contentRange: res.headers.get("content-range") ?? "none",
+            };
+          } else {
+            // ── Standard Supabase client for non-reply queries ──
+            const { data, error: qErr } = await q;
+            postsQueryMs = Date.now() - t1;
+            if (qErr) throw qErr;
+            posts = data;
+          }
           const p3 = performance.now();
 
           // Granular logging + slow-query alert
@@ -535,11 +589,11 @@ export default {
           if (postsQueryMs > 400) {
             console.log(`[perf] /api/posts SLOW_QUERY rid=${request_id} select_ms=${postsQueryMs} count_ms=0 filter=${filterDesc} limit=${limit_param || 50} rows=${posts?.length ?? 0}`);
           }
-          if (error) throw error;
 
-          // ── Replies-specific perf log ──
+          // ── Replies-specific perf logs ──
           if (isReplyQuery) {
-            console.log(`[perf][replies] rid=${request_id} parent_post_id=${parent_post_id_param} limit=${lim} order=created_at_desc,id_desc select_ms=${postsQueryMs} rows=${posts?.length ?? 0}`);
+            console.log(`[perf][replies] rid=${request_id} parent_post_id=${parent_post_id_param} limit=${lim} order=created_at_desc,id_desc select_ms=${postsQueryMs} http_ms=${replyHttpMs} parse_ms=${replyParseMs} rows=${posts?.length ?? 0}`);
+            console.log(`[perf][replies_http] rid=${request_id} parent_post_id=${parent_post_id_param} http_ms=${replyHttpMs} parse_ms=${replyParseMs} status=${replyStatus} server_timing="${replyHeaders.serverTiming}" x_response_time="${replyHeaders.xResponseTime}" cf_ray="${replyHeaders.cfRay}" cf_cache="${replyHeaders.cfCache}" content_range="${replyHeaders.contentRange}"`);
           }
 
           // Fast path: no posts => return immediately
@@ -660,6 +714,10 @@ export default {
             payloadBytes: responseBody.length,
           });
           console.log(`[perf] /api/posts breakdown rid=${request_id} cache=MISS params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} parallel=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${(p5 - p0).toFixed(1)} rows=${enrichedPosts.length}`);
+          if (isReplyQuery) {
+            const serializeMs = performance.now();
+            console.log(`[perf][replies_breakdown] rid=${request_id} parent_post_id=${parent_post_id_param} http_ms=${replyHttpMs} parse_ms=${replyParseMs} parallel_ms=${(p4 - p3).toFixed(1)} transform_ms=${(p5 - p4).toFixed(1)} serialize_ms=${(serializeMs - p5).toFixed(1)} total_ms=${(serializeMs - p0).toFixed(1)} rows=${enrichedPosts.length} payload_bytes=${responseBody.length}`);
+          }
 
           // ── Store in edge cache (feed only, fire-and-forget) ──
           if (isFeed && feedCacheKey) {
