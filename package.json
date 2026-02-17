@@ -16,6 +16,7 @@
 		"wrangler": "^4.60.0"
 	},
 	"dependencies": {
-		"@supabase/supabase-js": "^2.91.0"
+		"@supabase/supabase-js": "^2.91.0",
+		"aws4fetch": "^1.0.20"
 	}
 }
