@@ -2,7 +2,7 @@ import http from "k6/http";
 import { check, sleep } from "k6";
 
 // ── Env-configurable params ──
-const BASE_URL = __ENV.BASE_URL || "https://teran-api.teran-development.workers.dev";
+const BASE_URL = __ENV.BASE_URL || "https://teran-api-loadtest.teran-development.workers.dev";
 const LIMIT = __ENV.LIMIT || "60";
 const SLEEP_S = parseFloat(__ENV.SLEEP || "1");
 const POST_TYPES = __ENV.POST_TYPES || "status,thread";

@@ -34,7 +34,33 @@
 			"id": "8c3912fc758c4adbb6ba63bbe0b14e41",
 			"remote": true
 		}
-	]
+	],
+	"env": {
+		"loadtest": {
+			"name": "teran-api-loadtest",
+			"r2_buckets": [
+				{
+					"binding": "R2_MEDIA",
+					"bucket_name": "teran-media"
+				}
+			],
+			"kv_namespaces": [
+				{
+					"binding": "UNREAD_KV",
+					"id": "704a0aa3f72d4e1eb0ab8822ee8334a6"
+				},
+				{
+					"binding": "PROFILE_KV",
+					"id": "8c3912fc758c4adbb6ba63bbe0b14e41"
+				},
+				{
+					"binding": "y",
+					"id": "8c3912fc758c4adbb6ba63bbe0b14e41",
+					"remote": true
+				}
+			]
+		}
+	}
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
