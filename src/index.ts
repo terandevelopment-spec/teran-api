@@ -13,11 +13,15 @@ export interface Env {
   R2_ACCESS_KEY_ID: string;      // R2 S3-compat API token
   R2_SECRET_ACCESS_KEY: string;
   R2_ACCOUNT_ID: string;         // CF account id
-
+  DIAG_LOG?: string;             // "1" to enable sampled request-start logs
 }
 
 // --------- request_id + response helpers ----------
-function getReqId(): string {
+function getReqId(req?: Request): string {
+  if (req) {
+    const incoming = req.headers.get("x-request-id") || req.headers.get("x-req-id");
+    if (incoming) return incoming;
+  }
   return (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`).toString();
 }
 
@@ -165,6 +169,9 @@ function logDiag(tag: string, obj: unknown) {
 }
 function logPerf(tag: string, obj: unknown) {
   console.log(`[perf] ${tag} ${JSON.stringify(obj)}`);
+}
+function logErr(tag: string, obj: unknown) {
+  console.log(`[err] ${tag} ${JSON.stringify(obj)}`);
 }
 
 
@@ -342,8 +349,9 @@ function clampPaginationLimit(raw: string | null, defaultVal = 20, max = 200): n
 // --------- routes ----------
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const request_id = getReqId();
+    const request_id = getReqId(req);
     const t0 = Date.now();
+    const cfRay = req.headers.get("cf-ray") || ((req as any).cf?.ray) || "";
 
     // Preflight (don't log timing for OPTIONS)
     if (req.method === "OPTIONS") {
@@ -358,6 +366,15 @@ export default {
     const q = url.searchParams.toString();
     const shortQ = q.length > 120 ? q.slice(0, 120) + "…" : q;
     const label = shortQ ? `${path}?${shortQ}` : path;
+
+    // Sampled request-start log (2% when DIAG_LOG=1)
+    if (env.DIAG_LOG === "1" && Math.random() < 0.02) {
+      logDiag(`${path} start`, {
+        rid: request_id, method: req.method, path,
+        query_keys: [...url.searchParams.keys()],
+        cf_ray: cfRay, colo: (req as any).cf?.colo || "",
+      });
+    }
 
     const handleRequest = async (): Promise<Response> => {
       try {
@@ -851,14 +868,28 @@ export default {
           const tSerialize = performance.now();
           const responseBody = JSON.stringify(responsePayload);
           const serializeMs = performance.now() - tSerialize;
-          console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms`, {
-            posts_query: postsQueryMs,
-            parallel: parallelMs,
-            posts: enrichedPosts.length,
-            payloadBytes: responseBody.length,
-          });
-          console.log(`[perf] /api/posts breakdown rid=${request_id} cache=MISS params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} parallel=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${(p5 - p0).toFixed(1)} rows=${enrichedPosts.length}`);
           const postsTotal = performance.now() - p0;
+          // Standardized perf summary (always emitted)
+          logPerf("/api/posts summary", {
+            rid: request_id,
+            cf_ray: cfRay,
+            colo: (req as any).cf?.colo || "",
+            cache: cacheStatus,
+            select_ms: postsQueryMs,
+            media_ms: mediaMs,
+            likes_ms: likesMs,
+            cc_ms: commentCountMs,
+            parallel_ms: parallelMs,
+            transform_ms: +(p5 - p4).toFixed(1),
+            serialize_ms: +serializeMs.toFixed(1),
+            total_ms: +postsTotal.toFixed(1),
+            posts: enrichedPosts.length,
+            media_n: mediaRows.length,
+            like_n: (allLikeRows as any[]).length,
+            cc_n: (commentCountRows as any[]).length,
+            bytes: responseBody.length,
+          });
+          console.log(`[perf] /api/posts breakdown rid=${request_id} cache=${cacheStatus} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} parallel=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${postsTotal.toFixed(1)} rows=${enrichedPosts.length}`);
           if (postsTotal >= 300) {
             console.log(`[perf] /api/posts breakdown2`, JSON.stringify({
               rid: request_id,
@@ -5129,13 +5160,42 @@ export default {
       const ms = Date.now() - t0;
       const headers = new Headers(res!.headers);
       if (!headers.has("x-req-id")) headers.set("x-req-id", request_id);
+      if (!headers.has("X-Request-Id")) headers.set("X-Request-Id", request_id);
       res = new Response(res!.body, { status: res!.status, statusText: res!.statusText, headers });
 
       const status = res.status;
+      const cfData = (req as any).cf || {};
+      const colo = cfData.colo || "";
       console.log(`${req.method} ${label} -> ${status} ${ms}ms${ms >= 300 ? " SLOW" : ""}`);
 
+      // Always-on failure logging (status >= 400)
+      if (status >= 400) {
+        if (status === 429) {
+          // Rate limit: log with CF rate-limit headers
+          logErr(`${path} rate_limit`, {
+            rid: request_id, method: req.method, path, status,
+            elapsed_ms: ms, cf_ray: cfRay, colo,
+            retry_after: res.headers.get("retry-after") || "",
+            cf_ratelimit: res.headers.get("cf-ratelimit-action") || "",
+            x_ratelimit: res.headers.get("x-ratelimit-remaining") || "",
+          });
+        } else {
+          // App error: log with truncated body (safe fields only)
+          let errBody = "";
+          try {
+            const cloned = res.clone();
+            errBody = (await cloned.text()).slice(0, 300);
+          } catch (_) { }
+          logErr(`${path} fail`, {
+            rid: request_id, method: req.method, path, status,
+            elapsed_ms: ms, cf_ray: cfRay, colo,
+            body: errBody,
+          });
+        }
+      }
+
+      // Spike detection (5xx or very slow)
       if (status >= 500 || ms >= 2000) {
-        const cfData = (req as any).cf || {};
         const cacheHeader = res.headers.get("X-Cache") || "UNKNOWN";
         console.log(JSON.stringify({
           tag: "spike",
@@ -5145,8 +5205,8 @@ export default {
           status: status,
           ms: ms,
           query: url.search,
-          cf_ray: req.headers.get("cf-ray") || cfData.ray || "",
-          colo: cfData.colo || "",
+          cf_ray: cfRay,
+          colo: colo,
           cache: cacheHeader,
         }));
       }
