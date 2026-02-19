@@ -363,18 +363,16 @@ export default {
 
     const url = new URL(req.url);
     const path = url.pathname;
+    const method = req.method;
+    const colo = (req as any).cf?.colo || "";
     const q = url.searchParams.toString();
     const shortQ = q.length > 120 ? q.slice(0, 120) + "…" : q;
     const label = shortQ ? `${path}?${shortQ}` : path;
 
-    // Sampled request-start log (2% when DIAG_LOG=1)
-    if (env.DIAG_LOG === "1" && Math.random() < 0.02) {
-      logDiag(`${path} start`, {
-        rid: request_id, method: req.method, path,
-        query_keys: [...url.searchParams.keys()],
-        cf_ray: cfRay, colo: (req as any).cf?.colo || "",
-      });
-    }
+    // Shared context for perf breakdown (populated by route handlers)
+    const reqCtx: Record<string, number | string> = {};
+    let outcome: "ok" | "exception" | "canceled" = "ok";
+    let errMsg = "";
 
     const handleRequest = async (): Promise<Response> => {
       try {
@@ -869,26 +867,25 @@ export default {
           const responseBody = JSON.stringify(responsePayload);
           const serializeMs = performance.now() - tSerialize;
           const postsTotal = performance.now() - p0;
-          // Standardized perf summary (always emitted)
-          logPerf("/api/posts summary", {
-            rid: request_id,
-            cf_ray: cfRay,
-            colo: (req as any).cf?.colo || "",
-            cache: cacheStatus,
-            select_ms: postsQueryMs,
-            media_ms: mediaMs,
-            likes_ms: likesMs,
-            cc_ms: commentCountMs,
-            parallel_ms: parallelMs,
-            transform_ms: +(p5 - p4).toFixed(1),
-            serialize_ms: +serializeMs.toFixed(1),
-            total_ms: +postsTotal.toFixed(1),
-            posts: enrichedPosts.length,
-            media_n: mediaRows.length,
-            like_n: (allLikeRows as any[]).length,
-            cc_n: (commentCountRows as any[]).length,
-            bytes: responseBody.length,
-          });
+          // Populate reqCtx so [sum] log includes perf breakdown
+          reqCtx.params_ms = +(p1 - p0).toFixed(1);
+          reqCtx.client_ms = +(p2 - p1).toFixed(1);
+          reqCtx.db_posts_ms = +(p3 - p2).toFixed(1);
+          reqCtx.parallel_ms = parallelMs;
+          reqCtx.transform_ms = +(p5 - p4).toFixed(1);
+          reqCtx.serialize_ms = +serializeMs.toFixed(1);
+          reqCtx.total_ms = +postsTotal.toFixed(1);
+          reqCtx.cache = cacheStatus;
+          reqCtx.select_ms = postsQueryMs;
+          reqCtx.media_ms = mediaMs;
+          reqCtx.likes_ms = likesMs;
+          reqCtx.cc_ms = commentCountMs;
+          reqCtx.rows = enrichedPosts.length;
+          reqCtx.ids_count = postIds.length;
+          reqCtx.media_count = mediaRows.length;
+          reqCtx.likes_count = (allLikeRows as any[]).length;
+          reqCtx.comment_counts_count = (commentCountRows as any[]).length;
+          reqCtx.bytes = responseBody.length;
           console.log(`[perf] /api/posts breakdown rid=${request_id} cache=${cacheStatus} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} parallel=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${postsTotal.toFixed(1)} rows=${enrichedPosts.length}`);
           if (postsTotal >= 300) {
             console.log(`[perf] /api/posts breakdown2`, JSON.stringify({
@@ -5151,7 +5148,9 @@ export default {
     let res: Response;
     try {
       res = await handleRequest();
-    } catch (fatal) {
+    } catch (fatal: any) {
+      outcome = "exception";
+      errMsg = (typeof fatal?.message === "string" ? fatal.message : String(fatal)).slice(0, 120);
       res = new Response(
         JSON.stringify({ error: { code: "INTERNAL_ERROR", message: "unhandled" }, request_id }),
         { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders(req, env) } }
@@ -5164,51 +5163,51 @@ export default {
       res = new Response(res!.body, { status: res!.status, statusText: res!.statusText, headers });
 
       const status = res.status;
-      const cfData = (req as any).cf || {};
-      const colo = cfData.colo || "";
-      console.log(`${req.method} ${label} -> ${status} ${ms}ms${ms >= 300 ? " SLOW" : ""}`);
+      const diagOn = env.DIAG_LOG === "1";
+      const isError = status >= 500 || outcome === "exception";
+      const isSlow = ms >= 2000;
+      const is429 = status === 429;
 
-      // Always-on failure logging (status >= 400)
-      if (status >= 400) {
-        if (status === 429) {
-          // Rate limit: log with CF rate-limit headers
-          logErr(`${path} rate_limit`, {
-            rid: request_id, method: req.method, path, status,
-            elapsed_ms: ms, cf_ray: cfRay, colo,
+      // ── [rl] Rate limit log (always, for 429 or body containing 1027) ──
+      if (is429) {
+        let bodyPrefix = "";
+        try { bodyPrefix = (await res.clone().text()).slice(0, 120); } catch (_) { }
+        console.warn(`[rl] ${method} ${path} ${JSON.stringify({
+          rid: request_id, cf_ray: cfRay, colo, status, elapsed_ms: ms,
+          retry_after: res.headers.get("retry-after") || "",
+          cf_ratelimit: res.headers.get("cf-ratelimit-action") || "",
+          x_ratelimit: res.headers.get("x-ratelimit-remaining") || "",
+          body_prefix: bodyPrefix,
+        })}`);
+      }
+
+      // ── [sum] Summary log ──
+      // DIAG_LOG=1: every request. DIAG_LOG=0: only 429, 5xx, exceptions, or slow (>=2s).
+      if (diagOn || is429 || isError || isSlow) {
+        const ua = req.headers.get("user-agent") || "";
+        const caller = req.headers.get("x-teran-caller") || "";
+        const sum: Record<string, any> = {
+          rid: request_id, cf_ray: cfRay, colo,
+          method, path, status, outcome, elapsed_ms: ms,
+          ua: ua.length > 80 ? ua.slice(0, 80) : ua,
+          caller: caller.length > 40 ? caller.slice(0, 40) : caller,
+          auth: req.headers.has("authorization") ? "present" : "missing",
+        };
+        // Include error message if exception
+        if (errMsg) sum.err = errMsg;
+        // Include /api/posts perf breakdown if available
+        if (Object.keys(reqCtx).length > 0) {
+          for (const [k, v] of Object.entries(reqCtx)) sum[k] = v;
+        }
+        // Include rate-limit details for 429
+        if (is429) {
+          sum.ratelimit = {
             retry_after: res.headers.get("retry-after") || "",
             cf_ratelimit: res.headers.get("cf-ratelimit-action") || "",
             x_ratelimit: res.headers.get("x-ratelimit-remaining") || "",
-          });
-        } else {
-          // App error: log with truncated body (safe fields only)
-          let errBody = "";
-          try {
-            const cloned = res.clone();
-            errBody = (await cloned.text()).slice(0, 300);
-          } catch (_) { }
-          logErr(`${path} fail`, {
-            rid: request_id, method: req.method, path, status,
-            elapsed_ms: ms, cf_ray: cfRay, colo,
-            body: errBody,
-          });
+          };
         }
-      }
-
-      // Spike detection (5xx or very slow)
-      if (status >= 500 || ms >= 2000) {
-        const cacheHeader = res.headers.get("X-Cache") || "UNKNOWN";
-        console.log(JSON.stringify({
-          tag: "spike",
-          req_id: request_id,
-          path: path,
-          method: req.method,
-          status: status,
-          ms: ms,
-          query: url.search,
-          cf_ray: cfRay,
-          colo: colo,
-          cache: cacheHeader,
-        }));
+        console.log(`[sum] ${method} ${path} ${JSON.stringify(sum)}`);
       }
     }
     return res;
