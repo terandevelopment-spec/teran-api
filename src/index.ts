@@ -412,12 +412,16 @@ export default {
           const room_scope_param = url.searchParams.get("room_scope");     // "global"|"rooms"|"any"
           const cursor_param = url.searchParams.get("cursor");             // pagination cursor
           const diag_param = url.searchParams.get("diag");                 // suspect isolation: "posts_only" | "only_parallel:media" etc.
+          const mode_param = url.searchParams.get("mode");                 // CSV: "Ask,Discuss"
+          const mood_param = url.searchParams.get("mood");                 // CSV: "Happy,Curious"
+          const q_param = url.searchParams.get("q");                       // keyword search
           const isReplyQuery = !!parent_post_id_param;
-          const cursor = isReplyQuery ? parseCursor(cursor_param) : null;
+          const isScopedQuery = !!post_type_param || !!root_only_param || !!mode_param || !!mood_param || !!q_param;
+          const cursor = (isReplyQuery || isScopedQuery) ? parseCursor(cursor_param) : null;
           const p1 = performance.now();
 
           // ── Edge cache: unfiltered feed only (disable for scoped requests) ──
-          const hasNewFilters = !!post_type_param || !!root_only_param || !!parent_post_id_param || !!room_scope_param;
+          const hasNewFilters = !!post_type_param || !!root_only_param || !!parent_post_id_param || !!room_scope_param || !!mode_param || !!mood_param || !!q_param;
           // Feed cache: only for non-reply, non-cursored feed queries
           const isFeed = !id_param && !user_id_param && !author_id_param && !isReplyQuery && !cursor && !room_id_param && !hasNewFilters;
           let feedCacheKey: Request | null = null;
@@ -528,6 +532,13 @@ export default {
               q = q.is("parent_post_id", null);
             }
 
+            // Apply cursor keyset filter for scoped (non-reply) pagination
+            if (!isReplyQuery && cursor) {
+              q = q.or(
+                `created_at.lt.${cursor.created_at},and(created_at.eq.${cursor.created_at},id.lt.${cursor.id})`
+              );
+            }
+
             // ── room_scope / room_id filter ──
             // room_id takes precedence for specific-room queries;
             // room_scope adds global/rooms scoping for profile tabs.
@@ -558,6 +569,29 @@ export default {
                 q = q.not("room_id", "is", null).neq("room_id", "global");
               }
               // effectiveScope === "any": no room filter
+            }
+            // ── mode filter (CSV → .in) ──
+            if (mode_param) {
+              const modes = mode_param.split(",").map(m => m.trim()).filter(Boolean);
+              if (modes.length > 0) {
+                q = q.in("mode", modes);
+              }
+            }
+
+            // ── mood filter (CSV → .overlaps for array column) ──
+            if (mood_param) {
+              const moods = mood_param.split(",").map(m => m.trim()).filter(Boolean);
+              if (moods.length > 0) {
+                q = q.overlaps("moods", moods);
+              }
+            }
+
+            // ── keyword search (ILIKE on title + content) ──
+            if (q_param && q_param.trim().length > 0) {
+              const keyword = `%${q_param.trim()}%`;
+              q = q.or(
+                `title.ilike.${keyword},content.ilike.${keyword}`
+              );
             }
 
             // Determine limit — for reply queries default 20/max 200, otherwise 50/max 200
@@ -862,7 +896,7 @@ export default {
 
           const responsePayload = isReplyQuery
             ? { items: enrichedPosts, next_cursor: buildNextCursor(enrichedPosts, lim) }
-            : { posts: enrichedPosts };
+            : { posts: enrichedPosts, next_cursor: isScopedQuery ? buildNextCursor(enrichedPosts, lim) : undefined };
           const tSerialize = performance.now();
           const responseBody = JSON.stringify(responsePayload);
           const serializeMs = performance.now() - tSerialize;
