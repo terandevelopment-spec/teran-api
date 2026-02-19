@@ -1605,12 +1605,12 @@ export default {
             .eq("post_id", post_id);
           if (cursor) {
             commentsQuery = commentsQuery.or(
-              `created_at.lt.${cursor.created_at},and(created_at.eq.${cursor.created_at},id.lt.${cursor.id})`
+              `created_at.gt.${cursor.created_at},and(created_at.eq.${cursor.created_at},id.gt.${cursor.id})`
             );
           }
           const { data: comments, error } = await commentsQuery
-            .order("created_at", { ascending: false })
-            .order("id", { ascending: false })
+            .order("created_at", { ascending: true })
+            .order("id", { ascending: true })
             .limit(limit);
           console.log(`[perf] /api/comments comments_query ${Date.now() - t1}ms`, { post_id, limit, cursor: !!cursor, count: comments?.length });
           if (error) throw error;
