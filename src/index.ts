@@ -790,6 +790,16 @@ export default {
           let parallelMs = 0;
           let p4 = performance.now();
           let p5 = p4;
+          // Hoisted from else block so perf-logging (after if/else) can reference them
+          let mediaMs = 0, likesMs = 0, commentCountMs = 0;
+          let mediaRows: any[] = [];
+          let allLikeRows: any[] = [];
+          let commentCountRows: any[] = [];
+          const mediaSelectCols = "id, post_id, type, key, thumb_key, width, height, duration_ms";
+          const mediaWhereShape = "post_id IN";
+          const likesSelectCols = "post_id, actor_id";
+          const likesWhereShape = "post_id IN";
+          const commentCountsWhereShape = "rpc:get_comment_counts(parent_ids)";
 
           if (light) {
             // Light path: no media, likes, or commentCounts queries
@@ -805,14 +815,6 @@ export default {
           } else {
             // Parallel fetch: media + likes + comment counts
             const parallelStart = Date.now();
-            let mediaMs = 0, likesMs = 0, commentCountMs = 0;
-
-            // Step 2: query shape constants for diagnostics
-            const mediaSelectCols = "id, post_id, type, key, thumb_key, width, height, duration_ms";
-            const mediaWhereShape = "post_id IN";
-            const likesSelectCols = "post_id, actor_id";
-            const likesWhereShape = "post_id IN";
-            const commentCountsWhereShape = "rpc:get_comment_counts(parent_ids)";
 
             // Step 2: log pre-execution query shape for each parallel query
             logDiag("/api/posts parallel_pre", {
@@ -857,7 +859,7 @@ export default {
               return data ?? [];
             })();
 
-            const [mediaRows, allLikeRows, commentCountRows] = await Promise.all([
+            [mediaRows, allLikeRows, commentCountRows] = await Promise.all([
               mediaQuery,
               likesQuery,
               commentCountsQuery,
@@ -923,114 +925,119 @@ export default {
           const serializeMs = performance.now() - tSerialize;
           const postsTotal = performance.now() - p0;
           // Populate reqCtx so [sum] log includes perf breakdown
-          reqCtx.params_ms = +(p1 - p0).toFixed(1);
-          reqCtx.client_ms = +(p2 - p1).toFixed(1);
-          reqCtx.db_posts_ms = +(p3 - p2).toFixed(1);
-          reqCtx.parallel_ms = parallelMs;
-          reqCtx.transform_ms = +(p5 - p4).toFixed(1);
-          reqCtx.serialize_ms = +serializeMs.toFixed(1);
-          reqCtx.total_ms = +postsTotal.toFixed(1);
-          reqCtx.cache = cacheStatus;
-          reqCtx.select_ms = postsQueryMs;
-          reqCtx.media_ms = mediaMs;
-          reqCtx.likes_ms = likesMs;
-          reqCtx.cc_ms = commentCountMs;
-          reqCtx.rows = enrichedPosts.length;
-          reqCtx.ids_count = postIds.length;
-          reqCtx.media_count = mediaRows.length;
-          reqCtx.likes_count = (allLikeRows as any[]).length;
-          reqCtx.comment_counts_count = (commentCountRows as any[]).length;
-          reqCtx.bytes = responseBody.length;
-          console.log(`[perf] /api/posts breakdown rid=${request_id} cache=${cacheStatus} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} parallel=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${postsTotal.toFixed(1)} rows=${enrichedPosts.length}`);
-          if (postsTotal >= 300) {
-            console.log(`[perf] /api/posts breakdown2`, JSON.stringify({
+          // Wrapped in try-catch: perf logging must NEVER crash the endpoint
+          try {
+            reqCtx.params_ms = +(p1 - p0).toFixed(1);
+            reqCtx.client_ms = +(p2 - p1).toFixed(1);
+            reqCtx.db_posts_ms = +(p3 - p2).toFixed(1);
+            reqCtx.parallel_ms = parallelMs;
+            reqCtx.transform_ms = +(p5 - p4).toFixed(1);
+            reqCtx.serialize_ms = +serializeMs.toFixed(1);
+            reqCtx.total_ms = +postsTotal.toFixed(1);
+            reqCtx.cache = cacheStatus;
+            reqCtx.select_ms = postsQueryMs;
+            reqCtx.media_ms = mediaMs;
+            reqCtx.likes_ms = likesMs;
+            reqCtx.cc_ms = commentCountMs;
+            reqCtx.rows = enrichedPosts.length;
+            reqCtx.ids_count = postIds.length;
+            reqCtx.media_count = mediaRows.length;
+            reqCtx.likes_count = (allLikeRows as any[]).length;
+            reqCtx.comment_counts_count = (commentCountRows as any[]).length;
+            reqCtx.bytes = responseBody.length;
+            console.log(`[perf] /api/posts breakdown rid=${request_id} cache=${cacheStatus} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} parallel=${(p4 - p3).toFixed(1)} transform=${(p5 - p4).toFixed(1)} total=${postsTotal.toFixed(1)} rows=${enrichedPosts.length}`);
+            if (postsTotal >= 300) {
+              console.log(`[perf] /api/posts breakdown2`, JSON.stringify({
+                rid: request_id,
+                filter: { post_type: post_type_param || "all", root_only: root_only_param || "false", room_scope: room_scope_param || "none", limit: limit_param || 50 },
+                posts_select_ms: +(p3 - p2).toFixed(1), posts_rows: postIds.length,
+                media_ms: mediaMs, media_rows: mediaRows.length,
+                likes_ms: likesMs, likes_rows: (allLikeRows as any[]).length,
+                comment_counts_ms: commentCountMs, comment_counts_rows: (commentCountRows as any[]).length,
+                transform_ms: +(p5 - p4).toFixed(1),
+                serialize_ms: +serializeMs.toFixed(1),
+                payload_bytes: responseBody.length,
+                total_ms: +postsTotal.toFixed(1),
+              }));
+            }
+
+            // Step 4: breakdown3 — query-shape diagnostics for bottleneck identification
+            logPerf("/api/posts breakdown3", {
               rid: request_id,
-              filter: { post_type: post_type_param || "all", root_only: root_only_param || "false", room_scope: room_scope_param || "none", limit: limit_param || 50 },
-              posts_select_ms: +(p3 - p2).toFixed(1), posts_rows: postIds.length,
+              filter: postsFilterShape,
+              posts_select_cols: selectFields,
+              posts_select_ms: +(p3 - p2).toFixed(1),
+              posts_rows: postIds.length,
+              ids_count: postIds.length,
+              ids_first: postIds[0] ?? null, ids_last: postIds[postIds.length - 1] ?? null,
+              media_where_shape: mediaWhereShape, media_select_cols: mediaSelectCols,
               media_ms: mediaMs, media_rows: mediaRows.length,
+              likes_where_shape: likesWhereShape, likes_select_cols: likesSelectCols,
               likes_ms: likesMs, likes_rows: (allLikeRows as any[]).length,
-              comment_counts_ms: commentCountMs, comment_counts_rows: (commentCountRows as any[]).length,
+              commentCounts_where_shape: commentCountsWhereShape,
+              commentCounts_ms: commentCountMs, commentCounts_rows: (commentCountRows as any[]).length,
               transform_ms: +(p5 - p4).toFixed(1),
               serialize_ms: +serializeMs.toFixed(1),
-              payload_bytes: responseBody.length,
               total_ms: +postsTotal.toFixed(1),
-            }));
-          }
+            });
+            if (isReplyQuery) {
+              const serializeMs = performance.now();
+              console.log(`[perf][replies_breakdown] rid=${request_id} parent_post_id=${parent_post_id_param} http_ms=${replyHttpMs} parse_ms=${replyParseMs} parallel_ms=${(p4 - p3).toFixed(1)} transform_ms=${(p5 - p4).toFixed(1)} serialize_ms=${(serializeMs - p5).toFixed(1)} total_ms=${(serializeMs - p0).toFixed(1)} rows=${enrichedPosts.length} payload_bytes=${responseBody.length}`);
+            }
 
-          // Step 4: breakdown3 — query-shape diagnostics for bottleneck identification
-          logPerf("/api/posts breakdown3", {
-            rid: request_id,
-            filter: postsFilterShape,
-            posts_select_cols: selectFields,
-            posts_select_ms: +(p3 - p2).toFixed(1),
-            posts_rows: postIds.length,
-            ids_count: postIds.length,
-            ids_first: postIds[0] ?? null, ids_last: postIds[postIds.length - 1] ?? null,
-            media_where_shape: mediaWhereShape, media_select_cols: mediaSelectCols,
-            media_ms: mediaMs, media_rows: mediaRows.length,
-            likes_where_shape: likesWhereShape, likes_select_cols: likesSelectCols,
-            likes_ms: likesMs, likes_rows: (allLikeRows as any[]).length,
-            commentCounts_where_shape: commentCountsWhereShape,
-            commentCounts_ms: commentCountMs, commentCounts_rows: (commentCountRows as any[]).length,
-            transform_ms: +(p5 - p4).toFixed(1),
-            serialize_ms: +serializeMs.toFixed(1),
-            total_ms: +postsTotal.toFixed(1),
-          });
-          if (isReplyQuery) {
-            const serializeMs = performance.now();
-            console.log(`[perf][replies_breakdown] rid=${request_id} parent_post_id=${parent_post_id_param} http_ms=${replyHttpMs} parse_ms=${replyParseMs} parallel_ms=${(p4 - p3).toFixed(1)} transform_ms=${(p5 - p4).toFixed(1)} serialize_ms=${(serializeMs - p5).toFixed(1)} total_ms=${(serializeMs - p0).toFixed(1)} rows=${enrichedPosts.length} payload_bytes=${responseBody.length}`);
-          }
+            if (postsTotal >= SLOW_MS) {
+              console.log(JSON.stringify({
+                tag: "slow",
+                rid: request_id,
+                total_ms: +postsTotal.toFixed(1),
+                cache_lookup_ms: cacheLookupMs,
+                select_ms: +postsQueryMs,
+                parallel_ms: parallelMs,
+                media_ms: mediaMs,
+                likes_ms: likesMs,
+                comment_counts_ms: commentCountMs,
+                cache_hit: cacheStatus,
+                cache_key: feedCacheKey?.url || "none",
+                rows: enrichedPosts.length,
+                payload_bytes: responseBody.length,
+              }));
+            }
 
-          if (postsTotal >= SLOW_MS) {
-            console.log(JSON.stringify({
-              tag: "slow",
-              rid: request_id,
-              total_ms: +postsTotal.toFixed(1),
-              cache_lookup_ms: cacheLookupMs,
-              select_ms: +postsQueryMs,
-              parallel_ms: parallelMs,
-              media_ms: mediaMs,
-              likes_ms: likesMs,
-              comment_counts_ms: commentCountMs,
-              cache_hit: cacheStatus,
-              cache_key: feedCacheKey?.url || "none",
-              rows: enrichedPosts.length,
-              payload_bytes: responseBody.length,
-            }));
-          }
-
-          if (postsTotal >= VERY_SLOW_MS) {
-            console.log(JSON.stringify({
-              tag: "very_slow",
-              rid: request_id,
-              total_ms: +postsTotal.toFixed(1),
-              cache_lookup_ms: cacheLookupMs,
-              select_ms: +postsQueryMs,
-              parallel_ms: parallelMs,
-              media_ms: mediaMs,
-              likes_ms: likesMs,
-              comment_counts_ms: commentCountMs,
-              transform_ms: +(p5 - p4).toFixed(1),
-              serialize_ms: +serializeMs.toFixed(1),
-              cache_hit: cacheStatus,
-              cache_key: feedCacheKey?.url || "none",
-              rows: enrichedPosts.length,
-              payload_bytes: responseBody.length,
-              shape: {
-                limit: lim,
-                cursor: cursor ? `${cursor.created_at}:${cursor.id}` : null,
-                root_only: root_only_param || "false",
-                room_scope: room_scope_param || "none",
-                room_id: room_id_param || "none",
-                post_type: post_type_param || "all",
-                select_cols: selectFields,
-                is_reply: isReplyQuery,
-              },
-              query_evidence: queryEvidence,
-              media_rows: mediaRows.length,
-              likes_rows: (allLikeRows as any[]).length,
-              comment_count_rows: (commentCountRows as any[]).length,
-            }));
+            if (postsTotal >= VERY_SLOW_MS) {
+              console.log(JSON.stringify({
+                tag: "very_slow",
+                rid: request_id,
+                total_ms: +postsTotal.toFixed(1),
+                cache_lookup_ms: cacheLookupMs,
+                select_ms: +postsQueryMs,
+                parallel_ms: parallelMs,
+                media_ms: mediaMs,
+                likes_ms: likesMs,
+                comment_counts_ms: commentCountMs,
+                transform_ms: +(p5 - p4).toFixed(1),
+                serialize_ms: +serializeMs.toFixed(1),
+                cache_hit: cacheStatus,
+                cache_key: feedCacheKey?.url || "none",
+                rows: enrichedPosts.length,
+                payload_bytes: responseBody.length,
+                shape: {
+                  limit: lim,
+                  cursor: cursor ? `${cursor.created_at}:${cursor.id}` : null,
+                  root_only: root_only_param || "false",
+                  room_scope: room_scope_param || "none",
+                  room_id: room_id_param || "none",
+                  post_type: post_type_param || "all",
+                  select_cols: selectFields,
+                  is_reply: isReplyQuery,
+                },
+                query_evidence: queryEvidence,
+                media_rows: mediaRows.length,
+                likes_rows: (allLikeRows as any[]).length,
+                comment_count_rows: (commentCountRows as any[]).length,
+              }));
+            }
+          } catch (perfErr) {
+            console.error(`[perf] /api/posts logging_error rid=${request_id}`, perfErr);
           }
 
           // ── Store in edge cache (feed only, fire-and-forget) ──
