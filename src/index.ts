@@ -415,6 +415,7 @@ export default {
           const mode_param = url.searchParams.get("mode");                 // CSV: "Ask,Discuss"
           const mood_param = url.searchParams.get("mood");                 // CSV: "Happy,Curious"
           const q_param = url.searchParams.get("q");                       // keyword search
+          const light = url.searchParams.get("light") === "1";              // lightweight mode: skip enrichment
           const isReplyQuery = !!parent_post_id_param;
           const isScopedQuery = !!post_type_param || !!root_only_param || !!mode_param || !!mood_param || !!q_param;
           const cursor = (isReplyQuery || isScopedQuery) ? parseCursor(cursor_param) : null;
@@ -459,7 +460,8 @@ export default {
           // - Feed lists: lightweight select (content included for card preview)
           // - Single post by id: include full data for PostDetail
           const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods";
-          const selectFields = id_param ? "*" : feedSelectFields;
+          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type";
+          const selectFields = id_param ? "*" : (light ? lightSelectFields : feedSelectFields);
 
           // Step 1: log normalized filter + select cols
           const postsFilterShape = {
@@ -473,7 +475,7 @@ export default {
             limit: limit_param || "default",
             cursor: cursor ? "set" : "none",
           };
-          logDiag("/api/posts query_shape", { rid: request_id, select_cols: selectFields, filter: postsFilterShape });
+          logDiag("/api/posts query_shape", { rid: request_id, select_cols: selectFields, light, filter: postsFilterShape });
 
           let q = sb(env)
             .from("posts")
@@ -783,116 +785,135 @@ export default {
             });
           }
 
-          // Parallel fetch: media + likes + comment counts
-          const parallelStart = Date.now();
-          let mediaMs = 0, likesMs = 0, commentCountMs = 0;
+          // ── Light mode: skip enrichment, return posts with avatar sanitization only ──
+          let enrichedPosts: any[];
+          let parallelMs = 0;
+          let p4 = performance.now();
+          let p5 = p4;
 
-          // Step 2: query shape constants for diagnostics
-          const mediaSelectCols = "id, post_id, type, key, thumb_key, width, height, duration_ms";
-          const mediaWhereShape = "post_id IN";
-          const likesSelectCols = "post_id, actor_id";
-          const likesWhereShape = "post_id IN";
-          const commentCountsWhereShape = "rpc:get_comment_counts(parent_ids)";
+          if (light) {
+            // Light path: no media, likes, or commentCounts queries
+            enrichedPosts = (posts ?? []).map((p: any) => {
+              let avatar = p.author_avatar;
+              if (typeof avatar === "string" && avatar.startsWith("data:")) {
+                avatar = null;
+              }
+              return { ...p, author_avatar: avatar, media: [], like_count: 0, liked_by_me: false, comment_count: 0 };
+            });
+            p5 = performance.now();
+            console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} skip=parallel`);
+          } else {
+            // Parallel fetch: media + likes + comment counts
+            const parallelStart = Date.now();
+            let mediaMs = 0, likesMs = 0, commentCountMs = 0;
 
-          // Step 2: log pre-execution query shape for each parallel query
-          logDiag("/api/posts parallel_pre", {
-            rid: request_id, ids_count: postIds.length,
-            media: { select_cols: mediaSelectCols, where_shape: mediaWhereShape, table: "media" },
-            likes: { select_cols: likesSelectCols, where_shape: likesWhereShape, table: "post_likes" },
-            commentCounts: { where_shape: commentCountsWhereShape, table: "rpc" },
-          });
+            // Step 2: query shape constants for diagnostics
+            const mediaSelectCols = "id, post_id, type, key, thumb_key, width, height, duration_ms";
+            const mediaWhereShape = "post_id IN";
+            const likesSelectCols = "post_id, actor_id";
+            const likesWhereShape = "post_id IN";
+            const commentCountsWhereShape = "rpc:get_comment_counts(parent_ids)";
 
-          const mediaQuery = (async () => {
-            const t = Date.now();
-            const { data } = await sb(env)
-              .from("media")
-              .select(mediaSelectCols)
-              .in("post_id", postIds);
-            mediaMs = Date.now() - t;
-            return data ?? [];
-          })();
+            // Step 2: log pre-execution query shape for each parallel query
+            logDiag("/api/posts parallel_pre", {
+              rid: request_id, ids_count: postIds.length,
+              media: { select_cols: mediaSelectCols, where_shape: mediaWhereShape, table: "media" },
+              likes: { select_cols: likesSelectCols, where_shape: likesWhereShape, table: "post_likes" },
+              commentCounts: { where_shape: commentCountsWhereShape, table: "rpc" },
+            });
 
-          // Merged likes query: fetch post_id + actor_id in one roundtrip
-          // Compute like_count (group by post_id) and liked_by_me (filter actor_id) in JS
-          const likesQuery = (async () => {
-            const t = Date.now();
-            const { data } = await sb(env)
-              .from("post_likes")
-              .select(likesSelectCols)
-              .in("post_id", postIds);
-            likesMs = Date.now() - t;
-            return data ?? [];
-          })();
+            const mediaQuery = (async () => {
+              const t = Date.now();
+              const { data } = await sb(env)
+                .from("media")
+                .select(mediaSelectCols)
+                .in("post_id", postIds);
+              mediaMs = Date.now() - t;
+              return data ?? [];
+            })();
 
-          // Comment counts via RPC (direct replies only)
-          const commentCountsQuery = (async () => {
-            const t = Date.now();
-            const { data, error: rpcErr } = await sb(env)
-              .rpc("get_comment_counts", { parent_ids: postIds });
-            commentCountMs = Date.now() - t;
-            if (rpcErr) {
-              console.error(`[perf] /api/posts comment_counts RPC error rid=${request_id}`, rpcErr);
-              return [];
+            // Merged likes query: fetch post_id + actor_id in one roundtrip
+            // Compute like_count (group by post_id) and liked_by_me (filter actor_id) in JS
+            const likesQuery = (async () => {
+              const t = Date.now();
+              const { data } = await sb(env)
+                .from("post_likes")
+                .select(likesSelectCols)
+                .in("post_id", postIds);
+              likesMs = Date.now() - t;
+              return data ?? [];
+            })();
+
+            // Comment counts via RPC (direct replies only)
+            const commentCountsQuery = (async () => {
+              const t = Date.now();
+              const { data, error: rpcErr } = await sb(env)
+                .rpc("get_comment_counts", { parent_ids: postIds });
+              commentCountMs = Date.now() - t;
+              if (rpcErr) {
+                console.error(`[perf] /api/posts comment_counts RPC error rid=${request_id}`, rpcErr);
+                return [];
+              }
+              return data ?? [];
+            })();
+
+            const [mediaRows, allLikeRows, commentCountRows] = await Promise.all([
+              mediaQuery,
+              likesQuery,
+              commentCountsQuery,
+            ]);
+            parallelMs = Date.now() - parallelStart;
+            p4 = performance.now();
+
+            console.log(`[perf] /api/posts parallel_queries ${parallelMs}ms`, {
+              media: mediaMs,
+              likes: likesMs,
+              commentCounts: commentCountMs,
+              mediaCount: mediaRows.length,
+              likeRows: (allLikeRows as any[]).length,
+              commentCountRows: (commentCountRows as any[]).length,
+            });
+
+            // Process results
+            const mediaByPost: Record<number, any[]> = {};
+            for (const m of mediaRows) {
+              if (!mediaByPost[m.post_id]) mediaByPost[m.post_id] = [];
+              mediaByPost[m.post_id].push(m);
             }
-            return data ?? [];
-          })();
 
-          const [mediaRows, allLikeRows, commentCountRows] = await Promise.all([
-            mediaQuery,
-            likesQuery,
-            commentCountsQuery,
-          ]);
-          const parallelMs = Date.now() - parallelStart;
-          const p4 = performance.now();
-
-          console.log(`[perf] /api/posts parallel_queries ${parallelMs}ms`, {
-            media: mediaMs,
-            likes: likesMs,
-            commentCounts: commentCountMs,
-            mediaCount: mediaRows.length,
-            likeRows: (allLikeRows as any[]).length,
-            commentCountRows: (commentCountRows as any[]).length,
-          });
-
-          // Process results
-          const mediaByPost: Record<number, any[]> = {};
-          for (const m of mediaRows) {
-            if (!mediaByPost[m.post_id]) mediaByPost[m.post_id] = [];
-            mediaByPost[m.post_id].push(m);
-          }
-
-          // Compute like_count and liked_by_me from merged result
-          const likeCounts: Record<number, number> = {};
-          const likedByActorSet = new Set<number>();
-          for (const row of allLikeRows as any[]) {
-            likeCounts[row.post_id] = (likeCounts[row.post_id] || 0) + 1;
-            if (actor_id_param && row.actor_id === actor_id_param) {
-              likedByActorSet.add(row.post_id);
+            // Compute like_count and liked_by_me from merged result
+            const likeCounts: Record<number, number> = {};
+            const likedByActorSet = new Set<number>();
+            for (const row of allLikeRows as any[]) {
+              likeCounts[row.post_id] = (likeCounts[row.post_id] || 0) + 1;
+              if (actor_id_param && row.actor_id === actor_id_param) {
+                likedByActorSet.add(row.post_id);
+              }
             }
-          }
 
-          // Build comment count map from RPC result
-          const commentCounts: Record<number, number> = {};
-          for (const row of commentCountRows as any[]) {
-            commentCounts[row.parent_post_id] = Number(row.comment_count) || 0;
-          }
-
-          // Enrich posts with media, like_count, liked_by_me, comment_count
-          const enrichedPosts = (posts ?? []).map((p: any) => {
-            let avatar = p.author_avatar;
-            if (typeof avatar === "string" && avatar.startsWith("data:")) {
-              avatar = null;
+            // Build comment count map from RPC result
+            const commentCounts: Record<number, number> = {};
+            for (const row of commentCountRows as any[]) {
+              commentCounts[row.parent_post_id] = Number(row.comment_count) || 0;
             }
-            return {
-              ...p,
-              author_avatar: avatar,
-              media: mediaByPost[p.id] || [],
-              like_count: likeCounts[p.id] || 0,
-              liked_by_me: likedByActorSet.has(p.id),
-              comment_count: commentCounts[p.id] || 0,
-            };
-          });
-          const p5 = performance.now();
+
+            // Enrich posts with media, like_count, liked_by_me, comment_count
+            enrichedPosts = (posts ?? []).map((p: any) => {
+              let avatar = p.author_avatar;
+              if (typeof avatar === "string" && avatar.startsWith("data:")) {
+                avatar = null;
+              }
+              return {
+                ...p,
+                author_avatar: avatar,
+                media: mediaByPost[p.id] || [],
+                like_count: likeCounts[p.id] || 0,
+                liked_by_me: likedByActorSet.has(p.id),
+                comment_count: commentCounts[p.id] || 0,
+              };
+            });
+            p5 = performance.now();
+          } // end !light
 
           const responsePayload = isReplyQuery
             ? { items: enrichedPosts, next_cursor: buildNextCursor(enrichedPosts, lim) }
