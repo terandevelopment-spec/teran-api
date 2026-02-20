@@ -4053,32 +4053,6 @@ export default {
             console.log("[NEWS COMMENT CREATE] media inserted:", mediaRows.length);
           }
 
-          // Notify parent comment author on reply (skip self-notification)
-          if (parent_comment_id) {
-            try {
-              const { data: parentComment } = await sb(env)
-                .from("news_comments")
-                .select("user_id")
-                .eq("id", parent_comment_id)
-                .single();
-              if (parentComment) {
-                await createNotification(env, {
-                  recipient_user_id: parentComment.user_id,
-                  actor_user_id: user_id,
-                  actor_name: author_name,
-                  actor_avatar: author_avatar,
-                  type: "reply",
-                  comment_id: data.id,
-                  parent_comment_id,
-                  news_id,
-                  group_key: `rp:${parent_comment_id}`,
-                }, request_id);
-              }
-            } catch (notifErr) {
-              console.error("[NEWS COMMENT] reply notification failed", String(notifErr));
-            }
-          }
-
           return ok(req, env, request_id, {
             comment: { ...data, like_count: 0, liked_by_me: false, media: mediaRows }
           }, 201);
@@ -4145,35 +4119,6 @@ export default {
             }
 
             if (insertError) throw insertError;
-
-            // Notify comment author on like
-            try {
-              const { data: likedComment } = await sb(env)
-                .from("news_comments")
-                .select("user_id, news_id")
-                .eq("id", comment_id)
-                .single();
-              if (likedComment) {
-                // Fetch actor info
-                const { data: actorProfile } = await sb(env)
-                  .from("user_profiles")
-                  .select("display_name, avatar_key")
-                  .eq("user_id", user_id)
-                  .single();
-                await createNotification(env, {
-                  recipient_user_id: likedComment.user_id,
-                  actor_user_id: user_id,
-                  actor_name: actorProfile?.display_name ?? null,
-                  actor_avatar: actorProfile?.avatar_key ?? null,
-                  type: "comment_like",
-                  comment_id,
-                  news_id: likedComment.news_id,
-                  group_key: `cl:${comment_id}`,
-                }, request_id);
-              }
-            } catch (notifErr) {
-              console.error("[NEWS LIKE] notification failed", String(notifErr));
-            }
 
             return ok(req, env, request_id, { liked: true }, 201);
           }
