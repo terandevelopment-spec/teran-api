@@ -1117,8 +1117,9 @@ export default {
           const shared_post_id = rawSharedPostId != null ? (Number.isFinite(Number(rawSharedPostId)) ? Number(rawSharedPostId) : null) : null;
 
           // ── Mode + Moods (optional, used by thread creation) ──
-          const VALID_MODES = new Set(["Ask", "Discuss", "Share", "Fun"]);
-          const VALID_MOODS = new Set(["Happy", "Laughing", "Curious", "Meh", "Sad", "Anxious", "Angry", "Frustrated", "Tired"]);
+          // Includes new values + legacy values for backward compatibility
+          const VALID_MODES = new Set(["Advice", "Discuss", "Share", "Breaking!", "IRL", "Ask", "Fun"]);
+          const VALID_MOODS = new Set(["Happy", "Curious", "Sad", "Anxious", "Frustrated", "LowBattery", "Meh", "OffUneasy", "Laughing", "Angry", "Tired"]);
           const MAX_MOODS = 2;
 
           const rawMode = body?.mode;
