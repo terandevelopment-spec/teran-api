@@ -3397,6 +3397,43 @@ export default {
 
 
         // =====================================================
+        // FEED CONFIG API
+        // =====================================================
+
+        const FEED_CONFIG_DEFAULTS = {
+          recency_weight: 0.2,
+          comment_weight: 5,
+          like_weight: 1,
+          echo_weight: 50,
+          persona_weight: 15,
+        };
+
+        if (path === "/api/feed-config" && req.method === "GET") {
+          const kvKey = "feed_config:v1";
+          try {
+            // KV cache (300s TTL)
+            const cached = await env.PROFILE_KV.get(kvKey, "json");
+            if (cached) return ok(req, env, request_id, cached);
+
+            const { data, error } = await sb(env)
+              .from("feed_config")
+              .select("recency_weight, comment_weight, like_weight, echo_weight, persona_weight")
+              .eq("id", 1)
+              .maybeSingle();
+
+            const result = data && !error ? data : FEED_CONFIG_DEFAULTS;
+
+            ctx.waitUntil(
+              env.PROFILE_KV.put(kvKey, JSON.stringify(result), { expirationTtl: 300 })
+                .catch(() => { })
+            );
+            return ok(req, env, request_id, result);
+          } catch {
+            return ok(req, env, request_id, FEED_CONFIG_DEFAULTS);
+          }
+        }
+
+        // =====================================================
         // USER PROFILE API (Stage 1: READ-ONLY)
         // =====================================================
 
