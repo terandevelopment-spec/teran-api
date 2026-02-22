@@ -523,7 +523,7 @@ export default {
               if (!Number.isFinite(parsedPpid)) {
                 throw new HttpError(400, "BAD_REQUEST", "parent_post_id must be a valid integer");
               }
-              q = q.eq("parent_post_id", parsedPpid);
+              q = q.eq("root_post_id", parsedPpid);
               // Apply cursor keyset filter for reply pagination
               if (cursor) {
                 q = q.or(
@@ -635,7 +635,7 @@ export default {
           if (isReplyQuery) {
             // ── Direct PostgREST fetch for reply queries: HTTP timing + header capture ──
             const parsedPpid = Number(parent_post_id_param);
-            let restUrl = `${env.SUPABASE_URL}/rest/v1/posts?select=${encodeURIComponent(feedSelectFields)}&parent_post_id=eq.${parsedPpid}&order=created_at.desc,id.desc&limit=${lim}`;
+            let restUrl = `${env.SUPABASE_URL}/rest/v1/posts?select=${encodeURIComponent(feedSelectFields)}&root_post_id=eq.${parsedPpid}&order=created_at.desc,id.desc&limit=${lim}`;
             // Append keyset cursor filter if present
             if (cursor) {
               restUrl += `&or=(created_at.lt.${encodeURIComponent(cursor.created_at)},and(created_at.eq.${encodeURIComponent(cursor.created_at)},id.lt.${cursor.id}))`;
@@ -1195,6 +1195,22 @@ export default {
 
           mark("auth_done");
 
+          // ── Resolve root_post_id before insert ──
+          let root_post_id: number | null = null;
+          if (parent_post_id) {
+            const { data: parentRow, error: parentErr } = await sb(env)
+              .from("posts")
+              .select("id, root_post_id")
+              .eq("id", parent_post_id)
+              .single();
+            if (parentErr) {
+              console.error(`[posts][${request_id}] failed to fetch parent for root_post_id`, { parent_post_id, error: parentErr });
+            }
+            if (parentRow) {
+              root_post_id = parentRow.root_post_id ?? parentRow.id;
+            }
+          }
+
           const { data, error } = await sb(env)
             .from("posts")
             .insert({
@@ -1206,6 +1222,7 @@ export default {
               author_avatar,
               room_id,
               parent_post_id,
+              root_post_id,
               post_type,
               shared_post_id,
               mode,
@@ -1214,6 +1231,15 @@ export default {
             .select("*")
             .single();
           if (error) throw error;
+
+          // ── Case A: root post → set root_post_id = own id ──
+          if (!parent_post_id && data.id) {
+            await sb(env)
+              .from("posts")
+              .update({ root_post_id: data.id })
+              .eq("id", data.id);
+            data.root_post_id = data.id;
+          }
           mark("post_insert_done");
 
           // Insert media rows into unified 'media' table
