@@ -1121,14 +1121,32 @@ export default {
           const rawSharedPostId = body?.shared_post_id;
           const shared_post_id = rawSharedPostId != null ? (Number.isFinite(Number(rawSharedPostId)) ? Number(rawSharedPostId) : null) : null;
 
-          // ── Mode + Moods (optional, used by thread creation) ──
-          // Includes new values + legacy values for backward compatibility
-          const VALID_MODES = new Set(["Advice", "Discuss", "Share", "Breaking!", "IRL", "Ask", "Fun"]);
+          // ── Mode + Moods ──
+          // Single source of truth for allowed modes (matches DB check constraint + client constants)
+          const ALLOWED_MODES = new Set(["Advice", "Discuss", "Share", "Breaking!", "IRL", "Ask", "Fun"]);
+          const DEFAULT_MODE = "Discuss";
           const VALID_MOODS = new Set(["Happy", "Curious", "Sad", "Anxious", "Frustrated", "LowBattery", "Meh", "OffUneasy", "Laughing", "Angry", "Tired"]);
           const MAX_MOODS = 2;
 
           const rawMode = body?.mode;
-          const mode: string | null = typeof rawMode === "string" && VALID_MODES.has(rawMode) ? rawMode : null;
+          const isValidMode = typeof rawMode === "string" && ALLOWED_MODES.has(rawMode);
+          const isProd = (env as any).ENVIRONMENT === "production" || !(env as any).ENVIRONMENT;
+
+          if (!isValidMode && !isProd) {
+            // Dev/staging: strict — reject immediately with 400
+            console.warn(`[posts][${request_id}] REJECT invalid mode`, { raw: rawMode, user_id, ua: req.headers.get("user-agent")?.slice(0, 80) });
+            throw new HttpError(400, "invalid_mode", `mode must be one of: ${[...ALLOWED_MODES].join(", ")}`);
+          }
+
+          const mode: string = isValidMode ? rawMode! : DEFAULT_MODE;
+          if (!isValidMode) {
+            // Production: fallback + WARN for monitoring
+            console.warn(`[posts][${request_id}] WARN mode_fallback`, {
+              received: rawMode, normalized: mode, user_id,
+              ua: req.headers.get("user-agent")?.slice(0, 80),
+              endpoint: "/api/posts",
+            });
+          }
 
           let moods: string[] = [];
           if (Array.isArray(body?.moods)) {
@@ -1216,26 +1234,39 @@ export default {
             }
           }
 
-          const { data, error } = await sb(env)
-            .from("posts")
-            .insert({
-              user_id,
-              content,
-              title,
-              author_id,
-              author_name,
-              author_avatar,
-              room_id,
-              parent_post_id,
-              root_post_id,
-              post_type,
-              shared_post_id,
-              mode,
-              moods,
-            })
-            .select("*")
-            .single();
-          if (error) throw error;
+          let data: any;
+          try {
+            const insertResult = await sb(env)
+              .from("posts")
+              .insert({
+                user_id,
+                content,
+                title,
+                author_id,
+                author_name,
+                author_avatar,
+                room_id,
+                parent_post_id,
+                root_post_id,
+                post_type,
+                shared_post_id,
+                mode,
+                moods,
+              })
+              .select("*")
+              .single();
+            if (insertResult.error) throw insertResult.error;
+            data = insertResult.data;
+          } catch (dbErr: any) {
+            // Translate DB constraint / validation errors to 400
+            const msg = dbErr?.message || String(dbErr);
+            const isConstraint = /check|not-null|violat|invalid input|bad input/i.test(msg);
+            if (isConstraint) {
+              console.warn(`[posts][${request_id}] DB constraint error`, { message: msg, mode, post_type });
+              throw new HttpError(400, "bad_request", "Invalid post payload");
+            }
+            throw dbErr; // truly unexpected → 500
+          }
 
           // ── Case A: root post → set root_post_id = own id ──
           if (!parent_post_id && data.id) {
