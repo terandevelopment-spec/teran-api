@@ -526,7 +526,9 @@ export default {
               if (!Number.isFinite(parsedPpid)) {
                 throw new HttpError(400, "BAD_REQUEST", "parent_post_id must be a valid integer");
               }
-              q = q.eq("root_post_id", parsedPpid);
+              q = q
+                .eq("root_post_id", parsedPpid)
+                .not("parent_post_id", "is", null);
               // Apply cursor keyset filter for reply pagination
               if (cursor) {
                 q = q.or(
@@ -638,7 +640,7 @@ export default {
           if (isReplyQuery) {
             // ── Direct PostgREST fetch for reply queries: HTTP timing + header capture ──
             const parsedPpid = Number(parent_post_id_param);
-            let restUrl = `${env.SUPABASE_URL}/rest/v1/posts?select=${encodeURIComponent(feedSelectFields)}&root_post_id=eq.${parsedPpid}&order=created_at.desc,id.desc&limit=${lim}`;
+            let restUrl = `${env.SUPABASE_URL}/rest/v1/posts?select=${encodeURIComponent(feedSelectFields)}&root_post_id=eq.${parsedPpid}&parent_post_id=not.is.null&order=created_at.desc,id.desc&limit=${lim}`;
             // Append keyset cursor filter if present
             if (cursor) {
               restUrl += `&or=(created_at.lt.${encodeURIComponent(cursor.created_at)},and(created_at.eq.${encodeURIComponent(cursor.created_at)},id.lt.${cursor.id}))`;
