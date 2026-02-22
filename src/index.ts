@@ -807,16 +807,31 @@ export default {
           const commentCountsWhereShape = "rpc:get_comment_counts(parent_ids)";
 
           if (light) {
-            // Light path: no media, likes, or commentCounts queries
+            // Light path: skip likes + commentCounts (ThreadFeed fetches those separately)
+            // BUT still fetch media so thumbnails render in thread cards
+            const lightMediaStart = Date.now();
+            const { data: lightMediaData } = await sb(env)
+              .from("media")
+              .select(mediaSelectCols)
+              .in("post_id", postIds);
+            mediaMs = Date.now() - lightMediaStart;
+            mediaRows = lightMediaData ?? [];
+
+            const mediaByPost: Record<number, any[]> = {};
+            for (const m of mediaRows) {
+              if (!mediaByPost[m.post_id]) mediaByPost[m.post_id] = [];
+              mediaByPost[m.post_id].push(m);
+            }
+
             enrichedPosts = (posts ?? []).map((p: any) => {
               let avatar = p.author_avatar;
               if (typeof avatar === "string" && avatar.startsWith("data:")) {
                 avatar = null;
               }
-              return { ...p, author_avatar: avatar, media: [], like_count: 0, liked_by_me: false, comment_count: 0 };
+              return { ...p, author_avatar: avatar, media: mediaByPost[p.id] || [], like_count: 0, liked_by_me: false, comment_count: 0 };
             });
             p5 = performance.now();
-            console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} skip=parallel`);
+            console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} media_rows=${mediaRows.length} media_ms=${mediaMs} skip=likes,commentCounts`);
           } else {
             // Parallel fetch: media + likes + comment counts
             const parallelStart = Date.now();
