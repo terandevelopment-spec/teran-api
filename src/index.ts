@@ -1123,7 +1123,7 @@ export default {
 
           // ── Mode + Moods ──
           // Single source of truth for allowed modes (matches DB check constraint + client constants)
-          const ALLOWED_MODES = new Set(["Advice", "Discuss", "Share", "Breaking!", "IRL", "Ask", "Fun"]);
+          const ALLOWED_MODES = new Set(["Ask", "Discuss", "Share", "Fun"]);
           const DEFAULT_MODE = "Discuss";
           const VALID_MOODS = new Set(["Happy", "Curious", "Sad", "Anxious", "Frustrated", "LowBattery", "Meh", "OffUneasy", "Laughing", "Angry", "Tired"]);
           const MAX_MOODS = 2;
