@@ -236,6 +236,7 @@ async function createNotification(
     actor_avatar?: string | null;
     type: "comment_like" | "reply" | "post_comment" | "post_like" | "post_reply";
     post_id?: number;
+    root_post_id?: number;
     comment_id?: number;
     parent_comment_id?: number;
     news_id?: string;
@@ -261,6 +262,7 @@ async function createNotification(
     actor_user_id: payload.actor_user_id,
     type: payload.type,
     post_id: payload.post_id,
+    root_post_id: payload.root_post_id,
     comment_id: payload.comment_id,
     group_key: payload.group_key,
   });
@@ -272,6 +274,7 @@ async function createNotification(
     actor_avatar: payload.actor_avatar ?? null,
     type: payload.type,
     post_id: payload.post_id ?? null,
+    root_post_id: payload.root_post_id ?? null,
     comment_id: payload.comment_id ?? null,
     parent_comment_id: payload.parent_comment_id ?? null,
     group_key: payload.group_key,
@@ -1297,6 +1300,7 @@ export default {
                 actor_avatar: author_avatar,
                 type: "post_reply",
                 post_id: parent_post_id, // Link to parent so notification opens the thread
+                root_post_id: root_post_id ?? parent_post_id, // Always point to root for navigation
                 group_key: `post_reply:${parent_post_id}`,
               }, request_id);
               mark("notif_insert_done");
@@ -2021,7 +2025,7 @@ export default {
                 // Fetch the post owner's user_id (NOT author_id/persona)
                 const { data: postData, error: postFetchError } = await sb(env)
                   .from("posts")
-                  .select("user_id, author_id")
+                  .select("user_id, author_id, root_post_id")
                   .eq("id", post_id)
                   .single();
 
@@ -2039,6 +2043,8 @@ export default {
                     actor_persona_id: actor_id,
                     post_author_id: postData.author_id,
                   });
+                  // Resolve root_post_id for navigation
+                  const likedPostRootId = postData.root_post_id ?? post_id;
                   await createNotification(env, {
                     recipient_user_id: postData.user_id,  // JWT sub of post owner
                     actor_user_id: jwt_user_id,           // JWT sub of liker
@@ -2046,6 +2052,7 @@ export default {
                     actor_avatar,
                     type: "post_like",
                     post_id,
+                    root_post_id: likedPostRootId,
                     group_key: `post_like:${post_id}`,
                   }, request_id);
                 } else if (!postData?.user_id) {
@@ -2186,6 +2193,7 @@ export default {
               actor_name: n.actor_name,
               actor_avatar: n.actor_avatar,
               post_id: n.post_id,
+              root_post_id: n.root_post_id ?? n.post_id,
               comment_id: n.comment_id,
               parent_comment_id: n.parent_comment_id,
               news_id: n.news_id ?? null,
