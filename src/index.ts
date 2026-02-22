@@ -3397,6 +3397,43 @@ export default {
 
 
         // =====================================================
+        // ANALYTICS HEARTBEAT
+        // =====================================================
+
+        if (path === "/api/analytics/heartbeat" && req.method === "POST") {
+          const user_id = await optionalAuth(req, env);
+          if (!user_id) return new Response(null, { status: 204, headers: corsHeaders(req, env) });
+
+          let is_pwa = false;
+          let session_s = 0;
+          try {
+            const body = await req.json() as any;
+            is_pwa = body?.is_pwa === true;
+            session_s = Math.max(0, Math.min(Number(body?.session_s) || 0, 3600));
+          } catch { /* malformed body — use defaults */ }
+
+          ctx.waitUntil((async () => {
+            try {
+              // Dedup heartbeat
+              await sb(env).from("analytics_heartbeats").upsert(
+                { date: new Date().toISOString().slice(0, 10), user_id, is_pwa, session_s },
+                { onConflict: "date,user_id" }
+              );
+              // Update daily aggregate
+              await sb(env).rpc("upsert_daily_analytics", {
+                p_date: new Date().toISOString().slice(0, 10),
+                p_is_pwa: is_pwa,
+                p_session_s: session_s,
+              });
+            } catch (e) {
+              console.error("[analytics] heartbeat failed", String(e));
+            }
+          })());
+
+          return new Response(null, { status: 204, headers: corsHeaders(req, env) });
+        }
+
+        // =====================================================
         // FEED CONFIG API
         // =====================================================
 
