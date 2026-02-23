@@ -1137,7 +1137,7 @@ export default {
           const shared_post_id = rawSharedPostId != null ? (Number.isFinite(Number(rawSharedPostId)) ? Number(rawSharedPostId) : null) : null;
 
           // ── Mode + Moods ──
-          // Single source of truth for allowed modes (matches DB check constraint + client constants)
+          // Canonical mode values — enforced here at the API layer, client, and DB (posts_mode_check constraint).
           const ALLOWED_MODES = new Set(["Ask", "Discuss", "Share", "Fun"]);
           const DEFAULT_MODE = "Discuss";
           const VALID_MOODS = new Set(["Happy", "Curious", "Sad", "Anxious", "Frustrated", "LowBattery", "Meh", "OffUneasy", "Laughing", "Angry", "Tired"]);
