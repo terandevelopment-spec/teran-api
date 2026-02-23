@@ -1138,7 +1138,7 @@ export default {
 
           // ── Mode + Moods ──
           // Canonical mode values — enforced here at the API layer, client, and DB (posts_mode_check constraint).
-          const ALLOWED_MODES = new Set(["Ask", "Discuss", "Share", "Fun"]);
+          const ALLOWED_MODES = new Set(["Ask", "Discuss", "Share"]);
           const DEFAULT_MODE = "Discuss";
           const VALID_MOODS = new Set(["Happy", "Curious", "Sad", "Anxious", "Frustrated", "LowBattery", "Meh", "OffUneasy", "Laughing", "Angry", "Tired"]);
           const MAX_MOODS = 2;
