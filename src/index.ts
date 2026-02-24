@@ -1134,6 +1134,17 @@ export default {
             ? rawPostType
             : "status";
 
+          // ── Text length limits (must match frontend LIMITS constants) ──
+          const LIMIT_STATUS_CONTENT = 360;
+          const LIMIT_THREAD_TITLE = 100;
+          const LIMIT_THREAD_BODY = 600;
+          if (post_type === "thread") {
+            if (title.length > LIMIT_THREAD_TITLE) throw new HttpError(400, "TEXT_TOO_LONG", `Max ${LIMIT_THREAD_TITLE} characters for title`);
+            if (content.length > LIMIT_THREAD_BODY) throw new HttpError(400, "TEXT_TOO_LONG", `Max ${LIMIT_THREAD_BODY} characters for content`);
+          } else {
+            if (content.length > LIMIT_STATUS_CONTENT) throw new HttpError(400, "TEXT_TOO_LONG", `Max ${LIMIT_STATUS_CONTENT} characters`);
+          }
+
           const rawSharedPostId = body?.shared_post_id;
           const shared_post_id = rawSharedPostId != null ? (Number.isFinite(Number(rawSharedPostId)) ? Number(rawSharedPostId) : null) : null;
 
@@ -1768,6 +1779,12 @@ export default {
           // Require either content OR media
           if (!content && mediaInput.length === 0) {
             throw new HttpError(400, "BAD_REQUEST", "Comment must have text or media");
+          }
+
+          // ── Text length limit (must match frontend LIMITS.COMMENT) ──
+          const LIMIT_COMMENT = 600;
+          if (content.length > LIMIT_COMMENT) {
+            throw new HttpError(400, "TEXT_TOO_LONG", `Max ${LIMIT_COMMENT} characters`);
           }
 
           // Parse optional author fields from request (display only)
@@ -3657,6 +3674,16 @@ export default {
             throw new HttpError(422, "VALIDATION_ERROR", "avatar must be a URL or key, not a data URI");
           }
 
+          // ── Persona text length limits (must match frontend LIMITS constants) ──
+          const LIMIT_PERSONA_NAME = 20;
+          const LIMIT_PERSONA_BIO = 160;
+          if (incoming.display_name && incoming.display_name.length > LIMIT_PERSONA_NAME) {
+            throw new HttpError(400, "TEXT_TOO_LONG", `Max ${LIMIT_PERSONA_NAME} characters for name`);
+          }
+          if (incoming.bio && incoming.bio.length > LIMIT_PERSONA_BIO) {
+            throw new HttpError(400, "TEXT_TOO_LONG", `Max ${LIMIT_PERSONA_BIO} characters for bio`);
+          }
+
           // Validate persona_tags (optional field)
           if (body?.persona_tags !== undefined) {
             if (!Array.isArray(body.persona_tags)) {
@@ -4082,6 +4109,12 @@ export default {
           const mediaInput = Array.isArray(body?.media) ? body.media : [];
           if (!content && mediaInput.length === 0) {
             throw new HttpError(400, "BAD_REQUEST", "content or media is required");
+          }
+
+          // ── Text length limit (must match frontend LIMITS.COMMENT) ──
+          const LIMIT_NEWS_COMMENT = 600;
+          if (content.length > LIMIT_NEWS_COMMENT) {
+            throw new HttpError(400, "TEXT_TOO_LONG", `Max ${LIMIT_NEWS_COMMENT} characters`);
           }
 
           // Validate media items (same rules as post media)
