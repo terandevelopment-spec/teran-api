@@ -462,8 +462,8 @@ export default {
           // Build base query with conditional select:
           // - Feed lists: lightweight select (content included for card preview)
           // - Single post by id: include full data for PostDetail
-          const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods";
-          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type";
+          const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods,is_secret";
+          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,is_secret";
           const selectFields = id_param ? "*" : (light ? lightSelectFields : feedSelectFields);
 
           // Step 1: log normalized filter + select cols
@@ -1134,6 +1134,10 @@ export default {
             ? rawPostType
             : "status";
 
+          // ── Secret mode (thread-only) ──
+          const is_secret_raw = body?.is_secret;
+          const is_secret = post_type === "thread" && typeof is_secret_raw === "boolean" ? is_secret_raw : false;
+
           // ── Text length limits (must match frontend LIMITS constants) ──
           const LIMIT_STATUS_CONTENT = 360;
           const LIMIT_THREAD_TITLE = 100;
@@ -1279,6 +1283,7 @@ export default {
                 shared_post_id,
                 mode,
                 moods,
+                is_secret,
               })
               .select("*")
               .single();
