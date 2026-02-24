@@ -483,6 +483,7 @@ export default {
           let q = sb(env)
             .from("posts")
             .select(selectFields)
+            .is("deleted_at", null)
             .order("created_at", { ascending: false });
 
           // Apply filters - priority: id > user_id > author_id > default
@@ -640,7 +641,7 @@ export default {
           if (isReplyQuery) {
             // ── Direct PostgREST fetch for reply queries: HTTP timing + header capture ──
             const parsedPpid = Number(parent_post_id_param);
-            let restUrl = `${env.SUPABASE_URL}/rest/v1/posts?select=${encodeURIComponent(feedSelectFields)}&root_post_id=eq.${parsedPpid}&parent_post_id=not.is.null&order=created_at.desc,id.desc&limit=${lim}`;
+            let restUrl = `${env.SUPABASE_URL}/rest/v1/posts?select=${encodeURIComponent(feedSelectFields)}&root_post_id=eq.${parsedPpid}&parent_post_id=not.is.null&deleted_at=is.null&order=created_at.desc,id.desc&limit=${lim}`;
             // Append keyset cursor filter if present
             if (cursor) {
               restUrl += `&or=(created_at.lt.${encodeURIComponent(cursor.created_at)},and(created_at.eq.${encodeURIComponent(cursor.created_at)},id.lt.${cursor.id}))`;
@@ -1373,7 +1374,7 @@ export default {
           return ok(req, env, request_id, { post: { ...data, media: mediaRows } }, 201);
         }
 
-        // /api/posts/:id (DELETE)
+        // /api/posts/:id (DELETE) — cascade soft-delete
         {
           const m = path.match(/^\/api\/posts\/(\d+)$/);
           if (m && req.method === "DELETE") {
@@ -1383,8 +1384,9 @@ export default {
             // First check if the post exists and belongs to the user
             const { data: existingPost, error: fetchError } = await sb(env)
               .from("posts")
-              .select("id, user_id")
+              .select("id, user_id, root_post_id")
               .eq("id", postId)
+              .is("deleted_at", null)
               .single();
 
             if (fetchError || !existingPost) {
@@ -1395,40 +1397,28 @@ export default {
               throw new HttpError(403, "FORBIDDEN", "You can only delete your own posts");
             }
 
-            // Fetch related media rows BEFORE deleting the post
-            const { data: mediaRows } = await sb(env)
-              .from("media")
-              .select("key, thumb_key")
-              .eq("post_id", postId);
+            const now = new Date().toISOString();
 
-            console.log("[DELETE post] id=", postId, "mediaCount=", (mediaRows ?? []).length);
+            // Soft-delete the post itself
+            const { error: selfErr } = await sb(env)
+              .from("posts")
+              .update({ deleted_at: now })
+              .eq("id", postId);
+            if (selfErr) throw selfErr;
 
-            // Delete R2 objects (key + thumb_key) for each media row
-            for (const row of mediaRows ?? []) {
-              if (row.key) {
-                try {
-                  await env.R2_MEDIA.delete(row.key);
-                } catch (e) {
-                  console.warn("[DELETE post] R2 delete failed for key=", row.key, e);
-                }
-              }
-              if (row.thumb_key) {
-                try {
-                  await env.R2_MEDIA.delete(row.thumb_key);
-                } catch (e) {
-                  console.warn("[DELETE post] R2 delete failed for thumb_key=", row.thumb_key, e);
-                }
-              }
+            // Cascade: if this is a root post, soft-delete all descendants too
+            const isRoot = !existingPost.root_post_id || existingPost.root_post_id === postId;
+            if (isRoot) {
+              const { error: cascadeErr, count } = await sb(env)
+                .from("posts")
+                .update({ deleted_at: now })
+                .eq("root_post_id", postId)
+                .is("deleted_at", null);
+              console.log(`[DELETE post] cascade soft-delete root=${postId} children_marked=${count ?? "unknown"}`, cascadeErr ?? "ok");
             }
 
-            // Delete the post (cascade deletes media rows in DB)
-            const { error } = await sb(env)
-              .from("posts")
-              .delete()
-              .eq("id", postId);
-            if (error) throw error;
-
-            return new Response(null, { status: 204, headers: corsHeaders(req, env) });
+            console.log(`[DELETE post] soft-deleted id=${postId} isRoot=${isRoot}`);
+            return ok(req, env, request_id, { ok: true }, 200);
           }
         }
 
