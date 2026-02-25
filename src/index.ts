@@ -507,8 +507,8 @@ export default {
           // Build base query with conditional select:
           // - Feed lists: lightweight select (content included for card preview)
           // - Single post by id: include full data for PostDetail
-          const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods,is_secret";
-          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,is_secret";
+          const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods";
+          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type";
           const selectFields = id_param ? "*" : (light ? lightSelectFields : feedSelectFields);
 
           // Step 1: log normalized filter + select cols
@@ -1179,9 +1179,6 @@ export default {
             ? rawPostType
             : "status";
 
-          // ── Secret mode (thread-only) ──
-          const is_secret_raw = body?.is_secret;
-          const is_secret = post_type === "thread" && typeof is_secret_raw === "boolean" ? is_secret_raw : false;
 
           // ── Text length limits (must match frontend LIMITS constants) ──
           const LIMIT_STATUS_CONTENT = 360;
@@ -1328,7 +1325,6 @@ export default {
                 shared_post_id,
                 mode,
                 moods,
-                is_secret,
               })
               .select("*")
               .single();
@@ -1633,7 +1629,7 @@ export default {
             const tDb0 = Date.now();
             const { data: rows, error } = await sb(env)
               .from("comments")
-              .select("id, post_id, content, author_name, author_avatar, created_at, is_secret, secret_color")
+              .select("id, post_id, content, author_name, author_avatar, created_at")
               .in("post_id", postIds)
               .order("created_at", { ascending: false })
               .limit(fetchLimit);
@@ -1731,7 +1727,7 @@ export default {
           let t1 = Date.now();
           let commentsQuery = sb(env)
             .from("comments")
-            .select("id, post_id, user_id, content, parent_comment_id, author_id, author_name, author_avatar, created_at, is_secret, secret_color")
+            .select("id, post_id, user_id, content, parent_comment_id, author_id, author_name, author_avatar, created_at")
             .eq("post_id", post_id);
           if (cursor) {
             commentsQuery = commentsQuery.or(
@@ -1923,41 +1919,12 @@ export default {
               throw new HttpError(422, "VALIDATION_ERROR", "Media type must be 'image' or 'video'");
             }
           }
-          // ── Secret comment enforcement (thread-owner only) ──
-          const ALLOWED_SECRET_COLORS = new Set(["red", "orange", "yellow", "green", "blue", "indigo", "violet"]);
-          const validateSecretColor = (v: any): string => ALLOWED_SECRET_COLORS.has(String(v)) ? String(v) : "blue";
-
-          const { data: parentPost, error: parentPostErr } = await sb(env)
-            .from("posts")
-            .select("id, user_id, post_type, is_secret, secret_color")
-            .eq("id", post_id)
-            .single();
-          if (parentPostErr || !parentPost) {
-            throw new HttpError(404, "NOT_FOUND", "Post not found");
-          }
-
-          let comment_is_secret = false;
-          let comment_secret_color: string | null = null;
-          let final_author_name = author_name;
-          let final_author_avatar = author_avatar;
-
-          if (
-            parentPost.post_type === "thread" &&
-            parentPost.is_secret === true &&
-            user_id === parentPost.user_id
-          ) {
-            comment_is_secret = true;
-            comment_secret_color = validateSecretColor(parentPost.secret_color);
-            final_author_name = "Secret";
-            final_author_avatar = null;
-          }
 
           const { data, error } = await sb(env)
             .from("comments")
             .insert({
               post_id, user_id, content, parent_comment_id,
-              author_id, author_name: final_author_name, author_avatar: final_author_avatar,
-              is_secret: comment_is_secret, secret_color: comment_secret_color,
+              author_id, author_name, author_avatar,
             })
             .select("*")
             .single();
