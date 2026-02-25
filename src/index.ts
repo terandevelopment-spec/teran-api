@@ -47,7 +47,12 @@ function readDeviceIdFromCookie(req: Request): string | null {
 
 function setDeviceIdCookie(origin: string, deviceId: string): string {
   const isSecure = origin.startsWith("https");
-  return `teran_device_id=${deviceId}; HttpOnly; ${isSecure ? "Secure; " : ""}SameSite=Lax; Path=/; Max-Age=31536000`;
+  // Cross-origin (prod): SameSite=None requires Secure
+  // Same-origin / localhost (dev): SameSite=Lax, no Secure flag
+  if (isSecure) {
+    return `teran_device_id=${deviceId}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=31536000`;
+  }
+  return `teran_device_id=${deviceId}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000`;
 }
 
 function ok(req: Request, env: Env, request_id: string, data: any, status = 200) {
