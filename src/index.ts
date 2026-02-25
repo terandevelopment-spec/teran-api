@@ -30,11 +30,24 @@ function corsHeaders(req: Request, env: Env) {
   const allowed = env.CORS_ORIGIN || origin || "*";
   return {
     "Access-Control-Allow-Origin": allowed === "null" ? "*" : allowed,
+    "Access-Control-Allow-Credentials": "true",
     "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization, x-teran-caller",
     "Access-Control-Expose-Headers": "X-Cache, X-Cache-Key, X-Request-Id, Cache-Control",
     "Access-Control-Max-Age": "86400",
   };
+}
+
+// --------- Device ID cookie helpers ----------
+function readDeviceIdFromCookie(req: Request): string | null {
+  const cookie = req.headers.get("Cookie") || "";
+  const m = cookie.match(/(?:^|;\s*)teran_device_id=([a-f0-9-]{36})/);
+  return m ? m[1] : null;
+}
+
+function setDeviceIdCookie(origin: string, deviceId: string): string {
+  const isSecure = origin.startsWith("https");
+  return `teran_device_id=${deviceId}; HttpOnly; ${isSecure ? "Secure; " : ""}SameSite=Lax; Path=/; Max-Age=31536000`;
 }
 
 function ok(req: Request, env: Env, request_id: string, data: any, status = 200) {
@@ -381,14 +394,26 @@ export default {
       try {
         // /api/identity (POST) -> { user_id, token }
         if (path === "/api/identity" && req.method === "POST") {
-          const user_id = crypto.randomUUID();
+          // Stable device ID: prefer existing cookie, else generate new
+          let device_id = readDeviceIdFromCookie(req);
+          const had_cookie = !!device_id;
+          if (!device_id) device_id = crypto.randomUUID();
+
+          // Use device_id as user_id (stable identity across localStorage clears)
+          const user_id = device_id;
           const now = Math.floor(Date.now() / 1000);
           const token = await jwtSign(env, {
             sub: user_id,
             iat: now,
             exp: now + 60 * 60 * 24 * 365, // 1 year
           });
-          return ok(req, env, request_id, { user_id, token });
+          console.log(`[identity] rid=${request_id} had_cookie=${had_cookie} device_id=${device_id}`);
+
+          const resp = ok(req, env, request_id, { user_id, token });
+          // Always refresh the cookie Max-Age (rolling expiry)
+          const origin = req.headers.get("Origin") || "";
+          resp.headers.append("Set-Cookie", setDeviceIdCookie(origin, device_id));
+          return resp;
         }
 
         // /api/posts (GET) - filter by ?id=, ?user_id=, ?author_id=, ?room_id=, ?limit=, ?actor_id=
