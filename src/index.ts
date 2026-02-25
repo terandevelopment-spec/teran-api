@@ -418,6 +418,8 @@ export default {
           // Always refresh the cookie Max-Age (rolling expiry)
           const origin = req.headers.get("Origin") || "";
           resp.headers.append("Set-Cookie", setDeviceIdCookie(origin, device_id));
+          resp.headers.set("Cache-Control", "no-store");
+          resp.headers.set("Pragma", "no-cache");
           return resp;
         }
 
@@ -454,10 +456,18 @@ export default {
           const cursor = (isReplyQuery || isScopedQuery) ? parseCursor(cursor_param) : null;
           const p1 = performance.now();
 
-          // ── Edge cache: unfiltered feed only (disable for scoped requests) ──
-          const hasNewFilters = !!post_type_param || !!root_only_param || !!parent_post_id_param || !!room_scope_param || !!mode_param || !!mood_param || !!q_param;
-          // Feed cache: only for non-reply, non-cursored feed queries
-          const isFeed = !id_param && !user_id_param && !author_id_param && !isReplyQuery && !cursor && !room_id_param && !hasNewFilters;
+          // ── Edge cache: eligible for public, non-personalized feeds ──
+          // Allow the standard scoped main feed (post_type=status, root_only, room_scope=global)
+          // as well as the legacy unfiltered feed.
+          const hasPersonalizedFilters = !!mode_param || !!mood_param || !!q_param;
+          const isStandardScopedFeed = (
+            post_type_param === "status" &&
+            (root_only_param === "1" || root_only_param === "true") &&
+            room_scope_param === "global" &&
+            !hasPersonalizedFilters
+          );
+          // Feed cache: non-reply, non-cursored, non-user-specific queries
+          const isFeed = !id_param && !user_id_param && !author_id_param && !isReplyQuery && !cursor && !room_id_param && (!hasPersonalizedFilters) && (!parent_post_id_param) && (isStandardScopedFeed || (!post_type_param && !root_only_param && !room_scope_param));
           let feedCacheKey: Request | null = null;
           const cache = caches.default;
 
@@ -465,6 +475,10 @@ export default {
             const cacheUrl = new URL("https://cache.internal/posts/feed");
             cacheUrl.searchParams.set("limit", limit_param || "50");
             if (actor_id_param) cacheUrl.searchParams.set("actor", actor_id_param);
+            // Include scope params in cache key so scoped vs unscoped don't collide
+            if (post_type_param) cacheUrl.searchParams.set("pt", post_type_param);
+            if (root_only_param) cacheUrl.searchParams.set("ro", root_only_param);
+            if (room_scope_param) cacheUrl.searchParams.set("rs", room_scope_param);
             feedCacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
             const cacheT0 = performance.now();
@@ -481,6 +495,7 @@ export default {
                   "Content-Type": "application/json",
                   "X-Request-Id": request_id,
                   "X-Cache": "HIT",
+                  "Cache-Control": `public, max-age=0, s-maxage=${FEED_CACHE_TTL}, stale-while-revalidate=30`,
                   ...corsHeaders(req, env),
                 },
               });
