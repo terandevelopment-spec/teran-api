@@ -14,3 +14,7 @@ ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS like_visible      boolean;
 -- Header typography
 ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS header_font_size   text;
 ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS header_font_family text;
+
+-- Room content type
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS room_type          text DEFAULT 'post';
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS thread_card_style  text;

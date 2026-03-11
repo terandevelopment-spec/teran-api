@@ -4828,7 +4828,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family");
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style");
 
           if (owner_id_param) {
             // Support "me" alias: resolve to the authenticated caller's user_id
@@ -5025,6 +5025,12 @@ export default {
           const header_font_size = typeof design.headerFontSize === "string" ? design.headerFontSize.slice(0, 10) : null;
           const header_font_family = typeof design.headerFontFamily === "string" ? design.headerFontFamily.slice(0, 60) : null;
 
+          // ── Room content type (top-level, not inside design) ──
+          const VALID_ROOM_TYPES = ["post", "thread"];
+          const VALID_CARD_STYLES = ["standard", "teran"];
+          const room_type = typeof body?.room_type === "string" && VALID_ROOM_TYPES.includes(body.room_type) ? body.room_type : "post";
+          const thread_card_style = typeof body?.thread_card_style === "string" && VALID_CARD_STYLES.includes(body.thread_card_style) ? body.thread_card_style : null;
+
           const tValidate = performance.now();
 
           // Generate random room_key (16 hex chars)
@@ -5046,6 +5052,8 @@ export default {
           if (like_visible !== null) insertObj.like_visible = like_visible;
           if (header_font_size !== null) insertObj.header_font_size = header_font_size;
           if (header_font_family !== null) insertObj.header_font_family = header_font_family;
+          insertObj.room_type = room_type;
+          if (thread_card_style !== null) insertObj.thread_card_style = thread_card_style;
 
           const { data: room, error } = await sb(env)
             .from("rooms")
@@ -5171,6 +5179,14 @@ export default {
               updates.header_font_size = (design.headerFontSize ?? design.header_font_size).slice(0, 10);
             if (typeof design?.headerFontFamily === "string" || typeof design?.header_font_family === "string")
               updates.header_font_family = (design.headerFontFamily ?? design.header_font_family).slice(0, 60);
+
+            // ── Room content type (top-level fields) ──
+            const VALID_ROOM_TYPES = ["post", "thread"];
+            const VALID_CARD_STYLES = ["standard", "teran"];
+            if (typeof body?.room_type === "string" && VALID_ROOM_TYPES.includes(body.room_type))
+              updates.room_type = body.room_type;
+            if (typeof body?.thread_card_style === "string" && VALID_CARD_STYLES.includes(body.thread_card_style))
+              updates.thread_card_style = body.thread_card_style;
 
             if (Object.keys(updates).length === 0) {
               throw new HttpError(422, "VALIDATION_ERROR", "No fields to update");
