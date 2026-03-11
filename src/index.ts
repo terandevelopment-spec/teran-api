@@ -4828,7 +4828,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible");
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family");
 
           if (owner_id_param) {
             // Support "me" alias: resolve to the authenticated caller's user_id
@@ -5022,6 +5022,8 @@ export default {
           const card_bg_color = typeof design.cardBgColor === "string" ? design.cardBgColor.slice(0, 20) : null;
           const card_text_color = typeof design.cardTextColor === "string" ? design.cardTextColor.slice(0, 20) : null;
           const like_visible = typeof design.likeVisible === "boolean" ? design.likeVisible : null;
+          const header_font_size = typeof design.headerFontSize === "string" ? design.headerFontSize.slice(0, 10) : null;
+          const header_font_family = typeof design.headerFontFamily === "string" ? design.headerFontFamily.slice(0, 60) : null;
 
           const tValidate = performance.now();
 
@@ -5042,6 +5044,8 @@ export default {
           if (card_bg_color !== null) insertObj.card_bg_color = card_bg_color;
           if (card_text_color !== null) insertObj.card_text_color = card_text_color;
           if (like_visible !== null) insertObj.like_visible = like_visible;
+          if (header_font_size !== null) insertObj.header_font_size = header_font_size;
+          if (header_font_family !== null) insertObj.header_font_family = header_font_family;
 
           const { data: room, error } = await sb(env)
             .from("rooms")
@@ -5163,6 +5167,10 @@ export default {
               updates.card_text_color = (design.cardTextColor ?? design.card_text_color).slice(0, 20);
             if (typeof design?.likeVisible === "boolean" || typeof design?.like_visible === "boolean")
               updates.like_visible = design.likeVisible ?? design.like_visible;
+            if (typeof design?.headerFontSize === "string" || typeof design?.header_font_size === "string")
+              updates.header_font_size = (design.headerFontSize ?? design.header_font_size).slice(0, 10);
+            if (typeof design?.headerFontFamily === "string" || typeof design?.header_font_family === "string")
+              updates.header_font_family = (design.headerFontFamily ?? design.header_font_family).slice(0, 60);
 
             if (Object.keys(updates).length === 0) {
               throw new HttpError(422, "VALIDATION_ERROR", "No fields to update");
