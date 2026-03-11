@@ -4828,7 +4828,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at");
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible");
 
           if (owner_id_param) {
             // Support "me" alias: resolve to the authenticated caller's user_id
@@ -5014,6 +5014,15 @@ export default {
             }
             category = rawCategory;
           }
+          // ── Design fields (optional, from Step 2) ──
+          const design = (body?.design && typeof body.design === "object") ? body.design : {};
+          const header_bg_color = typeof design.headerBgColor === "string" ? design.headerBgColor.slice(0, 20) : null;
+          const header_text_color = typeof design.headerTextColor === "string" ? design.headerTextColor.slice(0, 20) : null;
+          const room_bg_color = typeof design.roomBgColor === "string" ? design.roomBgColor.slice(0, 20) : null;
+          const card_bg_color = typeof design.cardBgColor === "string" ? design.cardBgColor.slice(0, 20) : null;
+          const card_text_color = typeof design.cardTextColor === "string" ? design.cardTextColor.slice(0, 20) : null;
+          const like_visible = typeof design.likeVisible === "boolean" ? design.likeVisible : null;
+
           const tValidate = performance.now();
 
           // Generate random room_key (16 hex chars)
@@ -5021,13 +5030,22 @@ export default {
           const tKeygen = performance.now();
 
           const tDbInsertRoom = performance.now();
+          const insertObj: Record<string, any> = {
+            name, description, icon_key, category, room_key,
+            owner_id: user_id,
+            visibility, read_policy: "public", post_policy: "public",
+          };
+          // Only include design fields if they were provided
+          if (header_bg_color !== null) insertObj.header_bg_color = header_bg_color;
+          if (header_text_color !== null) insertObj.header_text_color = header_text_color;
+          if (room_bg_color !== null) insertObj.room_bg_color = room_bg_color;
+          if (card_bg_color !== null) insertObj.card_bg_color = card_bg_color;
+          if (card_text_color !== null) insertObj.card_text_color = card_text_color;
+          if (like_visible !== null) insertObj.like_visible = like_visible;
+
           const { data: room, error } = await sb(env)
             .from("rooms")
-            .insert({
-              name, description, icon_key, category, room_key,
-              owner_id: user_id,
-              visibility, read_policy: "public", post_policy: "public",
-            })
+            .insert(insertObj)
             .select()
             .single();
           const dbInsertRoomMs = performance.now() - tDbInsertRoom;
@@ -5130,6 +5148,21 @@ export default {
               }
               updates.category = cat;
             }
+
+            // ── Design fields ──
+            const design = (body?.design && typeof body.design === "object") ? body.design : body;
+            if (typeof design?.headerBgColor === "string" || typeof design?.header_bg_color === "string")
+              updates.header_bg_color = (design.headerBgColor ?? design.header_bg_color).slice(0, 20);
+            if (typeof design?.headerTextColor === "string" || typeof design?.header_text_color === "string")
+              updates.header_text_color = (design.headerTextColor ?? design.header_text_color).slice(0, 20);
+            if (typeof design?.roomBgColor === "string" || typeof design?.room_bg_color === "string")
+              updates.room_bg_color = (design.roomBgColor ?? design.room_bg_color).slice(0, 20);
+            if (typeof design?.cardBgColor === "string" || typeof design?.card_bg_color === "string")
+              updates.card_bg_color = (design.cardBgColor ?? design.card_bg_color).slice(0, 20);
+            if (typeof design?.cardTextColor === "string" || typeof design?.card_text_color === "string")
+              updates.card_text_color = (design.cardTextColor ?? design.card_text_color).slice(0, 20);
+            if (typeof design?.likeVisible === "boolean" || typeof design?.like_visible === "boolean")
+              updates.like_visible = design.likeVisible ?? design.like_visible;
 
             if (Object.keys(updates).length === 0) {
               throw new HttpError(422, "VALIDATION_ERROR", "No fields to update");
