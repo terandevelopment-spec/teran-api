@@ -4828,7 +4828,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color");
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons");
 
           if (owner_id_param) {
             // Support "me" alias: resolve to the authenticated caller's user_id
@@ -5035,6 +5035,8 @@ export default {
           const detail_comment_input_bg_color = typeof design.detailCommentInputBgColor === "string" ? design.detailCommentInputBgColor.slice(0, 20) : null;
           const detail_comment_input_text_color = typeof design.detailCommentInputTextColor === "string" ? design.detailCommentInputTextColor.slice(0, 20) : null;
           const detail_comment_bar_bg_color = typeof design.detailCommentBarBgColor === "string" ? design.detailCommentBarBgColor.slice(0, 20) : null;
+          const detail_show_icons = typeof design.detailShowIcons === "boolean" ? design.detailShowIcons : null;
+          const list_show_icons = typeof design.listShowIcons === "boolean" ? design.listShowIcons : null;
 
           // ── Room content type (top-level, not inside design) ──
           const VALID_ROOM_TYPES = ["post", "thread"];
@@ -5072,6 +5074,8 @@ export default {
           if (detail_comment_input_bg_color !== null) insertObj.detail_comment_input_bg_color = detail_comment_input_bg_color;
           if (detail_comment_input_text_color !== null) insertObj.detail_comment_input_text_color = detail_comment_input_text_color;
           if (detail_comment_bar_bg_color !== null) insertObj.detail_comment_bar_bg_color = detail_comment_bar_bg_color;
+          if (detail_show_icons !== null) insertObj.detail_show_icons = detail_show_icons;
+          if (list_show_icons !== null) insertObj.list_show_icons = list_show_icons;
           insertObj.room_type = room_type;
           if (thread_card_style !== null) insertObj.thread_card_style = thread_card_style;
 
@@ -5219,6 +5223,10 @@ export default {
               updates.detail_comment_input_text_color = (design.detailCommentInputTextColor ?? design.detail_comment_input_text_color).slice(0, 20);
             if (typeof design?.detailCommentBarBgColor === "string" || typeof design?.detail_comment_bar_bg_color === "string")
               updates.detail_comment_bar_bg_color = (design.detailCommentBarBgColor ?? design.detail_comment_bar_bg_color).slice(0, 20);
+            if (typeof design?.detailShowIcons === "boolean" || typeof design?.detail_show_icons === "boolean")
+              updates.detail_show_icons = design.detailShowIcons ?? design.detail_show_icons;
+            if (typeof design?.listShowIcons === "boolean" || typeof design?.list_show_icons === "boolean")
+              updates.list_show_icons = design.listShowIcons ?? design.list_show_icons;
 
             // ── Room content type (top-level fields) ──
             const VALID_ROOM_TYPES = ["post", "thread"];

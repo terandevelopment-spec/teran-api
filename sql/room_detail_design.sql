@@ -13,3 +13,9 @@ ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS detail_accent_color       text
 ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS detail_comment_input_bg_color   text;
 ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS detail_comment_input_text_color text;
 ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS detail_comment_bar_bg_color     text;
+
+-- Avatar/icon visibility toggle for inside-thread pages
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS detail_show_icons boolean DEFAULT true;
+
+-- Avatar/icon visibility toggle for thread list/feed
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS list_show_icons boolean DEFAULT true;
