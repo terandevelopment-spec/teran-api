@@ -26,3 +26,6 @@ ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS detail_icon_shape text DEFAULT
 
 -- Custom header background image (R2 key)
 ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS header_bg_image_key text;
+
+-- Header text visibility toggle
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS header_text_enabled boolean DEFAULT true;

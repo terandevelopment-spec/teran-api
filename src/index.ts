@@ -4828,7 +4828,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key");
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled");
 
           if (owner_id_param) {
             // Support "me" alias: resolve to the authenticated caller's user_id
@@ -5041,6 +5041,7 @@ export default {
           const list_icon_shape = typeof design.listIconShape === "string" && VALID_ICON_SHAPES.includes(design.listIconShape) ? design.listIconShape : null;
           const detail_icon_shape = typeof design.detailIconShape === "string" && VALID_ICON_SHAPES.includes(design.detailIconShape) ? design.detailIconShape : null;
           const header_bg_image_key = typeof design.headerBgImageKey === "string" && design.headerBgImageKey.length > 0 && design.headerBgImageKey.length <= 300 ? design.headerBgImageKey : null;
+          const header_text_enabled = typeof design.headerTextEnabled === "boolean" ? design.headerTextEnabled : null;
 
           // ── Room content type (top-level, not inside design) ──
           const VALID_ROOM_TYPES = ["post", "thread"];
@@ -5083,6 +5084,7 @@ export default {
           if (list_icon_shape !== null) insertObj.list_icon_shape = list_icon_shape;
           if (detail_icon_shape !== null) insertObj.detail_icon_shape = detail_icon_shape;
           if (header_bg_image_key !== null) insertObj.header_bg_image_key = header_bg_image_key;
+          if (header_text_enabled !== null) insertObj.header_text_enabled = header_text_enabled;
           insertObj.room_type = room_type;
           if (thread_card_style !== null) insertObj.thread_card_style = thread_card_style;
 
@@ -5250,6 +5252,9 @@ export default {
               updates.header_bg_image_key = design.header_bg_image_key.length > 0 && design.header_bg_image_key.length <= 300 ? design.header_bg_image_key : null;
             else if (design?.headerBgImageKey === null || design?.header_bg_image_key === null)
               updates.header_bg_image_key = null;
+            // Header text visibility toggle
+            if (typeof design?.headerTextEnabled === "boolean" || typeof design?.header_text_enabled === "boolean")
+              updates.header_text_enabled = design.headerTextEnabled ?? design.header_text_enabled;
 
             // ── Room content type (top-level fields) ──
             const VALID_ROOM_TYPES = ["post", "thread"];
