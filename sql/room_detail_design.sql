@@ -29,3 +29,6 @@ ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS header_bg_image_key text;
 
 -- Header text visibility toggle
 ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS header_text_enabled boolean DEFAULT true;
+
+-- Header area height preset (small / medium / large)
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS header_height text DEFAULT 'medium';
