@@ -4828,7 +4828,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity");
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled");
 
           if (owner_id_param) {
             // Support "me" alias: resolve to the authenticated caller's user_id
@@ -5048,6 +5048,7 @@ export default {
           const room_bg_image_opacity = room_bg_image_key && typeof design.roomBgImageOpacity === "number" && design.roomBgImageOpacity >= 0 && design.roomBgImageOpacity <= 1 ? design.roomBgImageOpacity : null;
           const card_bg_image_key = typeof design.cardBgImageKey === "string" && design.cardBgImageKey.length > 0 && design.cardBgImageKey.length <= 300 ? design.cardBgImageKey : null;
           const card_bg_image_opacity = card_bg_image_key && typeof design.cardBgImageOpacity === "number" && design.cardBgImageOpacity >= 0 && design.cardBgImageOpacity <= 1 ? design.cardBgImageOpacity : null;
+          const card_glass_enabled = typeof design.cardGlassEnabled === "boolean" ? design.cardGlassEnabled : null;
 
           // ── Room content type (top-level, not inside design) ──
           const VALID_ROOM_TYPES = ["post", "thread"];
@@ -5096,6 +5097,7 @@ export default {
           if (room_bg_image_opacity !== null) insertObj.room_bg_image_opacity = room_bg_image_opacity;
           if (card_bg_image_key !== null) insertObj.card_bg_image_key = card_bg_image_key;
           if (card_bg_image_opacity !== null) insertObj.card_bg_image_opacity = card_bg_image_opacity;
+          if (card_glass_enabled !== null) insertObj.card_glass_enabled = card_glass_enabled;
           insertObj.room_type = room_type;
           if (thread_card_style !== null) insertObj.thread_card_style = thread_card_style;
 
@@ -5296,6 +5298,11 @@ export default {
               updates.card_bg_image_opacity = design.cardBgImageOpacity;
             else if (updates.card_bg_image_key && typeof design?.card_bg_image_opacity === "number" && design.card_bg_image_opacity >= 0 && design.card_bg_image_opacity <= 1)
               updates.card_bg_image_opacity = design.card_bg_image_opacity;
+            // Card glass mode
+            if (typeof design?.cardGlassEnabled === "boolean")
+              updates.card_glass_enabled = design.cardGlassEnabled;
+            else if (typeof design?.card_glass_enabled === "boolean")
+              updates.card_glass_enabled = design.card_glass_enabled;
 
             // ── Room content type (top-level fields) ──
             const VALID_ROOM_TYPES = ["post", "thread"];
