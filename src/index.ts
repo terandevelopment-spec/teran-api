@@ -5045,9 +5045,9 @@ export default {
           const VALID_HEADER_HEIGHTS = ["small", "medium", "large"];
           const header_height = typeof design.headerHeight === "string" && VALID_HEADER_HEIGHTS.includes(design.headerHeight) ? design.headerHeight : null;
           const room_bg_image_key = typeof design.roomBgImageKey === "string" && design.roomBgImageKey.length > 0 && design.roomBgImageKey.length <= 300 ? design.roomBgImageKey : null;
-          const room_bg_image_opacity = typeof design.roomBgImageOpacity === "number" && design.roomBgImageOpacity >= 0 && design.roomBgImageOpacity <= 1 ? design.roomBgImageOpacity : null;
+          const room_bg_image_opacity = room_bg_image_key && typeof design.roomBgImageOpacity === "number" && design.roomBgImageOpacity >= 0 && design.roomBgImageOpacity <= 1 ? design.roomBgImageOpacity : null;
           const card_bg_image_key = typeof design.cardBgImageKey === "string" && design.cardBgImageKey.length > 0 && design.cardBgImageKey.length <= 300 ? design.cardBgImageKey : null;
-          const card_bg_image_opacity = typeof design.cardBgImageOpacity === "number" && design.cardBgImageOpacity >= 0 && design.cardBgImageOpacity <= 1 ? design.cardBgImageOpacity : null;
+          const card_bg_image_opacity = card_bg_image_key && typeof design.cardBgImageOpacity === "number" && design.cardBgImageOpacity >= 0 && design.cardBgImageOpacity <= 1 ? design.cardBgImageOpacity : null;
 
           // ── Room content type (top-level, not inside design) ──
           const VALID_ROOM_TYPES = ["post", "thread"];
@@ -5279,10 +5279,10 @@ export default {
               updates.room_bg_image_key = design.room_bg_image_key;
             else if (design?.roomBgImageKey === null || design?.room_bg_image_key === null)
               updates.room_bg_image_key = null;
-            // Room background image opacity
-            if (typeof design?.roomBgImageOpacity === "number" && design.roomBgImageOpacity >= 0 && design.roomBgImageOpacity <= 1)
+            // Room background image opacity (only when image key is being set)
+            if (updates.room_bg_image_key && typeof design?.roomBgImageOpacity === "number" && design.roomBgImageOpacity >= 0 && design.roomBgImageOpacity <= 1)
               updates.room_bg_image_opacity = design.roomBgImageOpacity;
-            else if (typeof design?.room_bg_image_opacity === "number" && design.room_bg_image_opacity >= 0 && design.room_bg_image_opacity <= 1)
+            else if (updates.room_bg_image_key && typeof design?.room_bg_image_opacity === "number" && design.room_bg_image_opacity >= 0 && design.room_bg_image_opacity <= 1)
               updates.room_bg_image_opacity = design.room_bg_image_opacity;
             // Card background image
             if (typeof design?.cardBgImageKey === "string" && design.cardBgImageKey.length > 0 && design.cardBgImageKey.length <= 300)
@@ -5291,10 +5291,10 @@ export default {
               updates.card_bg_image_key = design.card_bg_image_key;
             else if (design?.cardBgImageKey === null || design?.card_bg_image_key === null)
               updates.card_bg_image_key = null;
-            // Card background image opacity
-            if (typeof design?.cardBgImageOpacity === "number" && design.cardBgImageOpacity >= 0 && design.cardBgImageOpacity <= 1)
+            // Card background image opacity (only when image key is being set)
+            if (updates.card_bg_image_key && typeof design?.cardBgImageOpacity === "number" && design.cardBgImageOpacity >= 0 && design.cardBgImageOpacity <= 1)
               updates.card_bg_image_opacity = design.cardBgImageOpacity;
-            else if (typeof design?.card_bg_image_opacity === "number" && design.card_bg_image_opacity >= 0 && design.card_bg_image_opacity <= 1)
+            else if (updates.card_bg_image_key && typeof design?.card_bg_image_opacity === "number" && design.card_bg_image_opacity >= 0 && design.card_bg_image_opacity <= 1)
               updates.card_bg_image_opacity = design.card_bg_image_opacity;
 
             // ── Room content type (top-level fields) ──
