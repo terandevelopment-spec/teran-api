@@ -19,3 +19,10 @@ ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS detail_show_icons boolean DEFA
 
 -- Avatar/icon visibility toggle for thread list/feed
 ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS list_show_icons boolean DEFAULT true;
+
+-- Avatar/icon shape customisation (per layer)
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS list_icon_shape text DEFAULT 'circle';
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS detail_icon_shape text DEFAULT 'circle';
+
+-- Custom header background image (R2 key)
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS header_bg_image_key text;

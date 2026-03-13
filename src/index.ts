@@ -4828,7 +4828,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons");
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key");
 
           if (owner_id_param) {
             // Support "me" alias: resolve to the authenticated caller's user_id
@@ -5037,6 +5037,10 @@ export default {
           const detail_comment_bar_bg_color = typeof design.detailCommentBarBgColor === "string" ? design.detailCommentBarBgColor.slice(0, 20) : null;
           const detail_show_icons = typeof design.detailShowIcons === "boolean" ? design.detailShowIcons : null;
           const list_show_icons = typeof design.listShowIcons === "boolean" ? design.listShowIcons : null;
+          const VALID_ICON_SHAPES = ["circle", "roundedSquare", "square", "hexagon", "squircle"];
+          const list_icon_shape = typeof design.listIconShape === "string" && VALID_ICON_SHAPES.includes(design.listIconShape) ? design.listIconShape : null;
+          const detail_icon_shape = typeof design.detailIconShape === "string" && VALID_ICON_SHAPES.includes(design.detailIconShape) ? design.detailIconShape : null;
+          const header_bg_image_key = typeof design.headerBgImageKey === "string" && design.headerBgImageKey.length > 0 && design.headerBgImageKey.length <= 300 ? design.headerBgImageKey : null;
 
           // ── Room content type (top-level, not inside design) ──
           const VALID_ROOM_TYPES = ["post", "thread"];
@@ -5076,6 +5080,9 @@ export default {
           if (detail_comment_bar_bg_color !== null) insertObj.detail_comment_bar_bg_color = detail_comment_bar_bg_color;
           if (detail_show_icons !== null) insertObj.detail_show_icons = detail_show_icons;
           if (list_show_icons !== null) insertObj.list_show_icons = list_show_icons;
+          if (list_icon_shape !== null) insertObj.list_icon_shape = list_icon_shape;
+          if (detail_icon_shape !== null) insertObj.detail_icon_shape = detail_icon_shape;
+          if (header_bg_image_key !== null) insertObj.header_bg_image_key = header_bg_image_key;
           insertObj.room_type = room_type;
           if (thread_card_style !== null) insertObj.thread_card_style = thread_card_style;
 
@@ -5227,6 +5234,22 @@ export default {
               updates.detail_show_icons = design.detailShowIcons ?? design.detail_show_icons;
             if (typeof design?.listShowIcons === "boolean" || typeof design?.list_show_icons === "boolean")
               updates.list_show_icons = design.listShowIcons ?? design.list_show_icons;
+            const VALID_ICON_SHAPES = ["circle", "roundedSquare", "square", "hexagon", "squircle"];
+            if (typeof design?.listIconShape === "string" && VALID_ICON_SHAPES.includes(design.listIconShape))
+              updates.list_icon_shape = design.listIconShape;
+            else if (typeof design?.list_icon_shape === "string" && VALID_ICON_SHAPES.includes(design.list_icon_shape))
+              updates.list_icon_shape = design.list_icon_shape;
+            if (typeof design?.detailIconShape === "string" && VALID_ICON_SHAPES.includes(design.detailIconShape))
+              updates.detail_icon_shape = design.detailIconShape;
+            else if (typeof design?.detail_icon_shape === "string" && VALID_ICON_SHAPES.includes(design.detail_icon_shape))
+              updates.detail_icon_shape = design.detail_icon_shape;
+            // Header background image key (string or null to clear)
+            if (typeof design?.headerBgImageKey === "string")
+              updates.header_bg_image_key = design.headerBgImageKey.length > 0 && design.headerBgImageKey.length <= 300 ? design.headerBgImageKey : null;
+            else if (typeof design?.header_bg_image_key === "string")
+              updates.header_bg_image_key = design.header_bg_image_key.length > 0 && design.header_bg_image_key.length <= 300 ? design.header_bg_image_key : null;
+            else if (design?.headerBgImageKey === null || design?.header_bg_image_key === null)
+              updates.header_bg_image_key = null;
 
             // ── Room content type (top-level fields) ──
             const VALID_ROOM_TYPES = ["post", "thread"];
