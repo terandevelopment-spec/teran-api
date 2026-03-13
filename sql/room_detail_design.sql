@@ -32,3 +32,7 @@ ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS header_text_enabled boolean DE
 
 -- Header area height preset (small / medium / large)
 ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS header_height text DEFAULT 'medium';
+
+-- Room background image (R2 key) and opacity for the image layer
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS room_bg_image_key text;
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS room_bg_image_opacity real DEFAULT 1.0;
