@@ -36,3 +36,7 @@ ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS header_height text DEFAULT 'me
 -- Room background image (R2 key) and opacity for the image layer
 ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS room_bg_image_key text;
 ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS room_bg_image_opacity real DEFAULT 1.0;
+
+-- Card background image (R2 key) and opacity for the image layer
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS card_bg_image_key text;
+ALTER TABLE public.rooms ADD COLUMN IF NOT EXISTS card_bg_image_opacity real DEFAULT 1.0;

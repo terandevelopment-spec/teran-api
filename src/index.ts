@@ -4828,7 +4828,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,room_bg_image_key,room_bg_image_opacity");
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity");
 
           if (owner_id_param) {
             // Support "me" alias: resolve to the authenticated caller's user_id
@@ -5046,6 +5046,8 @@ export default {
           const header_height = typeof design.headerHeight === "string" && VALID_HEADER_HEIGHTS.includes(design.headerHeight) ? design.headerHeight : null;
           const room_bg_image_key = typeof design.roomBgImageKey === "string" && design.roomBgImageKey.length > 0 && design.roomBgImageKey.length <= 300 ? design.roomBgImageKey : null;
           const room_bg_image_opacity = typeof design.roomBgImageOpacity === "number" && design.roomBgImageOpacity >= 0 && design.roomBgImageOpacity <= 1 ? design.roomBgImageOpacity : null;
+          const card_bg_image_key = typeof design.cardBgImageKey === "string" && design.cardBgImageKey.length > 0 && design.cardBgImageKey.length <= 300 ? design.cardBgImageKey : null;
+          const card_bg_image_opacity = typeof design.cardBgImageOpacity === "number" && design.cardBgImageOpacity >= 0 && design.cardBgImageOpacity <= 1 ? design.cardBgImageOpacity : null;
 
           // ── Room content type (top-level, not inside design) ──
           const VALID_ROOM_TYPES = ["post", "thread"];
@@ -5092,6 +5094,8 @@ export default {
           if (header_height !== null) insertObj.header_height = header_height;
           if (room_bg_image_key !== null) insertObj.room_bg_image_key = room_bg_image_key;
           if (room_bg_image_opacity !== null) insertObj.room_bg_image_opacity = room_bg_image_opacity;
+          if (card_bg_image_key !== null) insertObj.card_bg_image_key = card_bg_image_key;
+          if (card_bg_image_opacity !== null) insertObj.card_bg_image_opacity = card_bg_image_opacity;
           insertObj.room_type = room_type;
           if (thread_card_style !== null) insertObj.thread_card_style = thread_card_style;
 
@@ -5280,6 +5284,18 @@ export default {
               updates.room_bg_image_opacity = design.roomBgImageOpacity;
             else if (typeof design?.room_bg_image_opacity === "number" && design.room_bg_image_opacity >= 0 && design.room_bg_image_opacity <= 1)
               updates.room_bg_image_opacity = design.room_bg_image_opacity;
+            // Card background image
+            if (typeof design?.cardBgImageKey === "string" && design.cardBgImageKey.length > 0 && design.cardBgImageKey.length <= 300)
+              updates.card_bg_image_key = design.cardBgImageKey;
+            else if (typeof design?.card_bg_image_key === "string" && design.card_bg_image_key.length > 0)
+              updates.card_bg_image_key = design.card_bg_image_key;
+            else if (design?.cardBgImageKey === null || design?.card_bg_image_key === null)
+              updates.card_bg_image_key = null;
+            // Card background image opacity
+            if (typeof design?.cardBgImageOpacity === "number" && design.cardBgImageOpacity >= 0 && design.cardBgImageOpacity <= 1)
+              updates.card_bg_image_opacity = design.cardBgImageOpacity;
+            else if (typeof design?.card_bg_image_opacity === "number" && design.card_bg_image_opacity >= 0 && design.card_bg_image_opacity <= 1)
+              updates.card_bg_image_opacity = design.card_bg_image_opacity;
 
             // ── Room content type (top-level fields) ──
             const VALID_ROOM_TYPES = ["post", "thread"];
