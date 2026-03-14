@@ -4828,7 +4828,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style");
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style");
 
           if (owner_id_param) {
             // Support "me" alias: resolve to the authenticated caller's user_id
@@ -5052,6 +5052,26 @@ export default {
           const VALID_GLASS_STYLES = ["frosted", "clear", "tinted"];
           const card_glass_style = typeof design.cardGlassStyle === "string" && VALID_GLASS_STYLES.includes(design.cardGlassStyle) ? design.cardGlassStyle : null;
 
+          // ── Step 3 detail image + glass fields ──
+          const detail_bg_image_key = typeof design.detailBgImageKey === "string" && design.detailBgImageKey.length > 0 && design.detailBgImageKey.length <= 300 ? design.detailBgImageKey : null;
+          const detail_bg_image_opacity = detail_bg_image_key && typeof design.detailBgImageOpacity === "number" && design.detailBgImageOpacity >= 0 && design.detailBgImageOpacity <= 1 ? design.detailBgImageOpacity : null;
+          const detail_card_bg_image_key = typeof design.detailCardBgImageKey === "string" && design.detailCardBgImageKey.length > 0 && design.detailCardBgImageKey.length <= 300 ? design.detailCardBgImageKey : null;
+          const detail_card_bg_image_opacity = detail_card_bg_image_key && typeof design.detailCardBgImageOpacity === "number" && design.detailCardBgImageOpacity >= 0 && design.detailCardBgImageOpacity <= 1 ? design.detailCardBgImageOpacity : null;
+          const detail_card_glass_enabled = typeof design.detailCardGlassEnabled === "boolean" ? design.detailCardGlassEnabled : null;
+          const detail_card_glass_style = typeof design.detailCardGlassStyle === "string" && VALID_GLASS_STYLES.includes(design.detailCardGlassStyle) ? design.detailCardGlassStyle : null;
+          const detail_comment_bg_image_key = typeof design.detailCommentBgImageKey === "string" && design.detailCommentBgImageKey.length > 0 && design.detailCommentBgImageKey.length <= 300 ? design.detailCommentBgImageKey : null;
+          const detail_comment_bg_image_opacity = detail_comment_bg_image_key && typeof design.detailCommentBgImageOpacity === "number" && design.detailCommentBgImageOpacity >= 0 && design.detailCommentBgImageOpacity <= 1 ? design.detailCommentBgImageOpacity : null;
+          const detail_comment_glass_enabled = typeof design.detailCommentGlassEnabled === "boolean" ? design.detailCommentGlassEnabled : null;
+          const detail_comment_glass_style = typeof design.detailCommentGlassStyle === "string" && VALID_GLASS_STYLES.includes(design.detailCommentGlassStyle) ? design.detailCommentGlassStyle : null;
+          const detail_comment_input_bg_image_key = typeof design.detailCommentInputBgImageKey === "string" && design.detailCommentInputBgImageKey.length > 0 && design.detailCommentInputBgImageKey.length <= 300 ? design.detailCommentInputBgImageKey : null;
+          const detail_comment_input_bg_image_opacity = detail_comment_input_bg_image_key && typeof design.detailCommentInputBgImageOpacity === "number" && design.detailCommentInputBgImageOpacity >= 0 && design.detailCommentInputBgImageOpacity <= 1 ? design.detailCommentInputBgImageOpacity : null;
+          const detail_comment_input_glass_enabled = typeof design.detailCommentInputGlassEnabled === "boolean" ? design.detailCommentInputGlassEnabled : null;
+          const detail_comment_input_glass_style = typeof design.detailCommentInputGlassStyle === "string" && VALID_GLASS_STYLES.includes(design.detailCommentInputGlassStyle) ? design.detailCommentInputGlassStyle : null;
+          const detail_comment_bar_bg_image_key = typeof design.detailCommentBarBgImageKey === "string" && design.detailCommentBarBgImageKey.length > 0 && design.detailCommentBarBgImageKey.length <= 300 ? design.detailCommentBarBgImageKey : null;
+          const detail_comment_bar_bg_image_opacity = detail_comment_bar_bg_image_key && typeof design.detailCommentBarBgImageOpacity === "number" && design.detailCommentBarBgImageOpacity >= 0 && design.detailCommentBarBgImageOpacity <= 1 ? design.detailCommentBarBgImageOpacity : null;
+          const detail_comment_bar_glass_enabled = typeof design.detailCommentBarGlassEnabled === "boolean" ? design.detailCommentBarGlassEnabled : null;
+          const detail_comment_bar_glass_style = typeof design.detailCommentBarGlassStyle === "string" && VALID_GLASS_STYLES.includes(design.detailCommentBarGlassStyle) ? design.detailCommentBarGlassStyle : null;
+
           // ── Room content type (top-level, not inside design) ──
           const VALID_ROOM_TYPES = ["post", "thread"];
           const VALID_CARD_STYLES = ["standard", "teran"];
@@ -5101,6 +5121,24 @@ export default {
           if (card_bg_image_opacity !== null) insertObj.card_bg_image_opacity = card_bg_image_opacity;
           if (card_glass_enabled !== null) insertObj.card_glass_enabled = card_glass_enabled;
           if (card_glass_style !== null) insertObj.card_glass_style = card_glass_style;
+          if (detail_bg_image_key !== null) insertObj.detail_bg_image_key = detail_bg_image_key;
+          if (detail_bg_image_opacity !== null) insertObj.detail_bg_image_opacity = detail_bg_image_opacity;
+          if (detail_card_bg_image_key !== null) insertObj.detail_card_bg_image_key = detail_card_bg_image_key;
+          if (detail_card_bg_image_opacity !== null) insertObj.detail_card_bg_image_opacity = detail_card_bg_image_opacity;
+          if (detail_card_glass_enabled !== null) insertObj.detail_card_glass_enabled = detail_card_glass_enabled;
+          if (detail_card_glass_style !== null) insertObj.detail_card_glass_style = detail_card_glass_style;
+          if (detail_comment_bg_image_key !== null) insertObj.detail_comment_bg_image_key = detail_comment_bg_image_key;
+          if (detail_comment_bg_image_opacity !== null) insertObj.detail_comment_bg_image_opacity = detail_comment_bg_image_opacity;
+          if (detail_comment_glass_enabled !== null) insertObj.detail_comment_glass_enabled = detail_comment_glass_enabled;
+          if (detail_comment_glass_style !== null) insertObj.detail_comment_glass_style = detail_comment_glass_style;
+          if (detail_comment_input_bg_image_key !== null) insertObj.detail_comment_input_bg_image_key = detail_comment_input_bg_image_key;
+          if (detail_comment_input_bg_image_opacity !== null) insertObj.detail_comment_input_bg_image_opacity = detail_comment_input_bg_image_opacity;
+          if (detail_comment_input_glass_enabled !== null) insertObj.detail_comment_input_glass_enabled = detail_comment_input_glass_enabled;
+          if (detail_comment_input_glass_style !== null) insertObj.detail_comment_input_glass_style = detail_comment_input_glass_style;
+          if (detail_comment_bar_bg_image_key !== null) insertObj.detail_comment_bar_bg_image_key = detail_comment_bar_bg_image_key;
+          if (detail_comment_bar_bg_image_opacity !== null) insertObj.detail_comment_bar_bg_image_opacity = detail_comment_bar_bg_image_opacity;
+          if (detail_comment_bar_glass_enabled !== null) insertObj.detail_comment_bar_glass_enabled = detail_comment_bar_glass_enabled;
+          if (detail_comment_bar_glass_style !== null) insertObj.detail_comment_bar_glass_style = detail_comment_bar_glass_style;
           insertObj.room_type = room_type;
           if (thread_card_style !== null) insertObj.thread_card_style = thread_card_style;
 
@@ -5312,6 +5350,99 @@ export default {
               updates.card_glass_style = design.cardGlassStyle;
             else if (typeof design?.card_glass_style === "string" && VALID_GLASS_STYLES_U.includes(design.card_glass_style))
               updates.card_glass_style = design.card_glass_style;
+
+            // ── Step 3 detail image + glass fields ──
+            // Detail page background image
+            if (typeof design?.detailBgImageKey === "string" && design.detailBgImageKey.length > 0 && design.detailBgImageKey.length <= 300)
+              updates.detail_bg_image_key = design.detailBgImageKey;
+            else if (typeof design?.detail_bg_image_key === "string" && design.detail_bg_image_key.length > 0)
+              updates.detail_bg_image_key = design.detail_bg_image_key;
+            else if (design?.detailBgImageKey === null || design?.detail_bg_image_key === null)
+              updates.detail_bg_image_key = null;
+            if (typeof design?.detailBgImageOpacity === "number" && design.detailBgImageOpacity >= 0 && design.detailBgImageOpacity <= 1)
+              updates.detail_bg_image_opacity = design.detailBgImageOpacity;
+            else if (typeof design?.detail_bg_image_opacity === "number" && design.detail_bg_image_opacity >= 0 && design.detail_bg_image_opacity <= 1)
+              updates.detail_bg_image_opacity = design.detail_bg_image_opacity;
+            // Detail card background image
+            if (typeof design?.detailCardBgImageKey === "string" && design.detailCardBgImageKey.length > 0 && design.detailCardBgImageKey.length <= 300)
+              updates.detail_card_bg_image_key = design.detailCardBgImageKey;
+            else if (typeof design?.detail_card_bg_image_key === "string" && design.detail_card_bg_image_key.length > 0)
+              updates.detail_card_bg_image_key = design.detail_card_bg_image_key;
+            else if (design?.detailCardBgImageKey === null || design?.detail_card_bg_image_key === null)
+              updates.detail_card_bg_image_key = null;
+            if (typeof design?.detailCardBgImageOpacity === "number" && design.detailCardBgImageOpacity >= 0 && design.detailCardBgImageOpacity <= 1)
+              updates.detail_card_bg_image_opacity = design.detailCardBgImageOpacity;
+            else if (typeof design?.detail_card_bg_image_opacity === "number" && design.detail_card_bg_image_opacity >= 0 && design.detail_card_bg_image_opacity <= 1)
+              updates.detail_card_bg_image_opacity = design.detail_card_bg_image_opacity;
+            // Detail card glass
+            if (typeof design?.detailCardGlassEnabled === "boolean")
+              updates.detail_card_glass_enabled = design.detailCardGlassEnabled;
+            else if (typeof design?.detail_card_glass_enabled === "boolean")
+              updates.detail_card_glass_enabled = design.detail_card_glass_enabled;
+            if (typeof design?.detailCardGlassStyle === "string" && VALID_GLASS_STYLES_U.includes(design.detailCardGlassStyle))
+              updates.detail_card_glass_style = design.detailCardGlassStyle;
+            else if (typeof design?.detail_card_glass_style === "string" && VALID_GLASS_STYLES_U.includes(design.detail_card_glass_style))
+              updates.detail_card_glass_style = design.detail_card_glass_style;
+            // Comment background image
+            if (typeof design?.detailCommentBgImageKey === "string" && design.detailCommentBgImageKey.length > 0 && design.detailCommentBgImageKey.length <= 300)
+              updates.detail_comment_bg_image_key = design.detailCommentBgImageKey;
+            else if (typeof design?.detail_comment_bg_image_key === "string" && design.detail_comment_bg_image_key.length > 0)
+              updates.detail_comment_bg_image_key = design.detail_comment_bg_image_key;
+            else if (design?.detailCommentBgImageKey === null || design?.detail_comment_bg_image_key === null)
+              updates.detail_comment_bg_image_key = null;
+            if (typeof design?.detailCommentBgImageOpacity === "number" && design.detailCommentBgImageOpacity >= 0 && design.detailCommentBgImageOpacity <= 1)
+              updates.detail_comment_bg_image_opacity = design.detailCommentBgImageOpacity;
+            else if (typeof design?.detail_comment_bg_image_opacity === "number" && design.detail_comment_bg_image_opacity >= 0 && design.detail_comment_bg_image_opacity <= 1)
+              updates.detail_comment_bg_image_opacity = design.detail_comment_bg_image_opacity;
+            // Comment glass
+            if (typeof design?.detailCommentGlassEnabled === "boolean")
+              updates.detail_comment_glass_enabled = design.detailCommentGlassEnabled;
+            else if (typeof design?.detail_comment_glass_enabled === "boolean")
+              updates.detail_comment_glass_enabled = design.detail_comment_glass_enabled;
+            if (typeof design?.detailCommentGlassStyle === "string" && VALID_GLASS_STYLES_U.includes(design.detailCommentGlassStyle))
+              updates.detail_comment_glass_style = design.detailCommentGlassStyle;
+            else if (typeof design?.detail_comment_glass_style === "string" && VALID_GLASS_STYLES_U.includes(design.detail_comment_glass_style))
+              updates.detail_comment_glass_style = design.detail_comment_glass_style;
+            // Input box background image
+            if (typeof design?.detailCommentInputBgImageKey === "string" && design.detailCommentInputBgImageKey.length > 0 && design.detailCommentInputBgImageKey.length <= 300)
+              updates.detail_comment_input_bg_image_key = design.detailCommentInputBgImageKey;
+            else if (typeof design?.detail_comment_input_bg_image_key === "string" && design.detail_comment_input_bg_image_key.length > 0)
+              updates.detail_comment_input_bg_image_key = design.detail_comment_input_bg_image_key;
+            else if (design?.detailCommentInputBgImageKey === null || design?.detail_comment_input_bg_image_key === null)
+              updates.detail_comment_input_bg_image_key = null;
+            if (typeof design?.detailCommentInputBgImageOpacity === "number" && design.detailCommentInputBgImageOpacity >= 0 && design.detailCommentInputBgImageOpacity <= 1)
+              updates.detail_comment_input_bg_image_opacity = design.detailCommentInputBgImageOpacity;
+            else if (typeof design?.detail_comment_input_bg_image_opacity === "number" && design.detail_comment_input_bg_image_opacity >= 0 && design.detail_comment_input_bg_image_opacity <= 1)
+              updates.detail_comment_input_bg_image_opacity = design.detail_comment_input_bg_image_opacity;
+            // Input box glass
+            if (typeof design?.detailCommentInputGlassEnabled === "boolean")
+              updates.detail_comment_input_glass_enabled = design.detailCommentInputGlassEnabled;
+            else if (typeof design?.detail_comment_input_glass_enabled === "boolean")
+              updates.detail_comment_input_glass_enabled = design.detail_comment_input_glass_enabled;
+            if (typeof design?.detailCommentInputGlassStyle === "string" && VALID_GLASS_STYLES_U.includes(design.detailCommentInputGlassStyle))
+              updates.detail_comment_input_glass_style = design.detailCommentInputGlassStyle;
+            else if (typeof design?.detail_comment_input_glass_style === "string" && VALID_GLASS_STYLES_U.includes(design.detail_comment_input_glass_style))
+              updates.detail_comment_input_glass_style = design.detail_comment_input_glass_style;
+            // Input bar background image
+            if (typeof design?.detailCommentBarBgImageKey === "string" && design.detailCommentBarBgImageKey.length > 0 && design.detailCommentBarBgImageKey.length <= 300)
+              updates.detail_comment_bar_bg_image_key = design.detailCommentBarBgImageKey;
+            else if (typeof design?.detail_comment_bar_bg_image_key === "string" && design.detail_comment_bar_bg_image_key.length > 0)
+              updates.detail_comment_bar_bg_image_key = design.detail_comment_bar_bg_image_key;
+            else if (design?.detailCommentBarBgImageKey === null || design?.detail_comment_bar_bg_image_key === null)
+              updates.detail_comment_bar_bg_image_key = null;
+            if (typeof design?.detailCommentBarBgImageOpacity === "number" && design.detailCommentBarBgImageOpacity >= 0 && design.detailCommentBarBgImageOpacity <= 1)
+              updates.detail_comment_bar_bg_image_opacity = design.detailCommentBarBgImageOpacity;
+            else if (typeof design?.detail_comment_bar_bg_image_opacity === "number" && design.detail_comment_bar_bg_image_opacity >= 0 && design.detail_comment_bar_bg_image_opacity <= 1)
+              updates.detail_comment_bar_bg_image_opacity = design.detail_comment_bar_bg_image_opacity;
+            // Input bar glass
+            if (typeof design?.detailCommentBarGlassEnabled === "boolean")
+              updates.detail_comment_bar_glass_enabled = design.detailCommentBarGlassEnabled;
+            else if (typeof design?.detail_comment_bar_glass_enabled === "boolean")
+              updates.detail_comment_bar_glass_enabled = design.detail_comment_bar_glass_enabled;
+            if (typeof design?.detailCommentBarGlassStyle === "string" && VALID_GLASS_STYLES_U.includes(design.detailCommentBarGlassStyle))
+              updates.detail_comment_bar_glass_style = design.detailCommentBarGlassStyle;
+            else if (typeof design?.detail_comment_bar_glass_style === "string" && VALID_GLASS_STYLES_U.includes(design.detail_comment_bar_glass_style))
+              updates.detail_comment_bar_glass_style = design.detail_comment_bar_glass_style;
 
             // ── Room content type (top-level fields) ──
             const VALID_ROOM_TYPES = ["post", "thread"];
