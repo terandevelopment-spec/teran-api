@@ -4676,6 +4676,7 @@ export default {
             const items: Array<{
               article_id: string;
               title: string;
+              description: string;
               image_url: string | null;
               link: string;
               source_id: string;
@@ -4691,6 +4692,10 @@ export default {
               // Extract title
               const titleMatch = itemXml.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
               const title = titleMatch ? titleMatch[1].trim().replace(/<!\[CDATA\[|\]\]>/g, "") : "";
+
+              // Extract description
+              const descMatch = itemXml.match(/<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/i);
+              const description = descMatch ? descMatch[1].trim().replace(/<!\[CDATA\[|\]\]>/g, "") : "";
 
               // Extract link
               const linkMatch = itemXml.match(/<link>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/link>/i);
@@ -4740,6 +4745,7 @@ export default {
               items.push({
                 article_id,
                 title,
+                description,
                 image_url,
                 link,
                 source_id: "bbc",
@@ -4755,6 +4761,16 @@ export default {
               return new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime();
             });
             const tParse = Date.now();
+
+            // DEBUG: log first parsed item to verify description extraction
+            if (items.length > 0) {
+              console.log(`[rss] PARSED_ITEM_0 rid=${request_id}`, JSON.stringify({
+                title: items[0].title,
+                description: items[0].description?.slice(0, 120),
+                link: items[0].link,
+                pubDate: items[0].pubDate,
+              }));
+            }
 
             // Build response body
             const body = JSON.stringify({
