@@ -4844,7 +4844,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style");
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled");
 
           if (owner_id_param) {
             // Support "me" alias: resolve to the authenticated caller's user_id
@@ -5088,6 +5088,12 @@ export default {
           const detail_comment_bar_glass_enabled = typeof design.detailCommentBarGlassEnabled === "boolean" ? design.detailCommentBarGlassEnabled : null;
           const detail_comment_bar_glass_style = typeof design.detailCommentBarGlassStyle === "string" && VALID_GLASS_STYLES.includes(design.detailCommentBarGlassStyle) ? design.detailCommentBarGlassStyle : null;
 
+          // ── Step 3 detail comment interaction fields ──
+          const detail_like_visible = typeof design.detailLikeVisible === "boolean" ? design.detailLikeVisible : null;
+          const detail_reply_icon_color = typeof design.detailReplyIconColor === "string" ? design.detailReplyIconColor.slice(0, 20) : null;
+          const detail_reply_badge_bg_color = typeof design.detailReplyBadgeBgColor === "string" ? design.detailReplyBadgeBgColor.slice(0, 20) : null;
+          const detail_reply_badge_glass_enabled = typeof design.detailReplyBadgeGlassEnabled === "boolean" ? design.detailReplyBadgeGlassEnabled : null;
+
           // ── Room content type (top-level, not inside design) ──
           const VALID_ROOM_TYPES = ["post", "thread"];
           const VALID_CARD_STYLES = ["standard", "teran"];
@@ -5155,6 +5161,10 @@ export default {
           if (detail_comment_bar_bg_image_opacity !== null) insertObj.detail_comment_bar_bg_image_opacity = detail_comment_bar_bg_image_opacity;
           if (detail_comment_bar_glass_enabled !== null) insertObj.detail_comment_bar_glass_enabled = detail_comment_bar_glass_enabled;
           if (detail_comment_bar_glass_style !== null) insertObj.detail_comment_bar_glass_style = detail_comment_bar_glass_style;
+          if (detail_like_visible !== null) insertObj.detail_like_visible = detail_like_visible;
+          if (detail_reply_icon_color !== null) insertObj.detail_reply_icon_color = detail_reply_icon_color;
+          if (detail_reply_badge_bg_color !== null) insertObj.detail_reply_badge_bg_color = detail_reply_badge_bg_color;
+          if (detail_reply_badge_glass_enabled !== null) insertObj.detail_reply_badge_glass_enabled = detail_reply_badge_glass_enabled;
           insertObj.room_type = room_type;
           if (thread_card_style !== null) insertObj.thread_card_style = thread_card_style;
 
@@ -5459,6 +5469,23 @@ export default {
               updates.detail_comment_bar_glass_style = design.detailCommentBarGlassStyle;
             else if (typeof design?.detail_comment_bar_glass_style === "string" && VALID_GLASS_STYLES_U.includes(design.detail_comment_bar_glass_style))
               updates.detail_comment_bar_glass_style = design.detail_comment_bar_glass_style;
+            // Detail comment interaction fields
+            if (typeof design?.detailLikeVisible === "boolean")
+              updates.detail_like_visible = design.detailLikeVisible;
+            else if (typeof design?.detail_like_visible === "boolean")
+              updates.detail_like_visible = design.detail_like_visible;
+            if (typeof design?.detailReplyIconColor === "string")
+              updates.detail_reply_icon_color = design.detailReplyIconColor.slice(0, 20);
+            else if (typeof design?.detail_reply_icon_color === "string")
+              updates.detail_reply_icon_color = design.detail_reply_icon_color.slice(0, 20);
+            if (typeof design?.detailReplyBadgeBgColor === "string")
+              updates.detail_reply_badge_bg_color = design.detailReplyBadgeBgColor.slice(0, 20);
+            else if (typeof design?.detail_reply_badge_bg_color === "string")
+              updates.detail_reply_badge_bg_color = design.detail_reply_badge_bg_color.slice(0, 20);
+            if (typeof design?.detailReplyBadgeGlassEnabled === "boolean")
+              updates.detail_reply_badge_glass_enabled = design.detailReplyBadgeGlassEnabled;
+            else if (typeof design?.detail_reply_badge_glass_enabled === "boolean")
+              updates.detail_reply_badge_glass_enabled = design.detail_reply_badge_glass_enabled;
 
             // ── Room content type (top-level fields) ──
             const VALID_ROOM_TYPES = ["post", "thread"];
