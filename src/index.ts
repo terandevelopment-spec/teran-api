@@ -5038,6 +5038,7 @@ export default {
           const card_bg_color = typeof design.cardBgColor === "string" ? design.cardBgColor.slice(0, 20) : null;
           const card_text_color = typeof design.cardTextColor === "string" ? design.cardTextColor.slice(0, 20) : null;
           const like_visible = typeof design.likeVisible === "boolean" ? design.likeVisible : null;
+          const like_color = typeof design.likeColor === "string" ? design.likeColor.slice(0, 20) : null;
           const header_font_size = typeof design.headerFontSize === "string" ? design.headerFontSize.slice(0, 10) : null;
           const header_font_family = typeof design.headerFontFamily === "string" ? design.headerFontFamily.slice(0, 60) : null;
 
@@ -5121,6 +5122,7 @@ export default {
           if (card_bg_color !== null) insertObj.card_bg_color = card_bg_color;
           if (card_text_color !== null) insertObj.card_text_color = card_text_color;
           if (like_visible !== null) insertObj.like_visible = like_visible;
+          if (like_color !== null) insertObj.like_color = like_color;
           if (header_font_size !== null) insertObj.header_font_size = header_font_size;
           if (header_font_family !== null) insertObj.header_font_family = header_font_family;
           if (detail_bg_color !== null) insertObj.detail_bg_color = detail_bg_color;
@@ -5291,6 +5293,8 @@ export default {
               updates.card_text_color = (design.cardTextColor ?? design.card_text_color).slice(0, 20);
             if (typeof design?.likeVisible === "boolean" || typeof design?.like_visible === "boolean")
               updates.like_visible = design.likeVisible ?? design.like_visible;
+            if (typeof design?.likeColor === "string" || typeof design?.like_color === "string")
+              updates.like_color = (design.likeColor ?? design.like_color).slice(0, 20);
             if (typeof design?.headerFontSize === "string" || typeof design?.header_font_size === "string")
               updates.header_font_size = (design.headerFontSize ?? design.header_font_size).slice(0, 10);
             if (typeof design?.headerFontFamily === "string" || typeof design?.header_font_family === "string")
