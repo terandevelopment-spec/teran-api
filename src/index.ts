@@ -1693,6 +1693,119 @@ export default {
           }
         }
 
+        // GET /api/posts/reply-previews?parent_ids=1,2,3&per_post=2
+        // Returns lightweight post-based reply previews for room thread cards.
+        // Unlike /api/comments/preview (which queries the comments table),
+        // this queries the posts table where parent_post_id IN (parent_ids).
+        if (path === "/api/posts/reply-previews" && req.method === "GET") {
+          const PREVIEW_CACHE_TTL = 60;
+          const t0 = Date.now();
+          const rid = request_id;
+
+          const parentIdsParam = url.searchParams.get("parent_ids") || "";
+          const perPostParam = url.searchParams.get("per_post");
+          const perPost = Math.min(3, Math.max(1, parseInt(perPostParam || "2", 10) || 2));
+
+          const parentIds = parentIdsParam
+            .split(",")
+            .map(s => parseInt(s.trim(), 10))
+            .filter(n => Number.isFinite(n) && n > 0)
+            .slice(0, 100);
+
+          if (parentIds.length === 0) {
+            return ok(req, env, request_id, { previews: {} });
+          }
+
+          // Stable cache key
+          const sortedKey = [...parentIds].sort((a, b) => a - b).join(",");
+          const cacheKeyUrl = new URL("https://cache.internal/posts/reply-previews");
+          cacheKeyUrl.searchParams.set("ids", sortedKey);
+          cacheKeyUrl.searchParams.set("per_post", String(perPost));
+          const cacheKey = new Request(cacheKeyUrl.toString(), { method: "GET" });
+          const cache = caches.default;
+          const cached = await cache.match(cacheKey);
+
+          if (cached) {
+            const hitBody = await cached.text();
+            console.log(`[perf] posts/reply-previews rid=${rid} cache=HIT total=${Date.now() - t0}ms ids=${parentIds.length}`);
+            return new Response(hitBody, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+                "X-Cache": "HIT",
+                ...corsHeaders(req, env),
+              },
+            });
+          }
+
+          // Cache MISS — query posts table for child replies
+          const fetchLimit = parentIds.length * perPost * 3;
+          const tDb0 = Date.now();
+          const { data: rows, error } = await sb(env)
+            .from("posts")
+            .select("id, parent_post_id, content, author_name, author_avatar, created_at")
+            .in("parent_post_id", parentIds)
+            .is("deleted_at", null)
+            .order("created_at", { ascending: false })
+            .limit(fetchLimit);
+          const tDb1 = Date.now();
+          if (error) throw error;
+
+          // Group by parent_post_id, keep only perPost per group
+          const previews: Record<string, Array<{
+            id: number;
+            parent_post_id: number;
+            content: string;
+            author_name: string | null;
+            author_avatar: string | null;
+            created_at: string;
+          }>> = {};
+          for (const id of parentIds) {
+            previews[String(id)] = [];
+          }
+          for (const row of rows ?? []) {
+            const key = String(row.parent_post_id);
+            if (previews[key] && previews[key].length < perPost) {
+              previews[key].push({
+                id: row.id,
+                parent_post_id: row.parent_post_id,
+                content: row.content,
+                author_name: row.author_name,
+                author_avatar: row.author_avatar,
+                created_at: row.created_at,
+              });
+            }
+          }
+
+          const responseBody = { previews, request_id };
+          const body = JSON.stringify(responseBody);
+
+          // Store in edge cache
+          ctx.waitUntil(
+            cache.put(cacheKey, new Response(body, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "Cache-Control": `public, max-age=${PREVIEW_CACHE_TTL}`,
+              },
+            }))
+              .then(() => console.log(`[cache] posts/reply-previews put ok rid=${rid} ids=${parentIds.length}`))
+              .catch((err) => console.error(`[cache] posts/reply-previews put fail rid=${rid}`, err))
+          );
+
+          console.log(`[perf] posts/reply-previews rid=${rid} cache=MISS db=${tDb1 - tDb0}ms total=${Date.now() - t0}ms ids=${parentIds.length} per_post=${perPost} rows=${(rows ?? []).length}`);
+          return new Response(body, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              "X-Request-Id": request_id,
+              "X-Cache": "MISS",
+              ...corsHeaders(req, env),
+            },
+          });
+        }
+
         // /api/comments (GET) ?post_id=123 (REQUIRED) &limit=20&cursor=<ts>:<id>
         // Returns { items: [...], next_cursor: string|null }
         if (path === "/api/comments" && req.method === "GET") {
