@@ -143,6 +143,58 @@ async function jwtVerify(env: Env, token: string): Promise<Record<string, any> |
   return payload;
 }
 
+// --------- Password hashing (PBKDF2-SHA256, Workers-native) ----------
+const PBKDF2_ITERATIONS = 100_000;
+const SALT_BYTES = 16;
+
+async function hashPassword(password: string): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+    key,
+    256
+  );
+  const saltHex = [...salt].map(b => b.toString(16).padStart(2, "0")).join("");
+  const hashHex = [...new Uint8Array(bits)].map(b => b.toString(16).padStart(2, "0")).join("");
+  return `${saltHex}:${hashHex}`;
+}
+
+async function verifyPassword(password: string, stored: string): Promise<boolean> {
+  const [saltHex, expectedHex] = stored.split(":");
+  if (!saltHex || !expectedHex) return false;
+  const salt = new Uint8Array((saltHex.match(/.{2}/g) || []).map(h => parseInt(h, 16)));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+    key,
+    256
+  );
+  const actualHex = [...new Uint8Array(bits)].map(b => b.toString(16).padStart(2, "0")).join("");
+  return actualHex === expectedHex;
+}
+
+// --------- Teran handle validation ----------
+const HANDLE_RE = /^[a-z0-9][a-z0-9._]{1,28}[a-z0-9]$/;
+function isValidHandle(h: string): boolean {
+  if (!h || h.length < 3 || h.length > 30) return false;
+  if (!HANDLE_RE.test(h)) return false;
+  if (h.includes("..") || h.includes("__") || h.includes("._") || h.includes("_.")) return false;
+  return true;
+}
+
 async function requireAuth(req: Request, env: Env): Promise<string> {
   const auth = req.headers.get("Authorization") || "";
   if (!auth) {
@@ -3612,6 +3664,382 @@ export default {
 
 
         // =====================================================
+        // ACCOUNTS — read-only account state (Step 1 foundation)
+        // =====================================================
+
+        // GET /api/accounts/me — returns claimed state for the current session
+        if (path === "/api/accounts/me" && req.method === "GET") {
+          const user_id = await requireAuth(req, env);
+
+          // Helper: look up account by device_id via account_devices
+          const { data: binding } = await sb(env)
+            .from("account_devices")
+            .select("account_id")
+            .eq("device_id", user_id)
+            .maybeSingle();
+
+          if (!binding) {
+            // No account bound to this device — unclaimed guest
+            return ok(req, env, request_id, {
+              claimed: false,
+              account_id: null,
+              teran_handle: null,
+              personas: [],
+            });
+          }
+
+          // Account exists — fetch account details
+          const { data: account } = await sb(env)
+            .from("accounts")
+            .select("id, teran_handle, created_at")
+            .eq("id", binding.account_id)
+            .single();
+
+          if (!account) {
+            // Orphaned binding (should not happen) — treat as unclaimed
+            return ok(req, env, request_id, {
+              claimed: false,
+              account_id: null,
+              teran_handle: null,
+              personas: [],
+            });
+          }
+
+          // Fetch linked personas
+          const { data: personas } = await sb(env)
+            .from("account_personas")
+            .select("persona_author_id, persona_name, persona_avatar, created_at")
+            .eq("account_id", account.id)
+            .order("created_at", { ascending: true });
+
+          return ok(req, env, request_id, {
+            claimed: !!account.teran_handle,
+            account_id: account.id,
+            teran_handle: account.teran_handle || null,
+            personas: (personas || []).map(p => ({
+              author_id: p.persona_author_id,
+              name: p.persona_name,
+              avatar: p.persona_avatar,
+            })),
+          });
+        }
+
+        // POST /api/accounts/check-handle — check if a Teran ID is available
+        if (path === "/api/accounts/check-handle" && req.method === "POST") {
+          const body = await req.json() as any;
+          const handle = String(body?.handle || "").toLowerCase().trim();
+
+          if (!handle) {
+            return fail(req, env, request_id, 400, "missing_handle", "Handle is required");
+          }
+          if (!isValidHandle(handle)) {
+            return ok(req, env, request_id, {
+              available: false,
+              reason: "Handle must be 3–30 characters, lowercase letters/numbers/periods/underscores, start and end with a letter or number.",
+            });
+          }
+
+          const { data: existing } = await sb(env)
+            .from("accounts")
+            .select("id")
+            .eq("teran_handle", handle)
+            .maybeSingle();
+
+          return ok(req, env, request_id, {
+            available: !existing,
+            reason: existing ? "This Teran ID is already taken." : null,
+          });
+        }
+
+        // POST /api/accounts/claim — claim current guest session with Teran ID + password
+        //
+        // Migration approach: COMPATIBILITY MAPPING BRIDGE
+        // - Creates account + binds device + stores handle/password
+        // - Does NOT rewrite device_id in rooms/posts/membership tables
+        // - JWT sub remains device_id (no token re-issue)
+        // - All existing features continue using device_id unchanged
+        // - Account tables serve as metadata for future cross-device login
+        if (path === "/api/accounts/claim" && req.method === "POST") {
+          const user_id = await requireAuth(req, env);
+          const body = await req.json() as any;
+
+          const handle = String(body?.teran_handle || "").toLowerCase().trim();
+          const password = String(body?.password || "");
+
+          // Validate handle
+          if (!handle) {
+            return fail(req, env, request_id, 400, "missing_handle", "Teran ID is required");
+          }
+          if (!isValidHandle(handle)) {
+            return fail(req, env, request_id, 400, "invalid_handle",
+              "Teran ID must be 3–30 characters, lowercase letters/numbers/periods/underscores, start and end with a letter or number.");
+          }
+
+          // Validate password
+          if (!password || password.length < 8) {
+            return fail(req, env, request_id, 400, "weak_password", "Password must be at least 8 characters");
+          }
+          if (password.length > 128) {
+            return fail(req, env, request_id, 400, "password_too_long", "Password must be at most 128 characters");
+          }
+
+          // Check if device is already claimed
+          const { data: existingBinding } = await sb(env)
+            .from("account_devices")
+            .select("account_id")
+            .eq("device_id", user_id)
+            .maybeSingle();
+
+          if (existingBinding) {
+            // Check if that account already has a handle (already claimed)
+            const { data: existingAccount } = await sb(env)
+              .from("accounts")
+              .select("teran_handle")
+              .eq("id", existingBinding.account_id)
+              .single();
+
+            if (existingAccount?.teran_handle) {
+              return fail(req, env, request_id, 409, "already_claimed",
+                "This device is already linked to a claimed account.");
+            }
+          }
+
+          // Check handle uniqueness
+          const { data: handleTaken } = await sb(env)
+            .from("accounts")
+            .select("id")
+            .eq("teran_handle", handle)
+            .maybeSingle();
+
+          if (handleTaken) {
+            return fail(req, env, request_id, 409, "handle_taken", "This Teran ID is already taken.");
+          }
+
+          // Hash password
+          const password_hash = await hashPassword(password);
+
+          // Create account
+          const account_id = crypto.randomUUID();
+          const now = new Date().toISOString();
+
+          const { error: accountErr } = await sb(env)
+            .from("accounts")
+            .insert({
+              id: account_id,
+              teran_handle: handle,
+              password_hash,
+              created_at: now,
+              updated_at: now,
+            } as any);
+
+          if (accountErr) {
+            // Handle race condition on unique handle
+            if (accountErr.code === "23505") {
+              return fail(req, env, request_id, 409, "handle_taken", "This Teran ID is already taken.");
+            }
+            console.error(`[claim] account insert failed:`, accountErr);
+            return fail(req, env, request_id, 500, "internal", "Failed to create account");
+          }
+
+          // Bind current device
+          const { error: deviceErr } = await sb(env)
+            .from("account_devices")
+            .upsert({
+              account_id,
+              device_id: user_id,
+              created_at: now,
+            } as any, { onConflict: "device_id" });
+
+          if (deviceErr) {
+            console.error(`[claim] device bind failed:`, deviceErr);
+            // Cleanup: remove orphaned account
+            await sb(env).from("accounts").delete().eq("id", account_id);
+            return fail(req, env, request_id, 500, "internal", "Failed to bind device");
+          }
+
+          // Bind personas: look up user_profiles created by this device (user_id matches)
+          // These are the personas the guest has created on this device
+          const { data: profiles } = await sb(env)
+            .from("user_profiles")
+            .select("user_id, display_name, avatar")
+            .eq("created_by_device", user_id)
+            .limit(20);
+
+          // Fallback: if created_by_device column doesn't exist yet, try matching
+          // profiles that are known locally (the frontend will send them in future steps)
+          // For now, bind any personas sent in the request body
+          const personasToLink: Array<{ author_id: string; name?: string; avatar?: string }> =
+            body?.personas || [];
+
+          const personaRows = personasToLink.map(p => ({
+            account_id,
+            persona_author_id: p.author_id,
+            persona_name: p.name || null,
+            persona_avatar: p.avatar || null,
+            created_at: now,
+          }));
+
+          if (personaRows.length > 0) {
+            const { error: personaErr } = await sb(env)
+              .from("account_personas")
+              .upsert(personaRows as any, { onConflict: "account_id,persona_author_id" });
+
+            if (personaErr) {
+              console.error(`[claim] persona bind failed:`, personaErr);
+              // Non-fatal: account is still claimed, personas can be re-linked later
+            }
+          }
+
+          // Return claimed account state
+          return ok(req, env, request_id, {
+            claimed: true,
+            account_id,
+            teran_handle: handle,
+            personas: personaRows.map(p => ({
+              author_id: p.persona_author_id,
+              name: p.persona_name,
+              avatar: p.persona_avatar,
+            })),
+          });
+        }
+
+        // POST /api/accounts/login — authenticate with Teran ID + password from a new device
+        //
+        // Public endpoint (no auth required — user has no token yet on a new device).
+        // Reads or creates device_id from cookie, binds device to account, issues JWT.
+        if (path === "/api/accounts/login" && req.method === "POST") {
+          const body = await req.json() as any;
+          const handle = String(body?.teran_handle || "").toLowerCase().trim();
+          const password = String(body?.password || "");
+
+          if (!handle) {
+            return fail(req, env, request_id, 400, "missing_handle", "Teran ID is required");
+          }
+          if (!password) {
+            return fail(req, env, request_id, 400, "missing_password", "Password is required");
+          }
+
+          // Look up account by handle
+          const { data: account } = await sb(env)
+            .from("accounts")
+            .select("id, teran_handle, password_hash, created_at")
+            .eq("teran_handle", handle)
+            .maybeSingle();
+
+          if (!account || !account.password_hash) {
+            return fail(req, env, request_id, 401, "invalid_credentials", "Invalid Teran ID or password");
+          }
+
+          // Verify password
+          const passwordOk = await verifyPassword(password, account.password_hash);
+          if (!passwordOk) {
+            return fail(req, env, request_id, 401, "invalid_credentials", "Invalid Teran ID or password");
+          }
+
+          // Resolve device_id: prefer existing cookie, else generate new
+          let device_id = readDeviceIdFromCookie(req);
+          const had_cookie = !!device_id;
+          if (!device_id) device_id = crypto.randomUUID();
+
+          // Bind device to account (upsert — safe for re-login on same device)
+          const now = new Date().toISOString();
+          const { error: bindErr } = await sb(env)
+            .from("account_devices")
+            .upsert({
+              account_id: account.id,
+              device_id,
+              created_at: now,
+            } as any, { onConflict: "device_id" });
+
+          if (bindErr) {
+            console.error(`[login] device bind failed:`, bindErr);
+            return fail(req, env, request_id, 500, "internal", "Failed to bind device");
+          }
+
+          // Issue JWT with sub = device_id (same semantics as POST /api/identity)
+          const nowSec = Math.floor(Date.now() / 1000);
+          const token = await jwtSign(env, {
+            sub: device_id,
+            iat: nowSec,
+            exp: nowSec + 60 * 60 * 24 * 365, // 1 year
+          });
+
+          // Fetch linked personas for client-side restore
+          const { data: personas } = await sb(env)
+            .from("account_personas")
+            .select("persona_author_id, persona_name, persona_avatar, created_at")
+            .eq("account_id", account.id)
+            .order("created_at", { ascending: true });
+
+          // Fetch room memberships for client-side room list restore
+          const { data: memberships } = await sb(env)
+            .from("room_members")
+            .select(`
+              role,
+              rooms:room_id (
+                id, name, room_key, icon_key, emoji, visibility
+              )
+            `)
+            .eq("user_id", device_id);
+
+          // Also fetch memberships under any other device_ids bound to this account
+          // (rooms joined from a different device)
+          const { data: otherDevices } = await sb(env)
+            .from("account_devices")
+            .select("device_id")
+            .eq("account_id", account.id)
+            .neq("device_id", device_id);
+
+          let allRoomMemberships = (memberships || [])
+            .filter((m: any) => m.rooms)
+            .map((m: any) => ({ ...m.rooms, my_role: m.role }));
+
+          // Merge memberships from other devices bound to same account
+          if (otherDevices && otherDevices.length > 0) {
+            const otherDeviceIds = otherDevices.map((d: any) => d.device_id);
+            const { data: otherMemberships } = await sb(env)
+              .from("room_members")
+              .select(`
+                role,
+                rooms:room_id (
+                  id, name, room_key, icon_key, emoji, visibility
+                )
+              `)
+              .in("user_id", otherDeviceIds);
+
+            const existingRoomIds = new Set(allRoomMemberships.map((r: any) => r.id));
+            for (const m of (otherMemberships || [])) {
+              if ((m as any).rooms && !existingRoomIds.has((m as any).rooms.id)) {
+                allRoomMemberships.push({ ...(m as any).rooms, my_role: (m as any).role });
+                existingRoomIds.add((m as any).rooms.id);
+              }
+            }
+          }
+
+          console.log(`[login] rid=${request_id} handle=${handle} device_id=${device_id} had_cookie=${had_cookie} personas=${(personas || []).length} rooms=${allRoomMemberships.length}`);
+
+          const resp = ok(req, env, request_id, {
+            claimed: true,
+            account_id: account.id,
+            teran_handle: account.teran_handle,
+            token,
+            personas: (personas || []).map((p: any) => ({
+              author_id: p.persona_author_id,
+              name: p.persona_name,
+              avatar: p.persona_avatar,
+            })),
+            rooms: allRoomMemberships,
+          });
+
+          // Set/refresh the device cookie
+          const origin = req.headers.get("Origin") || "";
+          resp.headers.append("Set-Cookie", setDeviceIdCookie(origin, device_id));
+          resp.headers.set("Cache-Control", "no-store");
+          resp.headers.set("Pragma", "no-cache");
+          return resp;
+        }
+
+
         // ANALYTICS HEARTBEAT
         // =====================================================
 
