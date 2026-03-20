@@ -5052,6 +5052,40 @@ export default {
           return ok(req, env, request_id, { room: data });
         }
 
+        // GET /api/rooms/mine — authenticated user's joined/owned rooms
+        if (path === "/api/rooms/mine" && req.method === "GET") {
+          const user_id = await requireAuth(req, env);
+
+          // Query room_members for this user, join rooms table for metadata
+          const { data: memberships, error } = await sb(env)
+            .from("room_members")
+            .select(`
+              role,
+              rooms:room_id (
+                id, name, room_key, icon_key, emoji, visibility,
+                card_bg_color, card_text_color,
+                thread_card_style, social_reply_mode,
+                card_glass_enabled, card_glass_style,
+                card_bg_image_key, card_bg_image_opacity,
+                like_color, like_visible, list_icon_shape, list_show_icons
+              )
+            `)
+            .eq("user_id", user_id);
+
+          if (error) throw new Error(error.message);
+
+          // Flatten: each row has { role, rooms: { id, name, ... } }
+          // Filter out rows where the room was deleted (rooms == null)
+          const rooms = (memberships || [])
+            .filter((m: any) => m.rooms)
+            .map((m: any) => ({
+              ...m.rooms,
+              my_role: m.role,
+            }));
+
+          return ok(req, env, request_id, { rooms });
+        }
+
         // GET /api/rooms/:id — room detail
         {
           const m = path.match(/^\/api\/rooms\/([^/]+)$/);
