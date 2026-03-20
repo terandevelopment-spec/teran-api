@@ -1236,13 +1236,10 @@ export default {
           const author_avatar = rawAuthorAvatar;
           const room_id = typeof body?.room_id === "string" ? body.room_id : null;
 
-          // Room post policy enforcement (skip for null or 'global')
+          // Room post policy enforcement: membership always required for room posts
           if (room_id && room_id !== "global") {
-            const { data: roomRow } = await sb(env).from("rooms").select("post_policy").eq("id", room_id).maybeSingle();
-            if (roomRow && roomRow.post_policy === "members_only") {
-              const memberRole = await checkRoomMembership(env, room_id, user_id);
-              if (!memberRole) throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
-            }
+            const memberRole = await checkRoomMembership(env, room_id, user_id);
+            if (!memberRole) throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
           }
 
           // Parse reply/share fields with robust numeric coercion
@@ -5712,7 +5709,7 @@ export default {
           const insertObj: Record<string, any> = {
             name, description, icon_key, category, room_key,
             owner_id: user_id,
-            visibility, read_policy: "public", post_policy: "public",
+            visibility, read_policy: "public", post_policy: "members_only",
           };
           // Only include design fields if they were provided
           if (header_bg_color !== null) insertObj.header_bg_color = header_bg_color;
