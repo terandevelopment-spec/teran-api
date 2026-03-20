@@ -475,6 +475,29 @@ export default {
           return resp;
         }
 
+        // /api/identity/reset (POST) -> { user_id, token }
+        // Always generates a NEW device_id, ignores any existing cookie.
+        // Used by SetupScreen "Get Started" to ensure a fresh identity context
+        // so new accounts never inherit room memberships from a previous identity.
+        if (path === "/api/identity/reset" && req.method === "POST") {
+          const device_id = crypto.randomUUID();
+          const user_id = device_id;
+          const now = Math.floor(Date.now() / 1000);
+          const token = await jwtSign(env, {
+            sub: user_id,
+            iat: now,
+            exp: now + 60 * 60 * 24 * 365, // 1 year
+          });
+          console.log(`[identity/reset] rid=${request_id} new_device_id=${device_id}`);
+
+          const resp = ok(req, env, request_id, { user_id, token });
+          const origin = req.headers.get("Origin") || "";
+          resp.headers.append("Set-Cookie", setDeviceIdCookie(origin, device_id));
+          resp.headers.set("Cache-Control", "no-store");
+          resp.headers.set("Pragma", "no-cache");
+          return resp;
+        }
+
         // /api/posts (GET) - filter by ?id=, ?user_id=, ?author_id=, ?room_id=, ?limit=, ?actor_id=
         if (path === "/api/posts" && req.method === "GET") {
           const FEED_CACHE_TTL = 8;
