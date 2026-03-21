@@ -3803,6 +3803,39 @@ export default {
             return fail(req, env, request_id, 400, "password_too_long", "Password must be at most 128 characters");
           }
 
+          // ── STEP 0: Validate & normalize personas BEFORE any DB writes ──
+          const rawPersonas: Array<{ author_id?: string; name?: string; avatar?: string }> =
+            body?.personas || [];
+
+          // Normalize: dedupe by author_id, filter invalid entries
+          const seenIds = new Set<string>();
+          const validPersonas = rawPersonas.filter(p => {
+            if (!p.author_id || typeof p.author_id !== "string" || p.author_id.trim().length === 0) return false;
+            const aid = p.author_id.trim();
+            if (seenIds.has(aid)) return false;
+            seenIds.add(aid);
+            return true;
+          });
+
+          const invalidCount = rawPersonas.length - validPersonas.length;
+          console.log(`[AccountsClaimFix] claim request`, {
+            rid: request_id, teran_handle: handle,
+            rawPersonasCount: rawPersonas.length,
+          });
+          console.log(`[AccountsClaimFix] normalized personas`, {
+            rid: request_id, rawCount: rawPersonas.length, validCount: validPersonas.length, invalidCount,
+          });
+
+          // Reject immediately if no valid personas — prevents half-claimed accounts
+          if (validPersonas.length === 0) {
+            console.warn(`[AccountsClaimFix] claim rejected`, {
+              rid: request_id, reason: "no-valid-personas",
+              teran_handle: handle, rawCount: rawPersonas.length,
+            });
+            return fail(req, env, request_id, 400, "no_personas",
+              "This account could not be claimed because no valid personas were available to link. Please create a persona first.");
+          }
+
           // Check if device is already claimed
           const { data: existingBinding } = await sb(env)
             .from("account_devices")
@@ -3838,7 +3871,7 @@ export default {
           // Hash password
           const password_hash = await hashPassword(password);
 
-          // Create account
+          // ── STEP 1: Create account ──
           const account_id = crypto.randomUUID();
           const now = new Date().toISOString();
 
@@ -3857,11 +3890,11 @@ export default {
             if (accountErr.code === "23505") {
               return fail(req, env, request_id, 409, "handle_taken", "This Teran ID is already taken.");
             }
-            console.error(`[claim] account insert failed:`, accountErr);
+            console.error(`[AccountsClaimFix] account insert failed`, { rid: request_id, error: accountErr.message });
             return fail(req, env, request_id, 500, "internal", "Failed to create account");
           }
 
-          // Bind current device
+          // ── STEP 2: Bind current device ──
           const { error: deviceErr } = await sb(env)
             .from("account_devices")
             .upsert({
@@ -3871,70 +3904,55 @@ export default {
             } as any, { onConflict: "device_id" });
 
           if (deviceErr) {
-            console.error(`[claim] device bind failed:`, deviceErr);
-            // Cleanup: remove orphaned account
+            console.error(`[AccountsClaimFix] device bind failed, compensating`, {
+              rid: request_id, error: deviceErr.message, account_id,
+            });
+            // Compensation: remove orphaned account
             await sb(env).from("accounts").delete().eq("id", account_id);
             return fail(req, env, request_id, 500, "internal", "Failed to bind device");
           }
 
-         // Bind personas: look up user_profiles created by this device (user_id matches)
-          // These are the personas the guest has created on this device
-          const { data: profiles } = await sb(env)
-            .from("user_profiles")
-            .select("user_id, display_name, avatar")
-            .eq("created_by_device", user_id)
-            .limit(20);
-
-          // Fallback: if created_by_device column doesn't exist yet, try matching
-          // profiles that are known locally (the frontend will send them in future steps)
-          // For now, bind any personas sent in the request body
-          const personasToLink: Array<{ author_id: string; name?: string; avatar?: string }> =
-            body?.personas || [];
-
-          console.log(`[AccountsClaimDbg] claim request`, {
-            rid: request_id, teran_handle: handle,
-            personasCount: personasToLink.length,
-          });
-
-          const personaRows = personasToLink.map(p => ({
+          // ── STEP 3: Insert persona rows (REQUIRED — already validated above) ──
+          const personaRows = validPersonas.map(p => ({
             account_id,
-            persona_author_id: p.author_id,
+            persona_author_id: p.author_id!.trim(),
             persona_name: p.name || null,
             persona_avatar: p.avatar || null,
             created_at: now,
           }));
 
-          console.log(`[AccountsClaimDbg] persona rows prepared`, {
+          const { error: personaErr } = await sb(env)
+            .from("account_personas")
+            .upsert(personaRows as any, { onConflict: "account_id,persona_author_id" });
+
+          if (personaErr) {
+            console.error(`[AccountsClaimFix] persona upsert FAILED, compensating`, {
+              rid: request_id, error: personaErr.message, code: personaErr.code,
+              account_id, personaRowCount: personaRows.length,
+            });
+            // Compensation: remove account + device binding to avoid half-claimed state
+            const { error: delDeviceErr } = await sb(env).from("account_devices").delete().eq("account_id", account_id);
+            const { error: delAccountErr } = await sb(env).from("accounts").delete().eq("id", account_id);
+            if (delDeviceErr || delAccountErr) {
+              console.error(`[AccountsClaimFix] compensation delete failed`, {
+                rid: request_id, account_id,
+                deviceDeleteErr: delDeviceErr?.message || null,
+                accountDeleteErr: delAccountErr?.message || null,
+              });
+            } else {
+              console.log(`[AccountsClaimFix] compensation delete success`, {
+                rid: request_id, account_id,
+              });
+            }
+            return fail(req, env, request_id, 500, "persona_bind_failed",
+              "Account was created but personas could not be linked. The account has been rolled back. Please try again.");
+          }
+
+          console.log(`[AccountsClaimFix] persona upsert success`, {
             rid: request_id, count: personaRows.length,
           });
 
-          if (personaRows.length > 0) {
-            const { error: personaErr } = await sb(env)
-              .from("account_personas")
-              .upsert(personaRows as any, { onConflict: "account_id,persona_author_id" });
-
-            if (personaErr) {
-              console.error(`[AccountsClaimDbg] persona upsert FAILED`, {
-                rid: request_id, error: personaErr.message, code: personaErr.code,
-                account_id, personaRowCount: personaRows.length,
-              });
-              // HARD FAIL: do not leave account in half-claimed state
-              // (credentials exist but no personas → login restore will fail)
-              return fail(req, env, request_id, 500, "persona_bind_failed",
-                "Account was created but personas could not be linked. Please try again.");
-            }
-
-            console.log(`[AccountsClaimDbg] persona upsert success`, {
-              rid: request_id, count: personaRows.length,
-            });
-          } else {
-            // Zero personas sent — log loudly (will cause login restore failure)
-            console.warn(`[AccountsClaimDbg] ZERO personas sent in claim request`, {
-              rid: request_id, account_id, teran_handle: handle,
-            });
-          }
-
-          console.log(`[AccountsClaimDbg] claim completed`, {
+          console.log(`[AccountsClaimFix] claim completed`, {
             rid: request_id, account_id, teran_handle: handle,
             personasCount: personaRows.length,
           });
@@ -4065,14 +4083,14 @@ export default {
             }
           }
 
-          console.log(`[AccountsLoginDbg] login success`, {
+          console.log(`[AccountsLoginFix] login success`, {
             rid: request_id, teran_handle: handle, account_id: account.id,
             device_id, had_cookie, personasCount: (personas || []).length,
             roomsCount: allRoomMemberships.length, tokenIssued: true,
           });
 
           if ((personas || []).length === 0) {
-            console.warn(`[AccountsLoginDbg] login missing personas`, {
+            console.warn(`[AccountsLoginFix] login missing personas`, {
               rid: request_id, teran_handle: handle, account_id: account.id,
               personasCount: 0,
             });
