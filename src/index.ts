@@ -3877,7 +3877,7 @@ export default {
             return fail(req, env, request_id, 500, "internal", "Failed to bind device");
           }
 
-          // Bind personas: look up user_profiles created by this device (user_id matches)
+         // Bind personas: look up user_profiles created by this device (user_id matches)
           // These are the personas the guest has created on this device
           const { data: profiles } = await sb(env)
             .from("user_profiles")
@@ -3891,6 +3891,11 @@ export default {
           const personasToLink: Array<{ author_id: string; name?: string; avatar?: string }> =
             body?.personas || [];
 
+          console.log(`[AccountsClaimDbg] claim request`, {
+            rid: request_id, teran_handle: handle,
+            personasCount: personasToLink.length,
+          });
+
           const personaRows = personasToLink.map(p => ({
             account_id,
             persona_author_id: p.author_id,
@@ -3899,16 +3904,40 @@ export default {
             created_at: now,
           }));
 
+          console.log(`[AccountsClaimDbg] persona rows prepared`, {
+            rid: request_id, count: personaRows.length,
+          });
+
           if (personaRows.length > 0) {
             const { error: personaErr } = await sb(env)
               .from("account_personas")
               .upsert(personaRows as any, { onConflict: "account_id,persona_author_id" });
 
             if (personaErr) {
-              console.error(`[claim] persona bind failed:`, personaErr);
-              // Non-fatal: account is still claimed, personas can be re-linked later
+              console.error(`[AccountsClaimDbg] persona upsert FAILED`, {
+                rid: request_id, error: personaErr.message, code: personaErr.code,
+                account_id, personaRowCount: personaRows.length,
+              });
+              // HARD FAIL: do not leave account in half-claimed state
+              // (credentials exist but no personas → login restore will fail)
+              return fail(req, env, request_id, 500, "persona_bind_failed",
+                "Account was created but personas could not be linked. Please try again.");
             }
+
+            console.log(`[AccountsClaimDbg] persona upsert success`, {
+              rid: request_id, count: personaRows.length,
+            });
+          } else {
+            // Zero personas sent — log loudly (will cause login restore failure)
+            console.warn(`[AccountsClaimDbg] ZERO personas sent in claim request`, {
+              rid: request_id, account_id, teran_handle: handle,
+            });
           }
+
+          console.log(`[AccountsClaimDbg] claim completed`, {
+            rid: request_id, account_id, teran_handle: handle,
+            personasCount: personaRows.length,
+          });
 
           // Return claimed account state
           return ok(req, env, request_id, {
@@ -4036,7 +4065,18 @@ export default {
             }
           }
 
-          console.log(`[login] rid=${request_id} handle=${handle} device_id=${device_id} had_cookie=${had_cookie} personas=${(personas || []).length} rooms=${allRoomMemberships.length}`);
+          console.log(`[AccountsLoginDbg] login success`, {
+            rid: request_id, teran_handle: handle, account_id: account.id,
+            device_id, had_cookie, personasCount: (personas || []).length,
+            roomsCount: allRoomMemberships.length, tokenIssued: true,
+          });
+
+          if ((personas || []).length === 0) {
+            console.warn(`[AccountsLoginDbg] login missing personas`, {
+              rid: request_id, teran_handle: handle, account_id: account.id,
+              personasCount: 0,
+            });
+          }
 
           const resp = ok(req, env, request_id, {
             claimed: true,
