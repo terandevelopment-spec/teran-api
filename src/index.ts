@@ -927,6 +927,22 @@ export default {
           const likesWhereShape = "post_id IN";
           const commentCountsWhereShape = "rpc:get_comment_counts(parent_ids)";
 
+          // ── Batch-fetch teran_id for all unique author_ids ──
+          const uniqueAuthorIds = [...new Set((posts ?? []).map((p: any) => p.author_id).filter(Boolean))];
+          let teranIdMap: Record<string, string | null> = {};
+          let teranIdMs = 0;
+          if (uniqueAuthorIds.length > 0) {
+            const tTid = Date.now();
+            const { data: tidRows } = await sb(env)
+              .from("user_profiles")
+              .select("user_id, teran_id")
+              .in("user_id", uniqueAuthorIds);
+            teranIdMs = Date.now() - tTid;
+            for (const row of (tidRows ?? []) as any[]) {
+              if (row.teran_id) teranIdMap[row.user_id] = row.teran_id;
+            }
+          }
+
           if (light) {
             // Light path: skip likes + commentCounts (ThreadFeed fetches those separately)
             // BUT still fetch media so thumbnails render in thread cards
@@ -949,7 +965,7 @@ export default {
               if (typeof avatar === "string" && avatar.startsWith("data:")) {
                 avatar = null;
               }
-              return { ...p, author_avatar: avatar, media: mediaByPost[p.id] || [], like_count: 0, liked_by_me: false, comment_count: 0 };
+              return { ...p, author_avatar: avatar, media: mediaByPost[p.id] || [], like_count: 0, liked_by_me: false, comment_count: 0, teran_id: teranIdMap[p.author_id] ?? null };
             });
             p5 = performance.now();
             console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} media_rows=${mediaRows.length} media_ms=${mediaMs} skip=likes,commentCounts`);
@@ -1053,6 +1069,7 @@ export default {
                 like_count: likeCounts[p.id] || 0,
                 liked_by_me: likedByActorSet.has(p.id),
                 comment_count: commentCounts[p.id] || 0,
+                teran_id: teranIdMap[p.author_id] ?? null,
               };
             });
             p5 = performance.now();
@@ -4262,7 +4279,7 @@ export default {
           const tDb = performance.now();
           const { data, error } = await sb(env)
             .from("user_profiles")
-            .select("user_id, display_name, bio, avatar, persona_tags")
+            .select("user_id, display_name, bio, avatar, persona_tags, teran_id")
             .eq("user_id", user_id)
             .maybeSingle();
           const dbMs = performance.now() - tDb;
@@ -4291,6 +4308,7 @@ export default {
               bio: null,
               avatar: null,
               persona_tags: [],
+              teran_id: null,
             });
           }
 
@@ -4342,6 +4360,19 @@ export default {
             throw new HttpError(422, "VALIDATION_ERROR", "avatar must be a URL or key, not a data URI");
           }
 
+          // ── teran_id validation ──
+          if (body?.teran_id !== undefined) {
+            if (body.teran_id === null || body.teran_id === "") {
+              incoming.teran_id = null;
+            } else if (typeof body.teran_id === "string") {
+              const tid = body.teran_id.toLowerCase().trim();
+              if (!/^[a-z0-9_]{3,20}$/.test(tid)) {
+                throw new HttpError(422, "VALIDATION_ERROR", "teran_id must be 3-20 characters, lowercase letters, digits, and underscores only");
+              }
+              incoming.teran_id = tid;
+            }
+          }
+
           // ── Persona text length limits (must match frontend LIMITS constants) ──
           const LIMIT_PERSONA_NAME = 20;
           const LIMIT_PERSONA_BIO = 160;
@@ -4374,7 +4405,7 @@ export default {
           // ── DB read: minimal columns ──
           const { data: current, error: readErr } = await sb(env)
             .from("user_profiles")
-            .select("display_name, bio, avatar, persona_tags")
+            .select("display_name, bio, avatar, persona_tags, teran_id")
             .eq("user_id", trimmedUserId)
             .maybeSingle();
           const p2 = performance.now();
@@ -4384,12 +4415,15 @@ export default {
           // ── Compare: skip write if nothing changed ──
           const tagsMatch = incoming.persona_tags === undefined ||
             (current && JSON.stringify(current.persona_tags ?? []) === JSON.stringify(incoming.persona_tags));
+          const teranIdMatch = incoming.teran_id === undefined ||
+            (current && (current.teran_id ?? null) === (incoming.teran_id ?? null));
           if (
             current &&
             current.display_name === incoming.display_name &&
             (current.bio ?? null) === (incoming.bio ?? null) &&
             (current.avatar ?? null) === (incoming.avatar ?? null) &&
-            tagsMatch
+            tagsMatch &&
+            teranIdMatch
           ) {
             console.log(`[profile-sync] skip rid=${request_id} reason=DB_MATCH user=${trimmedUserId}`);
             console.log(`[perf] profile breakdown rid=${request_id} parse=${(p1 - p0).toFixed(1)} db_read=${(p2 - p1).toFixed(1)} total=${(p2 - p0).toFixed(1)} decision=SKIP_WRITE`);
@@ -4409,7 +4443,13 @@ export default {
             );
           const p3 = performance.now();
 
-          if (writeErr) throw writeErr;
+          if (writeErr) {
+            // Handle unique constraint violation on teran_id
+            if ((writeErr as any)?.code === "23505" && String((writeErr as any)?.message ?? "").includes("teran_id")) {
+              throw new HttpError(409, "CONFLICT", "teran_id is already taken");
+            }
+            throw writeErr;
+          }
 
           // Invalidate profile KV cache after write
           ctx.waitUntil(
