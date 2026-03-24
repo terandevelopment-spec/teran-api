@@ -31,7 +31,7 @@ function corsHeaders(req: Request, env: Env) {
   return {
     "Access-Control-Allow-Origin": allowed === "null" ? "*" : allowed,
     "Access-Control-Allow-Credentials": "true",
-    "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization, x-teran-caller",
     "Access-Control-Expose-Headers": "X-Cache, X-Cache-Key, X-Request-Id, Cache-Control",
     "Access-Control-Max-Age": "86400",
