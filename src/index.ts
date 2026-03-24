@@ -6223,6 +6223,71 @@ export default {
           }
         }
 
+        // DELETE /api/rooms/:id — owner-only hard delete (room + all content)
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)$/);
+          if (m && req.method === "DELETE") {
+            const roomId = m[1];
+            const user_id = await requireAuth(req, env);
+
+            // Verify ownership
+            const ownerRole = await checkRoomMembership(env, roomId, user_id);
+            if (ownerRole !== "owner") throw new HttpError(403, "FORBIDDEN", "Only room owner can delete");
+
+            // Verify room exists
+            const { data: room, error: roomErr } = await sb(env)
+              .from("rooms")
+              .select("id")
+              .eq("id", roomId)
+              .maybeSingle();
+            if (roomErr) throw roomErr;
+            if (!room) throw new HttpError(404, "NOT_FOUND", "Room not found");
+
+            // Step 1: Collect all post IDs in this room
+            const { data: roomPosts } = await sb(env)
+              .from("posts")
+              .select("id")
+              .eq("room_id", roomId);
+            const postIds = (roomPosts ?? []).map((p: any) => p.id);
+
+            if (postIds.length > 0) {
+              // Step 2: Delete notifications referencing these posts
+              await sb(env)
+                .from("notifications")
+                .delete()
+                .in("post_id", postIds);
+
+              // Step 3: Delete post_likes (no FK cascade)
+              await sb(env)
+                .from("post_likes")
+                .delete()
+                .in("post_id", postIds);
+
+              // Step 4: Delete comments on these posts
+              await sb(env)
+                .from("comments")
+                .delete()
+                .in("post_id", postIds);
+
+              // Step 5: Hard-delete posts (media rows cascade via FK ON DELETE CASCADE)
+              await sb(env)
+                .from("posts")
+                .delete()
+                .eq("room_id", roomId);
+            }
+
+            // Step 6: Delete room row (room_members + room_invites cascade via FK)
+            const { error: delErr } = await sb(env)
+              .from("rooms")
+              .delete()
+              .eq("id", roomId);
+            if (delErr) throw delErr;
+
+            console.log(`[DELETE room] id=${roomId} owner=${user_id} posts_deleted=${postIds.length}`);
+            return ok(req, env, request_id, { ok: true, posts_deleted: postIds.length });
+          }
+        }
+
         // POST /api/rooms/:id/join — join public room
         {
           const m = path.match(/^\/api\/rooms\/([^/]+)\/join$/);
