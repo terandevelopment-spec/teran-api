@@ -3978,6 +3978,11 @@ export default {
                 { user_id: user_id, teran_id: handle, updated_at: now } as any,
                 { onConflict: "user_id" }
               );
+            // Invalidate profile KV cache so GET /api/profile returns fresh teran_id
+            ctx.waitUntil(
+              env.PROFILE_KV.delete(`profile:${user_id}`)
+                .catch((e: any) => console.error("[claim] KV delete failed", { rid: request_id, user_id, error: String(e) }))
+            );
             console.log(`[AccountsClaimFix] bridged teran_id to user_profiles`, {
               rid: request_id, user_id, teran_id: handle,
             });
