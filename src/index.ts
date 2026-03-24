@@ -3970,24 +3970,30 @@ export default {
           });
 
           // ── STEP 4: Bridge teran_handle → user_profiles.teran_id ──
-          // The UI reads teran_id from user_profiles, so propagate the handle there.
+          // The UI reads teran_id from user_profiles keyed by author_id (NOT device_id).
+          // Write teran_id into each bound persona's user_profiles row.
           try {
+            const profileRows = personaRows.map(p => ({
+              user_id: p.persona_author_id,
+              teran_id: handle,
+              updated_at: now,
+            }));
             await sb(env)
               .from("user_profiles")
-              .upsert(
-                { user_id: user_id, teran_id: handle, updated_at: now } as any,
-                { onConflict: "user_id" }
+              .upsert(profileRows as any, { onConflict: "user_id" });
+
+            // Invalidate profile KV cache for each persona so GET /api/profile returns fresh teran_id
+            for (const p of personaRows) {
+              ctx.waitUntil(
+                env.PROFILE_KV.delete(`profile:${p.persona_author_id}`)
+                  .catch((e: any) => console.error("[claim] KV delete failed", { rid: request_id, author_id: p.persona_author_id, error: String(e) }))
               );
-            // Invalidate profile KV cache so GET /api/profile returns fresh teran_id
-            ctx.waitUntil(
-              env.PROFILE_KV.delete(`profile:${user_id}`)
-                .catch((e: any) => console.error("[claim] KV delete failed", { rid: request_id, user_id, error: String(e) }))
-            );
+            }
             console.log(`[AccountsClaimFix] bridged teran_id to user_profiles`, {
-              rid: request_id, user_id, teran_id: handle,
+              rid: request_id, author_ids: personaRows.map(p => p.persona_author_id), teran_id: handle,
             });
           } catch (bridgeErr: any) {
-            // Non-fatal: account is claimed, visible handle will sync on next profile hydration
+            // Non-fatal: account is claimed, syncToBackend from frontend will also write
             console.warn(`[AccountsClaimFix] bridge write failed (non-fatal)`, {
               rid: request_id, error: bridgeErr?.message,
             });
