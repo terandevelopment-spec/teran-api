@@ -3969,6 +3969,25 @@ export default {
             rid: request_id, count: personaRows.length,
           });
 
+          // ── STEP 4: Bridge teran_handle → user_profiles.teran_id ──
+          // The UI reads teran_id from user_profiles, so propagate the handle there.
+          try {
+            await sb(env)
+              .from("user_profiles")
+              .upsert(
+                { user_id: user_id, teran_id: handle, updated_at: now } as any,
+                { onConflict: "user_id" }
+              );
+            console.log(`[AccountsClaimFix] bridged teran_id to user_profiles`, {
+              rid: request_id, user_id, teran_id: handle,
+            });
+          } catch (bridgeErr: any) {
+            // Non-fatal: account is claimed, visible handle will sync on next profile hydration
+            console.warn(`[AccountsClaimFix] bridge write failed (non-fatal)`, {
+              rid: request_id, error: bridgeErr?.message,
+            });
+          }
+
           console.log(`[AccountsClaimFix] claim completed`, {
             rid: request_id, account_id, teran_handle: handle,
             personasCount: personaRows.length,
