@@ -5533,7 +5533,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled");
+            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled");
 
           if (owner_id_param) {
             // Support "me" alias: resolve to the authenticated caller's user_id
@@ -5791,6 +5791,8 @@ export default {
           const card_glass_enabled = typeof design.cardGlassEnabled === "boolean" ? design.cardGlassEnabled : null;
           const VALID_GLASS_STYLES = ["frosted", "clear", "tinted"];
           const card_glass_style = typeof design.cardGlassStyle === "string" && VALID_GLASS_STYLES.includes(design.cardGlassStyle) ? design.cardGlassStyle : null;
+          const header_glass_enabled = typeof design.headerGlassEnabled === "boolean" ? design.headerGlassEnabled : null;
+          const header_glass_style = typeof design.headerGlassStyle === "string" && VALID_GLASS_STYLES.includes(design.headerGlassStyle) ? design.headerGlassStyle : null;
 
           // ── Step 3 detail image + glass fields ──
           const detail_bg_image_key = typeof design.detailBgImageKey === "string" && design.detailBgImageKey.length > 0 && design.detailBgImageKey.length <= 300 ? design.detailBgImageKey : null;
@@ -5871,6 +5873,8 @@ export default {
           if (card_bg_image_opacity !== null) insertObj.card_bg_image_opacity = card_bg_image_opacity;
           if (card_glass_enabled !== null) insertObj.card_glass_enabled = card_glass_enabled;
           if (card_glass_style !== null) insertObj.card_glass_style = card_glass_style;
+          if (header_glass_enabled !== null) insertObj.header_glass_enabled = header_glass_enabled;
+          if (header_glass_style !== null) insertObj.header_glass_style = header_glass_style;
           if (detail_bg_image_key !== null) insertObj.detail_bg_image_key = detail_bg_image_key;
           if (detail_bg_image_opacity !== null) insertObj.detail_bg_image_opacity = detail_bg_image_opacity;
           if (detail_card_bg_image_key !== null) insertObj.detail_card_bg_image_key = detail_card_bg_image_key;
@@ -6108,6 +6112,16 @@ export default {
               updates.card_glass_style = design.cardGlassStyle;
             else if (typeof design?.card_glass_style === "string" && VALID_GLASS_STYLES_U.includes(design.card_glass_style))
               updates.card_glass_style = design.card_glass_style;
+            // Header glass mode
+            if (typeof design?.headerGlassEnabled === "boolean")
+              updates.header_glass_enabled = design.headerGlassEnabled;
+            else if (typeof design?.header_glass_enabled === "boolean")
+              updates.header_glass_enabled = design.header_glass_enabled;
+            // Header glass style
+            if (typeof design?.headerGlassStyle === "string" && VALID_GLASS_STYLES_U.includes(design.headerGlassStyle))
+              updates.header_glass_style = design.headerGlassStyle;
+            else if (typeof design?.header_glass_style === "string" && VALID_GLASS_STYLES_U.includes(design.header_glass_style))
+              updates.header_glass_style = design.header_glass_style;
 
             // ── Step 3 detail image + glass fields ──
             // Detail page background image
