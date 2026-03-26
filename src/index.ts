@@ -927,11 +927,11 @@ export default {
           const likesWhereShape = "post_id IN";
           const commentCountsWhereShape = "rpc:get_comment_counts(parent_ids)";
 
-          // ── Batch-fetch teran_id for all unique author_ids ──
+          // ── Batch-fetch teran_id for all unique author_ids (skip in light mode) ──
           const uniqueAuthorIds = [...new Set((posts ?? []).map((p: any) => p.author_id).filter(Boolean))];
           let teranIdMap: Record<string, string | null> = {};
           let teranIdMs = 0;
-          if (uniqueAuthorIds.length > 0) {
+          if (!light && uniqueAuthorIds.length > 0) {
             const tTid = Date.now();
             const { data: tidRows } = await sb(env)
               .from("user_profiles")
@@ -944,8 +944,8 @@ export default {
           }
 
           if (light) {
-            // Light path: skip likes + commentCounts (ThreadFeed fetches those separately)
-            // BUT still fetch media so thumbnails render in thread cards
+            // Light path: skip likes + commentCounts + teranId
+            // Only fetch media so thumbnails render in thread cards
             const lightMediaStart = Date.now();
             const { data: lightMediaData } = await sb(env)
               .from("media")
@@ -953,6 +953,9 @@ export default {
               .in("post_id", postIds);
             mediaMs = Date.now() - lightMediaStart;
             mediaRows = lightMediaData ?? [];
+
+            // Start transform timing AFTER DB work
+            p4 = performance.now();
 
             const mediaByPost: Record<number, any[]> = {};
             for (const m of mediaRows) {
@@ -965,10 +968,10 @@ export default {
               if (typeof avatar === "string" && avatar.startsWith("data:")) {
                 avatar = null;
               }
-              return { ...p, author_avatar: avatar, media: mediaByPost[p.id] || [], like_count: 0, liked_by_me: false, comment_count: 0, teran_id: teranIdMap[p.author_id] ?? null };
+              return { ...p, author_avatar: avatar, media: mediaByPost[p.id] || [], like_count: 0, liked_by_me: false, comment_count: 0, teran_id: null };
             });
             p5 = performance.now();
-            console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} media_rows=${mediaRows.length} media_ms=${mediaMs} skip=likes,commentCounts`);
+            console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} media_rows=${mediaRows.length} light_media_ms=${mediaMs} transform_ms=${(p5 - p4).toFixed(1)} skip=likes,commentCounts,teranId`);
           } else {
             // Parallel fetch: media + likes + comment counts
             const parallelStart = Date.now();
