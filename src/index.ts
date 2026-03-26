@@ -583,7 +583,7 @@ export default {
           // - Feed lists: lightweight select (content included for card preview)
           // - Single post by id: include full data for PostDetail
           const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods";
-          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type";
+          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,media(type,key,thumb_key)";
           const selectFields = id_param ? "*" : (light ? lightSelectFields : feedSelectFields);
 
           // Step 1: log normalized filter + select cols
@@ -945,33 +945,27 @@ export default {
 
           if (light) {
             // Light path: skip likes + commentCounts + teranId
-            // Only fetch media so thumbnails render in thread cards
-            const lightMediaStart = Date.now();
-            const { data: lightMediaData } = await sb(env)
-              .from("media")
-              .select(mediaSelectCols)
-              .in("post_id", postIds);
-            mediaMs = Date.now() - lightMediaStart;
-            mediaRows = lightMediaData ?? [];
+            // Media is embedded in the posts query via PostgREST relationship
+            // (no separate media HTTP round-trip needed)
+            mediaMs = 0; // embedded — no separate fetch
 
-            // Start transform timing AFTER DB work
+            // Start transform timing
             p4 = performance.now();
 
-            const mediaByPost: Record<number, any[]> = {};
-            for (const m of mediaRows) {
-              if (!mediaByPost[m.post_id]) mediaByPost[m.post_id] = [];
-              mediaByPost[m.post_id].push(m);
-            }
-
+            let totalMediaRows = 0;
             enrichedPosts = (posts ?? []).map((p: any) => {
               let avatar = p.author_avatar;
               if (typeof avatar === "string" && avatar.startsWith("data:")) {
                 avatar = null;
               }
-              return { ...p, author_avatar: avatar, media: mediaByPost[p.id] || [], like_count: 0, liked_by_me: false, comment_count: 0, teran_id: null };
+              // media is already attached by PostgREST embed as p.media[]
+              const embeddedMedia = Array.isArray(p.media) ? p.media : [];
+              totalMediaRows += embeddedMedia.length;
+              return { ...p, author_avatar: avatar, media: embeddedMedia, like_count: 0, liked_by_me: false, comment_count: 0, teran_id: null };
             });
+            mediaRows = []; // not used in light mode, but keep variable populated for downstream logging
             p5 = performance.now();
-            console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} media_rows=${mediaRows.length} light_media_ms=${mediaMs} transform_ms=${(p5 - p4).toFixed(1)} skip=likes,commentCounts,teranId`);
+            console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} media_rows=${totalMediaRows} media_embed=true transform_ms=${(p5 - p4).toFixed(1)} skip=likes,commentCounts,teranId,mediaSeparateFetch`);
           } else {
             // Parallel fetch: media + likes + comment counts
             const parallelStart = Date.now();
