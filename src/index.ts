@@ -5690,28 +5690,21 @@ export default {
               if (!privRole) throw new HttpError(404, "NOT_FOUND", "Room not found");
             }
 
-            // 2) Parallel: member_count + caller membership
-            const tParallel = performance.now();
-            const [countResult, my_role] = await Promise.all([
-              sb(env)
-                .from("room_members")
-                .select("*", { count: "exact", head: true })
-                .eq("room_id", roomId),
-              (async (): Promise<string | null> => {
-                const uid = await optionalAuth(req, env);
-                return uid ? checkRoomMembership(env, roomId, uid) : null;
-              })(),
-            ]);
-            const parallelMs = performance.now() - tParallel;
+            // 2) Enrichment: fetch my_role only (member_count removed — unused by frontend)
+            // my_role is needed for canPost (composer) on ALL room types
+            const tEnrich = performance.now();
+            const uid = await optionalAuth(req, env);
+            const my_role: string | null = uid ? await checkRoomMembership(env, roomId, uid) : null;
+            const enrichMs = performance.now() - tEnrich;
 
             const payload = {
-              room: { ...(room as any), member_count: countResult.count ?? 0 },
+              room: { ...(room as any) },
               my_role,
             };
             const payloadBytes = JSON.stringify(payload).length;
             const totalMs = performance.now() - tTotal;
 
-            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: "NONE", db_room_ms: +dbRoomMs.toFixed(1), parallel_ms: +parallelMs.toFixed(1), total_ms: +totalMs.toFixed(1), rows_room: 1, payload_bytes: payloadBytes, caller }));
+            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: "NONE", db_room_ms: +dbRoomMs.toFixed(1), enrich_ms: +enrichMs.toFixed(1), total_ms: +totalMs.toFixed(1), rows_room: 1, payload_bytes: payloadBytes, caller }));
 
             return ok(req, env, request_id, payload);
           }
