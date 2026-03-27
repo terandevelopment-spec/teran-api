@@ -1481,22 +1481,48 @@ export default {
           let accountId: string | null = null;
           let roomDirectRole: string | null = null;
 
+          // ── KV-cached device→account_id resolver ──
+          // Avoids cold Supabase round-trip (~200-534ms) on every post.
+          // Key: acct:dev:<device_id> → account_id string or "__null__"
+          // TTL: 300s (device→account bindings are stable)
+          const ACCT_CACHE_TTL = 300;
+          const acctKvKey = `acct:dev:${user_id}`;
+          const resolveAccountIdCached = async (): Promise<string | null> => {
+            const tDev = Date.now();
+            let kvHit = false;
+            try {
+              const cached = await env.PROFILE_KV.get(acctKvKey);
+              if (cached !== null) {
+                kvHit = true;
+                mark("acct_devices");
+                console.log(`[perf] /api/posts acct_devices_ms=${Date.now() - tDev} rid=${request_id} src=kv`);
+                return cached === "__null__" ? null : cached;
+              }
+            } catch { /* KV read failed — fall through to DB */ }
+
+            const { data: deviceBinding } = await sb(env)
+              .from("account_devices")
+              .select("account_id")
+              .eq("device_id", user_id)
+              .maybeSingle();
+            mark("acct_devices");
+            const acctId = deviceBinding?.account_id
+              ? ((deviceBinding as any).account_id as string)
+              : null;
+            console.log(`[perf] /api/posts acct_devices_ms=${Date.now() - tDev} rid=${request_id} src=db`);
+
+            // Write-behind: cache result for subsequent requests
+            ctx.waitUntil(
+              env.PROFILE_KV.put(acctKvKey, acctId ?? "__null__", { expirationTtl: ACCT_CACHE_TTL })
+                .catch(() => {})
+            );
+            return acctId;
+          };
+
           if (needsAccountResolution && needsRoomCheck) {
             const [acctResult, { data: directHit }] = await Promise.all([
-              // Branch A: resolve account_id ONLY (single query)
-              (async () => {
-                const tDev = Date.now();
-                const { data: deviceBinding } = await sb(env)
-                  .from("account_devices")
-                  .select("account_id")
-                  .eq("device_id", user_id)
-                  .maybeSingle();
-                mark("acct_devices");
-                console.log(`[perf] /api/posts acct_devices_ms=${Date.now() - tDev} rid=${request_id}`);
-                return deviceBinding?.account_id
-                  ? ((deviceBinding as any).account_id as string)
-                  : null;
-              })(),
+              // Branch A: resolve account_id (KV-cached)
+              resolveAccountIdCached(),
               // Branch B: room direct check (only needs user_id)
               sb(env)
                 .from("room_members")
@@ -1516,19 +1542,10 @@ export default {
             }
           } else if (needsAccountResolution) {
             // Only persona check needed, no room check
-            const tDev = Date.now();
-            const { data: deviceBinding } = await sb(env)
-              .from("account_devices")
-              .select("account_id")
-              .eq("device_id", user_id)
-              .maybeSingle();
-            mark("acct_devices");
+            accountId = await resolveAccountIdCached();
             mark("acct_resolve");
-            console.log(`[perf] /api/posts acct_devices_ms=${Date.now() - tDev} rid=${request_id}`);
 
-            if (deviceBinding?.account_id) {
-              accountId = (deviceBinding as any).account_id;
-            } else if (needsPersonaCheck) {
+            if (!accountId && needsPersonaCheck) {
               console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
               throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
             }
