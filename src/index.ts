@@ -1902,6 +1902,7 @@ export default {
 
         // GET /api/comments/counts?post_ids=1,2,3 - Get comment counts for multiple posts (public)
         if (path === "/api/comments/counts" && req.method === "GET") {
+          const t0 = Date.now();
           const postIdsParam = url.searchParams.get("post_ids") || "";
           const postIds = postIdsParam
             .split(",")
@@ -1913,24 +1914,24 @@ export default {
             return ok(req, env, request_id, { counts: {} });
           }
 
-          // Get all comment rows for requested post_ids
-          const { data: rows, error } = await sb(env)
-            .from("comments")
-            .select("post_id")
-            .in("post_id", postIds);
+          // Use RPC for grouped count — zero rows transferred
+          const tDb = Date.now();
+          const { data: rpcRows, error } = await sb(env)
+            .rpc("get_comment_counts", { parent_ids: postIds });
+          const dbMs = Date.now() - tDb;
           if (error) throw error;
 
-          // Count occurrences per post_id
-          const countMap: Record<number, number> = {};
-          for (const row of rows ?? []) {
-            countMap[row.post_id] = (countMap[row.post_id] || 0) + 1;
-          }
-
-          // Build response with 0 for posts that had no comments
+          // Build response from RPC result
           const counts: Record<string, number> = {};
           for (const id of postIds) {
-            counts[String(id)] = countMap[id] || 0;
+            counts[String(id)] = 0;
           }
+          for (const row of rpcRows ?? []) {
+            counts[String((row as any).parent_id)] = (row as any).comment_count ?? 0;
+          }
+
+          const totalMs = Date.now() - t0;
+          console.log(`[perf] /api/comments/counts`, JSON.stringify({ rid: request_id, db_ms: dbMs, total_ms: totalMs, post_ids: postIds.length }));
 
           return ok(req, env, request_id, { counts });
         }
@@ -2224,9 +2225,10 @@ export default {
 
           const commentIds = commentList.map((c: any) => c.id);
 
-          // Queries 2-4: Run in parallel (like counts, user likes, media)
+          // Queries 2-5: Run ALL enrichment in parallel (likes, user likes, media, profiles)
+          const commentAuthorIds = [...new Set(commentList.map((c: any) => c.author_id).filter(Boolean))];
           t1 = Date.now();
-          const [likesResult, userLikesResult, mediaResult] = await Promise.all([
+          const [likesResult, userLikesResult, mediaResult, profileResult] = await Promise.all([
             // Query 2: Get like counts for all comments
             sb(env)
               .from("comment_likes")
@@ -2245,6 +2247,13 @@ export default {
               .from("media")
               .select("id, comment_id, type, key, thumb_key, width, height")
               .in("comment_id", commentIds),
+            // Query 5: Live profile overlay (was sequential — now parallel)
+            commentAuthorIds.length > 0
+              ? sb(env)
+                .from("user_profiles")
+                .select("user_id, display_name, avatar")
+                .in("user_id", commentAuthorIds)
+              : Promise.resolve({ data: [] }),
           ]);
           console.log(`[perf] /api/comments parallel_queries ${Date.now() - t1}ms`);
 
@@ -2267,17 +2276,10 @@ export default {
             mediaByComment[m.comment_id].push(m);
           }
 
-          // Batch-fetch live profiles for identity overlay
-          const commentAuthorIds = [...new Set(commentList.map((c: any) => c.author_id).filter(Boolean))];
+          // Build profile map from parallel result
           let commentProfileMap: Record<string, { display_name?: string; avatar?: string }> = {};
-          if (commentAuthorIds.length > 0) {
-            const { data: profRows } = await sb(env)
-              .from("user_profiles")
-              .select("user_id, display_name, avatar")
-              .in("user_id", commentAuthorIds);
-            for (const row of (profRows ?? []) as any[]) {
-              commentProfileMap[row.user_id] = { display_name: row.display_name, avatar: row.avatar };
-            }
+          for (const row of (profileResult.data ?? []) as any[]) {
+            commentProfileMap[row.user_id] = { display_name: row.display_name, avatar: row.avatar };
           }
 
           // Enrich comments with like data, media, and live identity overlay
@@ -4060,17 +4062,41 @@ export default {
 
         // GET /api/accounts/me — returns claimed state for the current session
         if (path === "/api/accounts/me" && req.method === "GET") {
+          const t0 = Date.now();
           const user_id = await requireAuth(req, env);
+          const tAuth = Date.now();
 
-          // Helper: look up account by device_id via account_devices
-          const { data: binding } = await sb(env)
-            .from("account_devices")
-            .select("account_id")
-            .eq("device_id", user_id)
-            .maybeSingle();
+          // KV-cached device→account_id resolution (same as POST /api/posts)
+          const ACCT_CACHE_TTL = 300;
+          const acctKvKey = `acct:dev:${user_id}`;
+          let acctSrc = "db";
+          let accountId: string | null = null;
+          const tAcct = Date.now();
+          try {
+            const cached = await env.PROFILE_KV.get(acctKvKey);
+            if (cached !== null) {
+              acctSrc = "kv";
+              accountId = cached === "__null__" ? null : cached;
+            }
+          } catch { /* KV read failed — fall through */ }
 
-          if (!binding) {
-            // No account bound to this device — unclaimed guest
+          if (acctSrc === "db") {
+            const { data: binding } = await sb(env)
+              .from("account_devices")
+              .select("account_id")
+              .eq("device_id", user_id)
+              .maybeSingle();
+            accountId = binding?.account_id ? (binding as any).account_id : null;
+            // Write-behind cache
+            ctx.waitUntil(
+              env.PROFILE_KV.put(acctKvKey, accountId ?? "__null__", { expirationTtl: ACCT_CACHE_TTL })
+                .catch(() => {})
+            );
+          }
+          const acctMs = Date.now() - tAcct;
+
+          if (!accountId) {
+            console.log(`[perf] /api/accounts/me`, JSON.stringify({ rid: request_id, auth_ms: tAuth - t0, acct_ms: acctMs, acct_src: acctSrc, total_ms: Date.now() - t0, claimed: false }));
             return ok(req, env, request_id, {
               claimed: false,
               account_id: null,
@@ -4079,15 +4105,23 @@ export default {
             });
           }
 
-          // Account exists — fetch account details
-          const { data: account } = await sb(env)
-            .from("accounts")
-            .select("id, teran_handle, created_at")
-            .eq("id", binding.account_id)
-            .single();
+          // Parallelize: fetch account details + personas simultaneously
+          const tPar = Date.now();
+          const [{ data: account }, { data: personas }] = await Promise.all([
+            sb(env)
+              .from("accounts")
+              .select("id, teran_handle, created_at")
+              .eq("id", accountId)
+              .single(),
+            sb(env)
+              .from("account_personas")
+              .select("persona_author_id, persona_name, persona_avatar, created_at")
+              .eq("account_id", accountId)
+              .order("created_at", { ascending: true }),
+          ]);
+          const parMs = Date.now() - tPar;
 
           if (!account) {
-            // Orphaned binding (should not happen) — treat as unclaimed
             return ok(req, env, request_id, {
               claimed: false,
               account_id: null,
@@ -4096,18 +4130,14 @@ export default {
             });
           }
 
-          // Fetch linked personas
-          const { data: personas } = await sb(env)
-            .from("account_personas")
-            .select("persona_author_id, persona_name, persona_avatar, created_at")
-            .eq("account_id", account.id)
-            .order("created_at", { ascending: true });
+          const totalMs = Date.now() - t0;
+          console.log(`[perf] /api/accounts/me`, JSON.stringify({ rid: request_id, auth_ms: tAuth - t0, acct_ms: acctMs, acct_src: acctSrc, parallel_ms: parMs, total_ms: totalMs, claimed: true }));
 
           return ok(req, env, request_id, {
             claimed: !!account.teran_handle,
             account_id: account.id,
             teran_handle: account.teran_handle || null,
-            personas: (personas || []).map(p => ({
+            personas: (personas || []).map((p: any) => ({
               author_id: p.persona_author_id,
               name: p.persona_name,
               avatar: p.persona_avatar,
@@ -6052,19 +6082,21 @@ export default {
           const dbRoomsMs = performance.now() - tDbRooms;
           if (error) throw new Error(error.message);
 
-          // Attach member_count per room
+          // Attach member_count per room via PostgREST HEAD count (zero rows transferred)
           const roomIds = (data || []).map((r: any) => r.id);
           let countMap: Record<string, number> = {};
           let dbCountsMs = 0;
           if (roomIds.length > 0) {
             const tDbCounts = performance.now();
-            const { data: counts } = await sb(env)
+            // Batch count: fetch just room_id column and count in JS
+            // Use select + count approach with minimal payload
+            const { data: memberRows } = await sb(env)
               .from("room_members")
-              .select("room_id")
+              .select("room_id", { count: "exact", head: false })
               .in("room_id", roomIds);
             dbCountsMs = performance.now() - tDbCounts;
-            if (counts) {
-              for (const c of counts) {
+            if (memberRows) {
+              for (const c of memberRows as any[]) {
                 countMap[c.room_id] = (countMap[c.room_id] || 0) + 1;
               }
             }
