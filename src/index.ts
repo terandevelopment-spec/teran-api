@@ -1468,10 +1468,10 @@ export default {
 
           // ── Phase 4: Identity resolution + room permission (DB lookups) ──
           // Strategy:
-          //   Step 1 — parallel(acct_resolve+sibling_prefetch, room_direct)
-          //            Sibling prefetch chains off acct_resolve; its cost is hidden
-          //            under the parallel wait for room_direct.
-          //   Step 2 — persona + room_fallback_IN in parallel (if needed)
+          //   Step 1 — parallel(acct_resolve, room_direct)
+          //            acct_resolve is a SINGLE query (account_id only).
+          //            Sibling prefetch is DEFERRED to roomFallbackFn (only when direct misses).
+          //   Step 2 — persona + room_fallback in parallel (if needed)
           let author_id: string | null = raw_author_id;
           const needsPersonaCheck = !!author_id && author_id !== user_id;
           const needsRoomCheck = !!room_id && room_id !== "global";
@@ -1480,32 +1480,22 @@ export default {
           // Step 1: parallel branches
           let accountId: string | null = null;
           let roomDirectRole: string | null = null;
-          let siblingDeviceIds: string[] = []; // pre-fetched for fallback
 
           if (needsAccountResolution && needsRoomCheck) {
             const [acctResult, { data: directHit }] = await Promise.all([
-              // Branch A: resolve account_id, then immediately fetch sibling device_ids
+              // Branch A: resolve account_id ONLY (single query)
               (async () => {
+                const tDev = Date.now();
                 const { data: deviceBinding } = await sb(env)
                   .from("account_devices")
                   .select("account_id")
                   .eq("device_id", user_id)
                   .maybeSingle();
-
-                if (!deviceBinding?.account_id) return { accountId: null as string | null, siblings: [] as string[] };
-
-                const acctId = (deviceBinding as any).account_id as string;
-                // Chain: fetch siblings while room_direct is still running in parallel
-                const { data: allDevices } = await sb(env)
-                  .from("account_devices")
-                  .select("device_id")
-                  .eq("account_id", acctId)
-                  .neq("device_id", user_id);
-
-                const siblings = allDevices
-                  ? (allDevices as any[]).map((d: any) => d.device_id).filter(Boolean)
-                  : [];
-                return { accountId: acctId, siblings };
+                mark("acct_devices");
+                console.log(`[perf] /api/posts acct_devices_ms=${Date.now() - tDev} rid=${request_id}`);
+                return deviceBinding?.account_id
+                  ? ((deviceBinding as any).account_id as string)
+                  : null;
               })(),
               // Branch B: room direct check (only needs user_id)
               sb(env)
@@ -1517,8 +1507,7 @@ export default {
             ]);
             mark("acct_resolve");
 
-            accountId = acctResult.accountId;
-            siblingDeviceIds = acctResult.siblings;
+            accountId = acctResult;
             roomDirectRole = directHit?.role ?? null;
 
             if (!accountId && needsPersonaCheck) {
@@ -1527,12 +1516,15 @@ export default {
             }
           } else if (needsAccountResolution) {
             // Only persona check needed, no room check
+            const tDev = Date.now();
             const { data: deviceBinding } = await sb(env)
               .from("account_devices")
               .select("account_id")
               .eq("device_id", user_id)
               .maybeSingle();
+            mark("acct_devices");
             mark("acct_resolve");
+            console.log(`[perf] /api/posts acct_devices_ms=${Date.now() - tDev} rid=${request_id}`);
 
             if (deviceBinding?.account_id) {
               accountId = (deviceBinding as any).account_id;
@@ -1542,7 +1534,7 @@ export default {
             }
           }
 
-          // Step 2: Persona + room fallback (using pre-fetched siblings) in parallel
+          // Step 2: Persona + room fallback in parallel
           const personaCheckFn = needsPersonaCheck ? async () => {
             const { data: personaBinding } = await sb(env)
               .from("account_personas")
@@ -1559,8 +1551,26 @@ export default {
           } : null;
 
           const roomFallbackFn = (needsRoomCheck && !roomDirectRole) ? async () => {
-            // Direct missed — use pre-fetched siblings (single query remaining)
-            if (!accountId || siblingDeviceIds.length === 0) {
+            // Direct missed — fetch siblings NOW (deferred from Step 1)
+            if (!accountId) {
+              throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
+            }
+
+            const tSib = Date.now();
+            const { data: allDevices } = await sb(env)
+              .from("account_devices")
+              .select("device_id")
+              .eq("account_id", accountId)
+              .neq("device_id", user_id);
+            mark("sibling_fetch");
+            const siblingFetchMs = Date.now() - tSib;
+
+            const siblingDeviceIds = allDevices
+              ? (allDevices as any[]).map((d: any) => d.device_id).filter(Boolean)
+              : [];
+
+            if (siblingDeviceIds.length === 0) {
+              console.log(`[perf] /api/posts sibling_fetch_ms=${siblingFetchMs} siblings=0 rid=${request_id}`);
               throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
             }
 
@@ -1572,6 +1582,7 @@ export default {
               .limit(1)
               .maybeSingle();
             mark("room_fallback");
+            console.log(`[perf] /api/posts sibling_fetch_ms=${siblingFetchMs} siblings=${siblingDeviceIds.length} rid=${request_id}`);
 
             if (!siblingHit?.role) {
               throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
@@ -1749,8 +1760,10 @@ export default {
             jwt_ms: ms("jwt"),
             json_parse_ms: delta("json_parse", "jwt"),
             validation_ms: delta("validation", "json_parse"),
+            acct_devices_ms: delta("acct_devices", "validation"),
             acct_resolve_ms: delta("acct_resolve", "validation"),
             persona_check_ms: delta("persona_check", "acct_resolve") ?? delta("persona_check", "validation"),
+            sibling_fetch_ms: delta("sibling_fetch", "acct_resolve"),
             room_fallback_ms: delta("room_fallback", "acct_resolve"),
             auth_total_ms: ms("auth_done"),
             post_insert_ms: delta("post_insert_done", "auth_done"),
