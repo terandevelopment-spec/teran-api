@@ -1409,26 +1409,46 @@ export default {
 
           // ── Phase 4: Identity resolution + room permission (DB lookups) ──
           // Strategy:
-          //   Step 1 — resolve account_id AND room_direct in PARALLEL
-          //            (room_direct only needs user_id, not accountId)
-          //   Step 2 — persona_check + room_fallback in parallel (if needed)
+          //   Step 1 — parallel(acct_resolve+sibling_prefetch, room_direct)
+          //            Sibling prefetch chains off acct_resolve; its cost is hidden
+          //            under the parallel wait for room_direct.
+          //   Step 2 — persona + room_fallback_IN in parallel (if needed)
           let author_id: string | null = raw_author_id;
           const needsPersonaCheck = !!author_id && author_id !== user_id;
           const needsRoomCheck = !!room_id && room_id !== "global";
           const needsAccountResolution = needsPersonaCheck || needsRoomCheck;
 
-          // Step 1: parallel(acct_resolve, room_direct)
+          // Step 1: parallel branches
           let accountId: string | null = null;
           let roomDirectRole: string | null = null;
+          let siblingDeviceIds: string[] = []; // pre-fetched for fallback
 
           if (needsAccountResolution && needsRoomCheck) {
-            // Both account resolution and room direct check can start simultaneously
-            const [{ data: deviceBinding }, { data: directHit }] = await Promise.all([
-              sb(env)
-                .from("account_devices")
-                .select("account_id")
-                .eq("device_id", user_id)
-                .maybeSingle(),
+            const [acctResult, { data: directHit }] = await Promise.all([
+              // Branch A: resolve account_id, then immediately fetch sibling device_ids
+              (async () => {
+                const { data: deviceBinding } = await sb(env)
+                  .from("account_devices")
+                  .select("account_id")
+                  .eq("device_id", user_id)
+                  .maybeSingle();
+
+                if (!deviceBinding?.account_id) return { accountId: null as string | null, siblings: [] as string[] };
+
+                const acctId = (deviceBinding as any).account_id as string;
+                // Chain: fetch siblings while room_direct is still running in parallel
+                const { data: allDevices } = await sb(env)
+                  .from("account_devices")
+                  .select("device_id")
+                  .eq("account_id", acctId)
+                  .neq("device_id", user_id);
+
+                const siblings = allDevices
+                  ? (allDevices as any[]).map((d: any) => d.device_id).filter(Boolean)
+                  : [];
+                return { accountId: acctId, siblings };
+              })(),
+              // Branch B: room direct check (only needs user_id)
               sb(env)
                 .from("room_members")
                 .select("role")
@@ -1438,14 +1458,14 @@ export default {
             ]);
             mark("acct_resolve");
 
-            if (deviceBinding?.account_id) {
-              accountId = (deviceBinding as any).account_id;
-            } else if (needsPersonaCheck) {
+            accountId = acctResult.accountId;
+            siblingDeviceIds = acctResult.siblings;
+            roomDirectRole = directHit?.role ?? null;
+
+            if (!accountId && needsPersonaCheck) {
               console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
               throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
             }
-
-            roomDirectRole = directHit?.role ?? null;
           } else if (needsAccountResolution) {
             // Only persona check needed, no room check
             const { data: deviceBinding } = await sb(env)
@@ -1463,7 +1483,7 @@ export default {
             }
           }
 
-          // Step 2: Persona + room fallback in parallel (if needed)
+          // Step 2: Persona + room fallback (using pre-fetched siblings) in parallel
           const personaCheckFn = needsPersonaCheck ? async () => {
             const { data: personaBinding } = await sb(env)
               .from("account_personas")
@@ -1480,23 +1500,8 @@ export default {
           } : null;
 
           const roomFallbackFn = (needsRoomCheck && !roomDirectRole) ? async () => {
-            // Direct check already missed in Step 1 — need sibling fallback
-            if (!accountId) {
-              throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
-            }
-
-            const { data: siblings } = await sb(env)
-              .from("account_devices")
-              .select("device_id")
-              .eq("account_id", accountId)
-              .neq("device_id", user_id);
-
-            if (!siblings || siblings.length === 0) {
-              throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
-            }
-
-            const siblingIds = (siblings as any[]).map((s: any) => s.device_id).filter(Boolean);
-            if (siblingIds.length === 0) {
+            // Direct missed — use pre-fetched siblings (single query remaining)
+            if (!accountId || siblingDeviceIds.length === 0) {
               throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
             }
 
@@ -1504,7 +1509,7 @@ export default {
               .from("room_members")
               .select("role")
               .eq("room_id", room_id!)
-              .in("user_id", siblingIds)
+              .in("user_id", siblingDeviceIds)
               .limit(1)
               .maybeSingle();
             mark("room_fallback");
