@@ -2227,7 +2227,7 @@ export default {
           } catch { /* ignore auth errors for GET */ }
 
           // Query 1: Fetch comments (select only needed fields) with keyset pagination
-          let t1 = Date.now();
+          const tSelect = Date.now();
           let commentsQuery = sb(env)
             .from("comments")
             .select("id, post_id, user_id, content, parent_comment_id, author_id, author_name, author_avatar, created_at")
@@ -2241,21 +2241,43 @@ export default {
             .order("created_at", { ascending: true })
             .order("id", { ascending: true })
             .limit(limit);
-          console.log(`[perf] /api/comments comments_query ${Date.now() - t1}ms`, { post_id, limit, cursor: !!cursor, count: comments?.length });
+          const selectMs = Date.now() - tSelect;
           if (error) throw error;
 
           const commentList = comments ?? [];
           if (commentList.length === 0) {
-            console.log(`[perf] /api/comments total ${Date.now() - handlerStart}ms (empty)`);
+            const totalMs = Date.now() - handlerStart;
+            console.log(`[perf] /api/comments`, JSON.stringify({ rid: request_id, select_ms: selectMs, rows: 0, total_ms: totalMs, empty: true }));
             return ok(req, env, request_id, { items: [], next_cursor: null });
           }
 
           const commentIds = commentList.map((c: any) => c.id);
 
-          // Queries 2-5: Run ALL enrichment in parallel (likes, user likes, media, profiles)
+          // Profile overlay: KV-cached first, DB fallback only for misses
+          const tProf = Date.now();
           const commentAuthorIds = [...new Set(commentList.map((c: any) => c.author_id).filter(Boolean))];
-          t1 = Date.now();
-          const [likesResult, userLikesResult, mediaResult, profileResult] = await Promise.all([
+          let commentProfileMap: Record<string, { display_name?: string; avatar?: string }> = {};
+          const kvMissIds: string[] = [];
+          let profKvHits = 0;
+          for (const authorId of commentAuthorIds) {
+            try {
+              const kvRaw = await env.PROFILE_KV.get(`profile:${authorId}`, "text");
+              if (kvRaw) {
+                const parsed = JSON.parse(kvRaw);
+                commentProfileMap[authorId] = { display_name: parsed.display_name, avatar: parsed.avatar };
+                profKvHits++;
+              } else {
+                kvMissIds.push(authorId);
+              }
+            } catch {
+              kvMissIds.push(authorId);
+            }
+          }
+          const profKvMs = Date.now() - tProf;
+
+          // Queries 2-4(5): Run enrichment in parallel (likes, user likes, media, + profile DB fallback)
+          const tParallel = Date.now();
+          const parallelQueries: PromiseLike<any>[] = [
             // Query 2: Get like counts for all comments
             sb(env)
               .from("comment_likes")
@@ -2274,17 +2296,33 @@ export default {
               .from("media")
               .select("id, comment_id, type, key, thumb_key, width, height")
               .in("comment_id", commentIds),
-            // Query 5: Live profile overlay (was sequential — now parallel)
-            commentAuthorIds.length > 0
-              ? sb(env)
+          ];
+          // Query 5 (conditional): profile DB fallback only for KV misses
+          if (kvMissIds.length > 0) {
+            parallelQueries.push(
+              sb(env)
                 .from("user_profiles")
                 .select("user_id, display_name, avatar")
-                .in("user_id", commentAuthorIds)
-              : Promise.resolve({ data: [] }),
-          ]);
-          console.log(`[perf] /api/comments parallel_queries ${Date.now() - t1}ms`);
+                .in("user_id", kvMissIds)
+            );
+          }
+          const results = await Promise.all(parallelQueries);
+          const parallelMs = Date.now() - tParallel;
+          const dbQueries = parallelQueries.length;
+
+          const likesResult = results[0];
+          const userLikesResult = results[1];
+          const mediaResult = results[2];
+
+          // Merge profile DB fallback results
+          if (results.length > 3 && results[3]?.data) {
+            for (const row of results[3].data as any[]) {
+              commentProfileMap[row.user_id] = { display_name: row.display_name, avatar: row.avatar };
+            }
+          }
 
           // Aggregate like counts
+          const tTransform = Date.now();
           const likeCounts: Record<number, number> = {};
           for (const like of likesResult.data ?? []) {
             likeCounts[like.comment_id] = (likeCounts[like.comment_id] || 0) + 1;
@@ -2303,12 +2341,6 @@ export default {
             mediaByComment[m.comment_id].push(m);
           }
 
-          // Build profile map from parallel result
-          let commentProfileMap: Record<string, { display_name?: string; avatar?: string }> = {};
-          for (const row of (profileResult.data ?? []) as any[]) {
-            commentProfileMap[row.user_id] = { display_name: row.display_name, avatar: row.avatar };
-          }
-
           // Enrich comments with like data, media, and live identity overlay
           const enrichedComments = commentList.map((c: any) => {
             const prof = commentProfileMap[c.author_id];
@@ -2321,9 +2353,11 @@ export default {
               media: mediaByComment[c.id] || [],
             };
           });
+          const transformMs = Date.now() - tTransform;
 
           const next_cursor = buildNextCursor(commentList, limit);
-          console.log(`[perf] /api/comments total ${Date.now() - handlerStart}ms`, { post_id, comments: commentList.length, next_cursor: !!next_cursor });
+          const totalMs = Date.now() - handlerStart;
+          console.log(`[perf] /api/comments`, JSON.stringify({ rid: request_id, select_ms: selectMs, prof_kv_ms: profKvMs, prof_kv_hits: profKvHits, prof_kv_misses: kvMissIds.length, parallel_ms: parallelMs, db_queries: dbQueries, transform_ms: transformMs, rows: commentList.length, total_ms: totalMs }));
           return ok(req, env, request_id, { items: enrichedComments, next_cursor });
         }
 
