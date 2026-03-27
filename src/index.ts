@@ -1453,34 +1453,42 @@ export default {
           } : null;
 
           const roomCheckFn = needsRoomCheck ? async () => {
-            // Fast path: direct check by current device_id (1 query)
-            const { data: directHit } = await sb(env)
+            // Run direct check and sibling fetch in PARALLEL.
+            // If direct hits, we're done. If not, siblings are already fetched.
+            const directPromise = sb(env)
               .from("room_members")
               .select("role")
               .eq("room_id", room_id!)
               .eq("user_id", user_id)
               .maybeSingle();
+
+            // Start sibling fetch simultaneously (only useful if direct misses)
+            const siblingsPromise = accountId
+              ? sb(env)
+                  .from("account_devices")
+                  .select("device_id")
+                  .eq("account_id", accountId)
+                  .neq("device_id", user_id)
+              : Promise.resolve({ data: null });
+
+            const [{ data: directHit }, { data: siblings }] = await Promise.all([
+              directPromise,
+              siblingsPromise,
+            ]);
             mark("room_direct");
 
             if (directHit?.role) return; // ← hot path exits here
 
-            // Slow path: account-aware fallback (only after re-login with new device_id)
-            if (!accountId) {
+            // Fallback: use pre-fetched siblings
+            if (!accountId || !siblings || siblings.length === 0) {
               throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
             }
 
-            const { data: siblings } = await sb(env)
-              .from("account_devices")
-              .select("device_id")
-              .eq("account_id", accountId)
-              .neq("device_id", user_id);
-            mark("room_siblings");
-
-            if (!siblings || siblings.length === 0) {
+            const siblingIds = (siblings as any[]).map((s: any) => s.device_id).filter(Boolean);
+            if (siblingIds.length === 0) {
               throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
             }
 
-            const siblingIds = siblings.map((s: any) => s.device_id).filter(Boolean);
             const { data: siblingHit } = await sb(env)
               .from("room_members")
               .select("role")
@@ -1493,6 +1501,24 @@ export default {
             if (!siblingHit?.role) {
               throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
             }
+
+            // Self-heal: replicate membership to current device_id so future
+            // posts hit the direct check and skip the entire fallback chain.
+            ctx.waitUntil((async () => {
+              try {
+                await sb(env)
+                  .from("room_members")
+                  .upsert({
+                    room_id: room_id,
+                    user_id: user_id,
+                    role: (siblingHit as any).role,
+                  } as any, { onConflict: "room_id,user_id" });
+              } catch (e: any) {
+                console.warn(`[room-selfheal] upsert failed (non-fatal)`, {
+                  rid: request_id, room_id, user_id, error: e?.message,
+                });
+              }
+            })());
           } : null;
 
           if (personaCheckFn && roomCheckFn) {
@@ -1646,8 +1672,7 @@ export default {
             acct_resolve_ms: delta("acct_resolve", "validation"),
             persona_check_ms: delta("persona_check", "acct_resolve") ?? delta("persona_check", "validation"),
             room_direct_ms: delta("room_direct", "acct_resolve") ?? delta("room_direct", "validation"),
-            room_siblings_ms: delta("room_siblings", "room_direct"),
-            room_fallback_ms: delta("room_fallback", "room_siblings"),
+            room_fallback_ms: delta("room_fallback", "room_direct"),
             auth_total_ms: ms("auth_done"),
             post_insert_ms: delta("post_insert_done", "auth_done"),
             media_insert_ms: delta("media_insert_done", "post_insert_done"),
