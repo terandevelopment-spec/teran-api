@@ -377,13 +377,44 @@ async function optionalAuth(req: Request, env: Env): Promise<string | null> {
 }
 
 async function checkRoomMembership(env: Env, roomId: string, userId: string): Promise<string | null> {
+  // Direct check: membership under this device_id
   const { data } = await sb(env)
     .from("room_members")
     .select("role")
     .eq("room_id", roomId)
     .eq("user_id", userId)
     .maybeSingle();
-  return data?.role ?? null;
+  if (data?.role) return data.role;
+
+  // Account-aware fallback: after teran ID login, the new device_id may not
+  // have room_members rows. Check sibling device_ids on the same account.
+  const { data: binding } = await sb(env)
+    .from("account_devices")
+    .select("account_id")
+    .eq("device_id", userId)
+    .maybeSingle();
+  if (!binding?.account_id) return null;
+
+  const { data: siblings } = await sb(env)
+    .from("account_devices")
+    .select("device_id")
+    .eq("account_id", (binding as any).account_id)
+    .neq("device_id", userId);
+
+  if (!siblings || siblings.length === 0) return null;
+
+  const siblingIds = siblings.map((s: any) => s.device_id).filter(Boolean);
+  if (siblingIds.length === 0) return null;
+
+  const { data: siblingMembership } = await sb(env)
+    .from("room_members")
+    .select("role")
+    .eq("room_id", roomId)
+    .in("user_id", siblingIds)
+    .limit(1)
+    .maybeSingle();
+
+  return siblingMembership?.role ?? null;
 }
 
 function generateInviteToken(): string {
