@@ -931,15 +931,18 @@ export default {
           const uniqueAuthorIds = [...new Set((posts ?? []).map((p: any) => p.author_id).filter(Boolean))];
           let teranIdMap: Record<string, string | null> = {};
           let teranIdMs = 0;
+          // Build a profileMap for live identity overlay (display_name, avatar)
+          const profileMap: Record<string, { display_name?: string; avatar?: string }> = {};
           if (!light && uniqueAuthorIds.length > 0) {
             const tTid = Date.now();
             const { data: tidRows } = await sb(env)
               .from("user_profiles")
-              .select("user_id, teran_id")
+              .select("user_id, teran_id, display_name, avatar")
               .in("user_id", uniqueAuthorIds);
             teranIdMs = Date.now() - tTid;
             for (const row of (tidRows ?? []) as any[]) {
               if (row.teran_id) teranIdMap[row.user_id] = row.teran_id;
+              profileMap[row.user_id] = { display_name: row.display_name, avatar: row.avatar };
             }
           }
 
@@ -1059,9 +1062,14 @@ export default {
               if (typeof avatar === "string" && avatar.startsWith("data:")) {
                 avatar = null;
               }
+              // Live identity overlay: prefer user_profiles values over post snapshot
+              const profile = profileMap[p.author_id];
+              const liveDisplayName = profile?.display_name || null;
+              const liveAvatar = profile?.avatar || null;
               return {
                 ...p,
-                author_avatar: avatar,
+                author_name: liveDisplayName || p.author_name,
+                author_avatar: liveAvatar || avatar,
                 media: mediaByPost[p.id] || [],
                 like_count: likeCounts[p.id] || 0,
                 liked_by_me: likedByActorSet.has(p.id),
@@ -2028,13 +2036,31 @@ export default {
             mediaByComment[m.comment_id].push(m);
           }
 
-          // Enrich comments with like data and media
-          const enrichedComments = commentList.map((c: any) => ({
-            ...c,
-            like_count: likeCounts[c.id] || 0,
-            liked_by_me: likedByMe.has(c.id),
-            media: mediaByComment[c.id] || [],
-          }));
+          // Batch-fetch live profiles for identity overlay
+          const commentAuthorIds = [...new Set(commentList.map((c: any) => c.author_id).filter(Boolean))];
+          let commentProfileMap: Record<string, { display_name?: string; avatar?: string }> = {};
+          if (commentAuthorIds.length > 0) {
+            const { data: profRows } = await sb(env)
+              .from("user_profiles")
+              .select("user_id, display_name, avatar")
+              .in("user_id", commentAuthorIds);
+            for (const row of (profRows ?? []) as any[]) {
+              commentProfileMap[row.user_id] = { display_name: row.display_name, avatar: row.avatar };
+            }
+          }
+
+          // Enrich comments with like data, media, and live identity overlay
+          const enrichedComments = commentList.map((c: any) => {
+            const prof = commentProfileMap[c.author_id];
+            return {
+              ...c,
+              author_name: prof?.display_name || c.author_name,
+              author_avatar: prof?.avatar || c.author_avatar,
+              like_count: likeCounts[c.id] || 0,
+              liked_by_me: likedByMe.has(c.id),
+              media: mediaByComment[c.id] || [],
+            };
+          });
 
           const next_cursor = buildNextCursor(commentList, limit);
           console.log(`[perf] /api/comments total ${Date.now() - handlerStart}ms`, { post_id, comments: commentList.length, next_cursor: !!next_cursor });
@@ -4964,13 +4990,31 @@ export default {
             mediaByComment[m.news_comment_id].push(m);
           }
 
-          // Enrich comments with likes + media
-          const enrichedComments = commentList.map((c: any) => ({
-            ...c,
-            like_count: likeCounts[c.id] || 0,
-            liked_by_me: likedByMe.has(c.id),
-            media: mediaByComment[c.id] || [],
-          }));
+          // Batch-fetch live profiles for identity overlay
+          const newsCommentAuthorIds = [...new Set(commentList.map((c: any) => c.author_id).filter(Boolean))];
+          let newsCommentProfileMap: Record<string, { display_name?: string; avatar?: string }> = {};
+          if (newsCommentAuthorIds.length > 0) {
+            const { data: profRows } = await sb(env)
+              .from("user_profiles")
+              .select("user_id, display_name, avatar")
+              .in("user_id", newsCommentAuthorIds);
+            for (const row of (profRows ?? []) as any[]) {
+              newsCommentProfileMap[row.user_id] = { display_name: row.display_name, avatar: row.avatar };
+            }
+          }
+
+          // Enrich comments with likes, media, and live identity overlay
+          const enrichedComments = commentList.map((c: any) => {
+            const prof = newsCommentProfileMap[c.author_id];
+            return {
+              ...c,
+              author_name: prof?.display_name || c.author_name,
+              author_avatar: prof?.avatar || c.author_avatar,
+              like_count: likeCounts[c.id] || 0,
+              liked_by_me: likedByMe.has(c.id),
+              media: mediaByComment[c.id] || [],
+            };
+          });
 
           const next_cursor = buildNextCursor(commentList, limit);
           return ok(req, env, request_id, { items: enrichedComments, next_cursor });
