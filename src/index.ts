@@ -1408,82 +1408,85 @@ export default {
           mark("validation");
 
           // ── Phase 4: Identity resolution + room permission (DB lookups) ──
-          // OWNERSHIP CHECK: verify the caller is allowed to use this author_id.
-          // If raw_author_id matches the JWT device_id, allow (self).
-          // If raw_author_id is null/missing, default to user_id (device_id).
-          // Otherwise, check via account_devices → account_personas binding.
+          // Strategy: resolve account_id + all device_ids ONCE, then reuse for
+          // both persona ownership and room membership checks.
           let author_id: string | null = raw_author_id;
           const needsPersonaCheck = !!author_id && author_id !== user_id;
           const needsRoomCheck = !!room_id && room_id !== "global";
+          const needsAccountResolution = needsPersonaCheck || needsRoomCheck;
 
-          if (needsPersonaCheck && needsRoomCheck) {
-            // Both needed → run persona ownership chain and room membership in parallel
-            await Promise.all([
-              (async () => {
-                const { data: deviceBinding } = await sb(env)
+          // Step 1: Resolve account + all device_ids (shared by persona + room checks)
+          let accountId: string | null = null;
+          let allDeviceIds: string[] = [user_id]; // always includes current device_id
+
+          if (needsAccountResolution) {
+            const { data: deviceBinding } = await sb(env)
+              .from("account_devices")
+              .select("account_id")
+              .eq("device_id", user_id)
+              .maybeSingle();
+            mark("acct_resolve");
+
+            if (deviceBinding?.account_id) {
+              accountId = (deviceBinding as any).account_id;
+
+              // Fetch all sibling device_ids (needed for room membership fallback)
+              if (needsRoomCheck) {
+                const { data: allDevices } = await sb(env)
                   .from("account_devices")
-                  .select("account_id")
-                  .eq("device_id", user_id)
-                  .maybeSingle();
-
-                if (!deviceBinding?.account_id) {
-                  console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
-                  throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+                  .select("device_id")
+                  .eq("account_id", accountId!);
+                if (allDevices && allDevices.length > 0) {
+                  allDeviceIds = [...new Set(allDevices.map((d: any) => d.device_id).filter(Boolean))];
                 }
+              }
+            } else if (needsPersonaCheck) {
+              // Unclaimed device cannot act as a different persona
+              console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
+              throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+            }
+          }
 
-                const { data: personaBinding } = await sb(env)
-                  .from("account_personas")
-                  .select("persona_author_id")
-                  .eq("account_id", deviceBinding.account_id)
-                  .eq("persona_author_id", author_id!)
-                  .maybeSingle();
+          // Step 2: Persona verification + room membership (parallel when both needed)
+          const personaCheckFn = needsPersonaCheck ? async () => {
+            const { data: personaBinding } = await sb(env)
+              .from("account_personas")
+              .select("persona_author_id")
+              .eq("account_id", accountId!)
+              .eq("persona_author_id", author_id!)
+              .maybeSingle();
 
-                if (!personaBinding) {
-                  console.warn(`[posts-auth] REJECTED: device ${user_id} account ${deviceBinding.account_id} does not own persona ${author_id}`);
-                  throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
-                }
-                mark("identity");
-              })(),
-              (async () => {
-                const memberRole = await checkRoomMembership(env, room_id!, user_id);
-                if (!memberRole) throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
-                mark("room");
-              })(),
-            ]);
+            if (!personaBinding) {
+              console.warn(`[posts-auth] REJECTED: device ${user_id} account ${accountId} does not own persona ${author_id}`);
+              throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+            }
+            mark("persona_check");
+          } : null;
+
+          const roomCheckFn = needsRoomCheck ? async () => {
+            // Single query using all device_ids bound to this account
+            const { data: membership } = await sb(env)
+              .from("room_members")
+              .select("role")
+              .eq("room_id", room_id!)
+              .in("user_id", allDeviceIds)
+              .limit(1)
+              .maybeSingle();
+
+            if (!membership?.role) {
+              throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
+            }
+            mark("room_check");
+          } : null;
+
+          if (personaCheckFn && roomCheckFn) {
+            await Promise.all([personaCheckFn(), roomCheckFn()]);
+          } else if (personaCheckFn) {
+            await personaCheckFn();
+          } else if (roomCheckFn) {
+            await roomCheckFn();
           } else {
-            if (needsPersonaCheck) {
-              const { data: deviceBinding } = await sb(env)
-                .from("account_devices")
-                .select("account_id")
-                .eq("device_id", user_id)
-                .maybeSingle();
-
-              if (!deviceBinding?.account_id) {
-                console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
-                throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
-              }
-
-              const { data: personaBinding } = await sb(env)
-                .from("account_personas")
-                .select("persona_author_id")
-                .eq("account_id", deviceBinding.account_id)
-                .eq("persona_author_id", author_id!)
-                .maybeSingle();
-
-              if (!personaBinding) {
-                console.warn(`[posts-auth] REJECTED: device ${user_id} account ${deviceBinding.account_id} does not own persona ${author_id}`);
-                throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
-              }
-              mark("identity");
-            } else {
-              if (!author_id) author_id = user_id;
-            }
-
-            if (needsRoomCheck) {
-              const memberRole = await checkRoomMembership(env, room_id!, user_id);
-              if (!memberRole) throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
-              mark("room");
-            }
+            if (!author_id) author_id = user_id;
           }
 
           mark("auth_done");
@@ -1624,8 +1627,9 @@ export default {
             jwt_ms: ms("jwt"),
             json_parse_ms: delta("json_parse", "jwt"),
             validation_ms: delta("validation", "json_parse"),
-            identity_ms: ms("identity") ? +((marks.identity - marks.validation).toFixed(1)) : null,
-            room_ms: ms("room") ? +((marks.room - marks.validation).toFixed(1)) : null,
+            acct_resolve_ms: delta("acct_resolve", "validation"),
+            persona_check_ms: delta("persona_check", "acct_resolve") ?? delta("persona_check", "validation"),
+            room_check_ms: delta("room_check", "acct_resolve") ?? delta("room_check", "validation"),
             auth_total_ms: ms("auth_done"),
             post_insert_ms: delta("post_insert_done", "auth_done"),
             media_insert_ms: delta("media_insert_done", "post_insert_done"),
