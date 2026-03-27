@@ -1235,71 +1235,32 @@ export default {
           const marks: Record<string, number> = {};
           const mark = (k: string) => { marks[k] = performance.now(); };
 
+          // ── Phase 1: JWT verification ──
           const user_id = await requireAuth(req, env);
+          mark("jwt");
 
+          // ── Phase 2: Body parse ──
           const body = (await req.json().catch(() => null)) as any;
-          const content = typeof body?.content === "string" ? body.content.trim() : "";
+          mark("json_parse");
 
-          // Parse media early so we can validate content OR media requirement
+          // ── Phase 3: All cheap validation (fail-fast before any DB call) ──
+          const content = typeof body?.content === "string" ? body.content.trim() : "";
           const mediaInput = Array.isArray(body?.media) ? body.media : [];
           if (!content && mediaInput.length === 0) {
             throw new HttpError(422, "VALIDATION_ERROR", "content or media required");
           }
 
-          // Parse optional author fields from request
           const title = typeof body?.title === "string" ? body.title.trim() : "";
           // SECURITY: author_id from body is untrusted — must verify the caller
           // owns this persona before allowing them to post as it.
           const raw_author_id = typeof body?.author_id === "string" ? body.author_id.trim() : null;
-
-          // OWNERSHIP CHECK: verify the caller is allowed to use this author_id.
-          // If raw_author_id matches the JWT device_id, allow (self).
-          // If raw_author_id is null/missing, default to user_id (device_id).
-          // Otherwise, check via account_devices → account_personas binding.
-          let author_id: string | null = raw_author_id;
-          if (!author_id) {
-            // No persona specified → post as device identity
-            author_id = user_id;
-          } else if (author_id !== user_id) {
-            // Persona differs from device_id → verify ownership
-            const { data: deviceBinding } = await sb(env)
-              .from("account_devices")
-              .select("account_id")
-              .eq("device_id", user_id)
-              .maybeSingle();
-
-            if (!deviceBinding?.account_id) {
-              // Unclaimed device cannot act as a different persona
-              console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
-              throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
-            }
-
-            const { data: personaBinding } = await sb(env)
-              .from("account_personas")
-              .select("persona_author_id")
-              .eq("account_id", deviceBinding.account_id)
-              .eq("persona_author_id", author_id)
-              .maybeSingle();
-
-            if (!personaBinding) {
-              console.warn(`[posts-auth] REJECTED: device ${user_id} account ${deviceBinding.account_id} does not own persona ${author_id}`);
-              throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
-            }
-          }
           const author_name = typeof body?.author_name === "string" ? body.author_name : null;
           const rawAuthorAvatar = typeof body?.author_avatar === "string" ? body.author_avatar : null;
-          // Reject data URIs to prevent storing MB-sized base64 in DB
           if (rawAuthorAvatar && rawAuthorAvatar.startsWith("data:")) {
             throw new HttpError(422, "VALIDATION_ERROR", "author_avatar must be a URL, not a data URI");
           }
           const author_avatar = rawAuthorAvatar;
           const room_id = typeof body?.room_id === "string" ? body.room_id : null;
-
-          // Room post policy enforcement: membership always required for room posts
-          if (room_id && room_id !== "global") {
-            const memberRole = await checkRoomMembership(env, room_id, user_id);
-            if (!memberRole) throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
-          }
 
           // Parse reply/share fields with robust numeric coercion
           const rawParentPostId = body?.parent_post_id;
@@ -1309,7 +1270,6 @@ export default {
           const post_type = typeof rawPostType === "string" && ["status", "share", "thread"].includes(rawPostType)
             ? rawPostType
             : "status";
-
 
           // ── Text length limits (must match frontend LIMITS constants) ──
           const LIMIT_STATUS_CONTENT = 360;
@@ -1337,14 +1297,12 @@ export default {
           const isProd = (env as any).ENVIRONMENT === "production" || !(env as any).ENVIRONMENT;
 
           if (!isValidMode && !isProd) {
-            // Dev/staging: strict — reject immediately with 400
             console.warn(`[posts][${request_id}] REJECT invalid mode`, { raw: rawMode, user_id, ua: req.headers.get("user-agent")?.slice(0, 80) });
             throw new HttpError(400, "invalid_mode", `mode must be one of: ${[...ALLOWED_MODES].join(", ")}`);
           }
 
           const mode: string = isValidMode ? rawMode! : DEFAULT_MODE;
           if (!isValidMode) {
-            // Production: fallback + WARN for monitoring
             console.warn(`[posts][${request_id}] WARN mode_fallback`, {
               received: rawMode, normalized: mode, user_id,
               ua: req.headers.get("user-agent")?.slice(0, 80),
@@ -1359,11 +1317,9 @@ export default {
               .slice(0, MAX_MOODS);
           }
 
-          // Media limits
+          // Media validation
           const MAX_IMAGES = 4;
           const MAX_VIDEOS = 1;
-
-          // Validate media items (images + video)
           const validatedMedia: Array<{
             type: "image" | "video";
             key: string;
@@ -1391,7 +1347,6 @@ export default {
               if (imageCount > MAX_IMAGES) {
                 throw new HttpError(422, "VALIDATION_ERROR", `Maximum ${MAX_IMAGES} images allowed`);
               }
-              // Require thumb_key for images
               if (!mThumbKey || typeof mThumbKey !== "string" || !mThumbKey.trim()) {
                 throw new HttpError(422, "VALIDATION_ERROR", "thumb_key is required for images");
               }
@@ -1417,6 +1372,86 @@ export default {
               });
             } else {
               throw new HttpError(422, "VALIDATION_ERROR", "Media type must be 'image' or 'video'");
+            }
+          }
+          mark("validation");
+
+          // ── Phase 4: Identity resolution + room permission (DB lookups) ──
+          // OWNERSHIP CHECK: verify the caller is allowed to use this author_id.
+          // If raw_author_id matches the JWT device_id, allow (self).
+          // If raw_author_id is null/missing, default to user_id (device_id).
+          // Otherwise, check via account_devices → account_personas binding.
+          let author_id: string | null = raw_author_id;
+          const needsPersonaCheck = !!author_id && author_id !== user_id;
+          const needsRoomCheck = !!room_id && room_id !== "global";
+
+          if (needsPersonaCheck && needsRoomCheck) {
+            // Both needed → run persona ownership chain and room membership in parallel
+            await Promise.all([
+              (async () => {
+                const { data: deviceBinding } = await sb(env)
+                  .from("account_devices")
+                  .select("account_id")
+                  .eq("device_id", user_id)
+                  .maybeSingle();
+
+                if (!deviceBinding?.account_id) {
+                  console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
+                  throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+                }
+
+                const { data: personaBinding } = await sb(env)
+                  .from("account_personas")
+                  .select("persona_author_id")
+                  .eq("account_id", deviceBinding.account_id)
+                  .eq("persona_author_id", author_id!)
+                  .maybeSingle();
+
+                if (!personaBinding) {
+                  console.warn(`[posts-auth] REJECTED: device ${user_id} account ${deviceBinding.account_id} does not own persona ${author_id}`);
+                  throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+                }
+                mark("identity");
+              })(),
+              (async () => {
+                const memberRole = await checkRoomMembership(env, room_id!, user_id);
+                if (!memberRole) throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
+                mark("room");
+              })(),
+            ]);
+          } else {
+            if (needsPersonaCheck) {
+              const { data: deviceBinding } = await sb(env)
+                .from("account_devices")
+                .select("account_id")
+                .eq("device_id", user_id)
+                .maybeSingle();
+
+              if (!deviceBinding?.account_id) {
+                console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
+                throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+              }
+
+              const { data: personaBinding } = await sb(env)
+                .from("account_personas")
+                .select("persona_author_id")
+                .eq("account_id", deviceBinding.account_id)
+                .eq("persona_author_id", author_id!)
+                .maybeSingle();
+
+              if (!personaBinding) {
+                console.warn(`[posts-auth] REJECTED: device ${user_id} account ${deviceBinding.account_id} does not own persona ${author_id}`);
+                throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+              }
+              mark("identity");
+            } else {
+              if (!author_id) author_id = user_id;
+            }
+
+            if (needsRoomCheck) {
+              const memberRole = await checkRoomMembership(env, room_id!, user_id);
+              if (!memberRole) throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
+              mark("room");
             }
           }
 
@@ -1549,15 +1584,24 @@ export default {
           }
 
           mark("handler_done");
-          console.log(
-            `[perf][posts] rid=${request_id} post_type=${post_type} parent_post_id=${parent_post_id ?? "null"} ` +
-            `total_ms=${(marks.handler_done - t0).toFixed(1)} ` +
-            `auth_ms=${marks.auth_done ? (marks.auth_done - t0).toFixed(1) : "na"} ` +
-            `post_insert_ms=${marks.post_insert_done ? (marks.post_insert_done - (marks.auth_done ?? t0)).toFixed(1) : "na"} ` +
-            `media_insert_ms=${marks.media_insert_done ? (marks.media_insert_done - (marks.post_insert_done ?? marks.auth_done ?? t0)).toFixed(1) : "na"} ` +
-            `notif_prepare_ms=${marks.notif_prepare_done ? (marks.notif_prepare_done - (marks.media_insert_done ?? marks.post_insert_done ?? t0)).toFixed(1) : "na"} ` +
-            `notif_insert_ms=${marks.notif_insert_done ? (marks.notif_insert_done - (marks.notif_prepare_done ?? marks.post_insert_done ?? t0)).toFixed(1) : "na"}`
-          );
+          const ms = (k: string) => marks[k] ? +((marks[k] - t0).toFixed(1)) : null;
+          const delta = (a: string, b: string) => (marks[a] && marks[b]) ? +((marks[a] - marks[b]).toFixed(1)) : null;
+          logPerf("/api/posts", {
+            rid: request_id,
+            post_type,
+            parent_post_id: parent_post_id ?? null,
+            jwt_ms: ms("jwt"),
+            json_parse_ms: delta("json_parse", "jwt"),
+            validation_ms: delta("validation", "json_parse"),
+            identity_ms: ms("identity") ? +((marks.identity - marks.validation).toFixed(1)) : null,
+            room_ms: ms("room") ? +((marks.room - marks.validation).toFixed(1)) : null,
+            auth_total_ms: ms("auth_done"),
+            post_insert_ms: delta("post_insert_done", "auth_done"),
+            media_insert_ms: delta("media_insert_done", "post_insert_done"),
+            notif_prepare_ms: delta("notif_prepare_done", "media_insert_done") ?? delta("notif_prepare_done", "post_insert_done"),
+            notif_insert_ms: delta("notif_insert_done", "notif_prepare_done"),
+            total_ms: ms("handler_done"),
+          });
 
           return ok(req, env, request_id, { post: { ...data, media: mediaRows } }, 201);
         }
