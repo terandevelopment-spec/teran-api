@@ -875,6 +875,65 @@ export default {
             return ok(req, env, request_id, { posts: [] });
           }
 
+          // ── Single-post fast path ──
+          // When fetching exactly 1 post by id, use lightweight enrichment:
+          // - Re-fetch with PostgREST embedded media join (eliminates separate media query)
+          // - Parallel: likes + user_profiles only (skip commentCounts RPC)
+          // - comment_count defaults to 0 (thread UI fetches comments separately)
+          if (id_param && postIds.length === 1) {
+            const singlePost = (posts as any[])[0];
+            const singleId = singlePost.id;
+            const fastStart = Date.now();
+
+            // Re-fetch with embedded media join for single post
+            const { data: richPost, error: richErr } = await sb(env)
+              .from("posts")
+              .select(`*, media(id, post_id, type, key, thumb_key, width, height, duration_ms)`)
+              .eq("id", singleId)
+              .is("deleted_at", null)
+              .maybeSingle();
+            const embedMs = Date.now() - fastStart;
+
+            if (richErr || !richPost) {
+              console.log(`[perf] /api/posts single_post_fast FALLBACK rid=${request_id} embed_err=${!!richErr}`);
+              // Fall through to standard enrichment below
+            } else {
+              // Parallel: likes + profile (2 queries instead of 4)
+              const pStart = Date.now();
+              const [likeData, profileData] = await Promise.all([
+                sb(env).from("post_likes").select("post_id, actor_id").eq("post_id", singleId),
+                singlePost.author_id
+                  ? sb(env).from("user_profiles").select("user_id, teran_id, display_name, avatar").eq("user_id", singlePost.author_id).maybeSingle()
+                  : Promise.resolve({ data: null }),
+              ]);
+              const parallelFastMs = Date.now() - pStart;
+
+              const likes = likeData.data ?? [];
+              const likeCount = likes.length;
+              const likedByMe = actor_id_param ? likes.some((l: any) => l.actor_id === actor_id_param) : false;
+              const profile = (profileData as any).data;
+
+              let avatar = richPost.author_avatar;
+              if (typeof avatar === "string" && avatar.startsWith("data:")) avatar = null;
+
+              const enriched = {
+                ...richPost,
+                media: Array.isArray(richPost.media) ? richPost.media : [],
+                author_name: profile?.display_name || richPost.author_name,
+                author_avatar: profile?.avatar || avatar,
+                like_count: likeCount,
+                liked_by_me: likedByMe,
+                comment_count: 0,  // thread UI fetches comments separately
+                teran_id: profile?.teran_id ?? null,
+              };
+
+              const totalFastMs = Date.now() - fastStart;
+              console.log(`[perf] /api/posts single_post_fast rid=${request_id} path=single_post_fast embed_ms=${embedMs} parallel_ms=${parallelFastMs} total_ms=${totalFastMs} likes=${likeCount} media=${enriched.media.length}`);
+
+              return ok(req, env, request_id, { posts: [enriched] });
+            }
+          }
+
           // ── Suspect isolation: diag modes ──
           const postsSelectMs = +(p3 - p2).toFixed(1);
           if (diag_param === "posts_only") {
