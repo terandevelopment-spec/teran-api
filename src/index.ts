@@ -789,6 +789,25 @@ export default {
           let replyStatus = 0;
           let replyHeaders: Record<string, string> = {};
 
+          // ── Speculative: fire auxiliary queries for single-post fast path ──
+          // post_id is known from the URL param, so media + likes can start
+          // in parallel with the main SELECT instead of waiting for it.
+          let speculativeAux: PromiseLike<any[]> | null = null;
+          const specStartMs = Date.now();
+          if (id_param && !isReplyQuery) {
+            const postId = Number(id_param);
+            if (Number.isFinite(postId)) {
+              speculativeAux = Promise.all([
+                sb(env).from("media")
+                  .select("id, post_id, type, key, thumb_key, width, height, duration_ms")
+                  .eq("post_id", postId),
+                sb(env).from("post_likes")
+                  .select("post_id, actor_id")
+                  .eq("post_id", postId),
+              ]);
+            }
+          }
+
           if (isReplyQuery) {
             // ── Direct PostgREST fetch for reply queries: HTTP timing + header capture ──
             const parsedPpid = Number(parent_post_id_param);
@@ -876,12 +895,12 @@ export default {
           }
 
           // ── Single-post fast path ──
-          // Post is already fetched above. Only need: media, likes, profile.
-          // media + likes run in parallel DB queries; profile uses KV cache (populated by /api/profile).
+          // Post is already fetched above. media + likes were fired speculatively
+          // BEFORE the main SELECT, so they ran in parallel with it.
+          // Awaiting them here is nearly free (~0-10ms wait).
           // comment_count defaults to 0 (thread UI fetches comments separately)
-          if (id_param && postIds.length === 1) {
+          if (id_param && postIds.length === 1 && speculativeAux) {
             const singlePost = (posts as any[])[0];
-            const singleId = singlePost.id;
             const fastStart = Date.now();
 
             // Profile: KV-cached lookup first, DB fallback only on miss
@@ -900,37 +919,22 @@ export default {
             }
             const profKvMs = Date.now() - tProf;
 
-            // Parallel: media + likes (2 DB queries). Add profile DB fallback if KV missed.
-            const tPar = Date.now();
-            const parallelQueries: PromiseLike<any>[] = [
-              // Query 1: media for this post
-              sb(env).from("media")
-                .select("id, post_id, type, key, thumb_key, width, height, duration_ms")
-                .eq("post_id", singleId),
-              // Query 2: likes for this post
-              sb(env).from("post_likes")
-                .select("post_id, actor_id")
-                .eq("post_id", singleId),
-            ];
-            // Query 3 (conditional): profile DB fallback only if KV missed
+            // Await speculative results (fired before main SELECT — should already be done)
+            const tAux = Date.now();
+            const auxResults = await speculativeAux;
+            // Profile DB fallback if KV missed — fire now (only query that needs post data)
             if (singlePost.author_id && !profile) {
               profSrc = "db";
-              parallelQueries.push(
-                sb(env).from("user_profiles")
-                  .select("user_id, teran_id, display_name, avatar")
-                  .eq("user_id", singlePost.author_id)
-                  .maybeSingle()
-              );
+              const { data: profRow } = await sb(env).from("user_profiles")
+                .select("user_id, teran_id, display_name, avatar")
+                .eq("user_id", singlePost.author_id)
+                .maybeSingle();
+              profile = profRow;
             }
-            const results = await Promise.all(parallelQueries);
-            const parallelMs = Date.now() - tPar;
+            const auxWaitMs = Date.now() - tAux;
 
-            const mediaResult = results[0];
-            const likeData = results[1];
-            // Profile from DB fallback (3rd result) if it was queued
-            if (results.length > 2 && results[2]) {
-              profile = (results[2] as any).data;
-            }
+            const mediaResult = auxResults[0];
+            const likeData = auxResults[1];
 
             const mediaRows = mediaResult.data ?? [];
             const likes = likeData.data ?? [];
@@ -952,7 +956,7 @@ export default {
             };
 
             const totalFastMs = Date.now() - fastStart;
-            console.log(`[perf] /api/posts single_post_fast`, JSON.stringify({ rid: request_id, path: "single_post_fast", prof_kv_ms: profKvMs, prof_src: profSrc, parallel_ms: parallelMs, db_queries: results.length, total_ms: totalFastMs, likes: likeCount, media: mediaRows.length }));
+            console.log(`[perf] /api/posts single_post_fast`, JSON.stringify({ rid: request_id, path: "single_post_fast", select_ms: postsQueryMs, prof_kv_ms: profKvMs, prof_src: profSrc, aux_wait_ms: auxWaitMs, total_fast_ms: totalFastMs, total_ms: postsQueryMs + totalFastMs, likes: likeCount, media: mediaRows.length }));
 
             return ok(req, env, request_id, { posts: [enriched] });
           }
