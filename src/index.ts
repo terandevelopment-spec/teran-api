@@ -1409,18 +1409,45 @@ export default {
 
           // ── Phase 4: Identity resolution + room permission (DB lookups) ──
           // Strategy:
-          //   Step 1 — resolve account_id (1 query, sequential)
-          //   Step 2 — persona + room checks in parallel
-          //     Room uses direct-first strategy: try user_id, fallback to siblings on miss
+          //   Step 1 — resolve account_id AND room_direct in PARALLEL
+          //            (room_direct only needs user_id, not accountId)
+          //   Step 2 — persona_check + room_fallback in parallel (if needed)
           let author_id: string | null = raw_author_id;
           const needsPersonaCheck = !!author_id && author_id !== user_id;
           const needsRoomCheck = !!room_id && room_id !== "global";
           const needsAccountResolution = needsPersonaCheck || needsRoomCheck;
 
-          // Step 1: Resolve account_id (shared by persona + room fallback)
+          // Step 1: parallel(acct_resolve, room_direct)
           let accountId: string | null = null;
+          let roomDirectRole: string | null = null;
 
-          if (needsAccountResolution) {
+          if (needsAccountResolution && needsRoomCheck) {
+            // Both account resolution and room direct check can start simultaneously
+            const [{ data: deviceBinding }, { data: directHit }] = await Promise.all([
+              sb(env)
+                .from("account_devices")
+                .select("account_id")
+                .eq("device_id", user_id)
+                .maybeSingle(),
+              sb(env)
+                .from("room_members")
+                .select("role")
+                .eq("room_id", room_id!)
+                .eq("user_id", user_id)
+                .maybeSingle(),
+            ]);
+            mark("acct_resolve");
+
+            if (deviceBinding?.account_id) {
+              accountId = (deviceBinding as any).account_id;
+            } else if (needsPersonaCheck) {
+              console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
+              throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+            }
+
+            roomDirectRole = directHit?.role ?? null;
+          } else if (needsAccountResolution) {
+            // Only persona check needed, no room check
             const { data: deviceBinding } = await sb(env)
               .from("account_devices")
               .select("account_id")
@@ -1436,7 +1463,7 @@ export default {
             }
           }
 
-          // Step 2: Persona verification + room membership (parallel when both needed)
+          // Step 2: Persona + room fallback in parallel (if needed)
           const personaCheckFn = needsPersonaCheck ? async () => {
             const { data: personaBinding } = await sb(env)
               .from("account_personas")
@@ -1452,35 +1479,19 @@ export default {
             mark("persona_check");
           } : null;
 
-          const roomCheckFn = needsRoomCheck ? async () => {
-            // Run direct check and sibling fetch in PARALLEL.
-            // If direct hits, we're done. If not, siblings are already fetched.
-            const directPromise = sb(env)
-              .from("room_members")
-              .select("role")
-              .eq("room_id", room_id!)
-              .eq("user_id", user_id)
-              .maybeSingle();
+          const roomFallbackFn = (needsRoomCheck && !roomDirectRole) ? async () => {
+            // Direct check already missed in Step 1 — need sibling fallback
+            if (!accountId) {
+              throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
+            }
 
-            // Start sibling fetch simultaneously (only useful if direct misses)
-            const siblingsPromise = accountId
-              ? sb(env)
-                  .from("account_devices")
-                  .select("device_id")
-                  .eq("account_id", accountId)
-                  .neq("device_id", user_id)
-              : Promise.resolve({ data: null });
+            const { data: siblings } = await sb(env)
+              .from("account_devices")
+              .select("device_id")
+              .eq("account_id", accountId)
+              .neq("device_id", user_id);
 
-            const [{ data: directHit }, { data: siblings }] = await Promise.all([
-              directPromise,
-              siblingsPromise,
-            ]);
-            mark("room_direct");
-
-            if (directHit?.role) return; // ← hot path exits here
-
-            // Fallback: use pre-fetched siblings
-            if (!accountId || !siblings || siblings.length === 0) {
+            if (!siblings || siblings.length === 0) {
               throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
             }
 
@@ -1502,8 +1513,7 @@ export default {
               throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
             }
 
-            // Self-heal: replicate membership to current device_id so future
-            // posts hit the direct check and skip the entire fallback chain.
+            // Self-heal: replicate membership for future direct hits
             ctx.waitUntil((async () => {
               try {
                 await sb(env)
@@ -1521,12 +1531,12 @@ export default {
             })());
           } : null;
 
-          if (personaCheckFn && roomCheckFn) {
-            await Promise.all([personaCheckFn(), roomCheckFn()]);
-          } else if (personaCheckFn) {
-            await personaCheckFn();
-          } else if (roomCheckFn) {
-            await roomCheckFn();
+          // Run Step 2 tasks in parallel
+          const step2Tasks: Promise<void>[] = [];
+          if (personaCheckFn) step2Tasks.push(personaCheckFn());
+          if (roomFallbackFn) step2Tasks.push(roomFallbackFn());
+          if (step2Tasks.length > 0) {
+            await Promise.all(step2Tasks);
           } else {
             if (!author_id) author_id = user_id;
           }
@@ -1549,6 +1559,8 @@ export default {
             }
           }
 
+          // Narrow select on insert: only return columns needed for response + post-insert logic
+          const POST_RETURN_COLS = "id, user_id, content, title, author_id, author_name, author_avatar, room_id, parent_post_id, root_post_id, post_type, shared_post_id, mode, moods, created_at";
           let data: any;
           try {
             const insertResult = await sb(env)
@@ -1568,7 +1580,7 @@ export default {
                 mode,
                 moods,
               })
-              .select("*")
+              .select(POST_RETURN_COLS)
               .single();
             if (insertResult.error) throw insertResult.error;
             data = insertResult.data;
@@ -1583,13 +1595,17 @@ export default {
             throw dbErr; // truly unexpected → 500
           }
 
-          // ── Case A: root post → set root_post_id = own id ──
+          // ── Case A: root post → set root_post_id = own id (fire-and-forget) ──
           if (!parent_post_id && data.id) {
-            await sb(env)
-              .from("posts")
-              .update({ root_post_id: data.id })
-              .eq("id", data.id);
             data.root_post_id = data.id;
+            ctx.waitUntil(
+              Promise.resolve(
+                sb(env)
+                  .from("posts")
+                  .update({ root_post_id: data.id } as any)
+                  .eq("id", data.id)
+              ).catch((e: any) => console.warn(`[posts] root_post_id self-update failed`, { rid: request_id, id: data.id, error: e?.message }))
+            );
           }
           mark("post_insert_done");
 
@@ -1671,8 +1687,7 @@ export default {
             validation_ms: delta("validation", "json_parse"),
             acct_resolve_ms: delta("acct_resolve", "validation"),
             persona_check_ms: delta("persona_check", "acct_resolve") ?? delta("persona_check", "validation"),
-            room_direct_ms: delta("room_direct", "acct_resolve") ?? delta("room_direct", "validation"),
-            room_fallback_ms: delta("room_fallback", "room_direct"),
+            room_fallback_ms: delta("room_fallback", "acct_resolve"),
             auth_total_ms: ms("auth_done"),
             post_insert_ms: delta("post_insert_done", "auth_done"),
             media_insert_ms: delta("media_insert_done", "post_insert_done"),
