@@ -877,15 +877,32 @@ export default {
 
           // ── Single-post fast path ──
           // Post is already fetched above. Only need: media, likes, profile.
-          // All 3 run in a single parallel block (no redundant post re-fetch).
+          // media + likes run in parallel DB queries; profile uses KV cache (populated by /api/profile).
           // comment_count defaults to 0 (thread UI fetches comments separately)
           if (id_param && postIds.length === 1) {
             const singlePost = (posts as any[])[0];
             const singleId = singlePost.id;
             const fastStart = Date.now();
 
-            // All enrichment in one parallel block (3 queries)
-            const [mediaResult, likeData, profileData] = await Promise.all([
+            // Profile: KV-cached lookup first, DB fallback only on miss
+            const tProf = Date.now();
+            let profile: any = null;
+            let profSrc = "none";
+            if (singlePost.author_id) {
+              const profKvKey = `profile:${singlePost.author_id}`;
+              try {
+                const kvRaw = await env.PROFILE_KV.get(profKvKey, "text");
+                if (kvRaw) {
+                  profile = JSON.parse(kvRaw);
+                  profSrc = "kv";
+                }
+              } catch { /* KV miss — fall through */ }
+            }
+            const profKvMs = Date.now() - tProf;
+
+            // Parallel: media + likes (2 DB queries). Add profile DB fallback if KV missed.
+            const tPar = Date.now();
+            const parallelQueries: PromiseLike<any>[] = [
               // Query 1: media for this post
               sb(env).from("media")
                 .select("id, post_id, type, key, thumb_key, width, height, duration_ms")
@@ -894,21 +911,31 @@ export default {
               sb(env).from("post_likes")
                 .select("post_id, actor_id")
                 .eq("post_id", singleId),
-              // Query 3: live profile overlay (skip if no author_id)
-              singlePost.author_id
-                ? sb(env).from("user_profiles")
+            ];
+            // Query 3 (conditional): profile DB fallback only if KV missed
+            if (singlePost.author_id && !profile) {
+              profSrc = "db";
+              parallelQueries.push(
+                sb(env).from("user_profiles")
                   .select("user_id, teran_id, display_name, avatar")
                   .eq("user_id", singlePost.author_id)
                   .maybeSingle()
-                : Promise.resolve({ data: null }),
-            ]);
-            const parallelMs = Date.now() - fastStart;
+              );
+            }
+            const results = await Promise.all(parallelQueries);
+            const parallelMs = Date.now() - tPar;
+
+            const mediaResult = results[0];
+            const likeData = results[1];
+            // Profile from DB fallback (3rd result) if it was queued
+            if (results.length > 2 && results[2]) {
+              profile = (results[2] as any).data;
+            }
 
             const mediaRows = mediaResult.data ?? [];
             const likes = likeData.data ?? [];
             const likeCount = likes.length;
             const likedByMe = actor_id_param ? likes.some((l: any) => l.actor_id === actor_id_param) : false;
-            const profile = (profileData as any).data;
 
             let avatar = singlePost.author_avatar;
             if (typeof avatar === "string" && avatar.startsWith("data:")) avatar = null;
@@ -925,7 +952,7 @@ export default {
             };
 
             const totalFastMs = Date.now() - fastStart;
-            console.log(`[perf] /api/posts single_post_fast rid=${request_id} path=single_post_fast parallel_ms=${parallelMs} total_ms=${totalFastMs} likes=${likeCount} media=${mediaRows.length}`);
+            console.log(`[perf] /api/posts single_post_fast`, JSON.stringify({ rid: request_id, path: "single_post_fast", prof_kv_ms: profKvMs, prof_src: profSrc, parallel_ms: parallelMs, db_queries: results.length, total_ms: totalFastMs, likes: likeCount, media: mediaRows.length }));
 
             return ok(req, env, request_id, { posts: [enriched] });
           }
