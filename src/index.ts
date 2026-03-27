@@ -1240,7 +1240,44 @@ export default {
 
           // Parse optional author fields from request
           const title = typeof body?.title === "string" ? body.title.trim() : "";
-          const author_id = typeof body?.author_id === "string" ? body.author_id : null;
+          // SECURITY: author_id from body is untrusted — must verify the caller
+          // owns this persona before allowing them to post as it.
+          const raw_author_id = typeof body?.author_id === "string" ? body.author_id.trim() : null;
+
+          // OWNERSHIP CHECK: verify the caller is allowed to use this author_id.
+          // If raw_author_id matches the JWT device_id, allow (self).
+          // If raw_author_id is null/missing, default to user_id (device_id).
+          // Otherwise, check via account_devices → account_personas binding.
+          let author_id: string | null = raw_author_id;
+          if (!author_id) {
+            // No persona specified → post as device identity
+            author_id = user_id;
+          } else if (author_id !== user_id) {
+            // Persona differs from device_id → verify ownership
+            const { data: deviceBinding } = await sb(env)
+              .from("account_devices")
+              .select("account_id")
+              .eq("device_id", user_id)
+              .maybeSingle();
+
+            if (!deviceBinding?.account_id) {
+              // Unclaimed device cannot act as a different persona
+              console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
+              throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+            }
+
+            const { data: personaBinding } = await sb(env)
+              .from("account_personas")
+              .select("persona_author_id")
+              .eq("account_id", deviceBinding.account_id)
+              .eq("persona_author_id", author_id)
+              .maybeSingle();
+
+            if (!personaBinding) {
+              console.warn(`[posts-auth] REJECTED: device ${user_id} account ${deviceBinding.account_id} does not own persona ${author_id}`);
+              throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+            }
+          }
           const author_name = typeof body?.author_name === "string" ? body.author_name : null;
           const rawAuthorAvatar = typeof body?.author_avatar === "string" ? body.author_avatar : null;
           // Reject data URIs to prevent storing MB-sized base64 in DB
@@ -2299,13 +2336,44 @@ export default {
               const jwt_user_id = await requireAuth(req, env);
 
               // Parse actor fields from request body (for post_likes table and UI display)
+              // SECURITY: actor_id from body is untrusted — must verify the caller
+              // owns this persona before allowing them to like as it.
               const body = (await req.json().catch(() => ({}))) as any;
-              const actor_id = typeof body?.actor_id === "string" ? body.actor_id.trim() : null;
+              const raw_actor_id = typeof body?.actor_id === "string" ? body.actor_id.trim() : null;
               const actor_name = typeof body?.actor_name === "string" ? body.actor_name : null;
               const actor_avatar = typeof body?.actor_avatar === "string" ? body.actor_avatar : null;
 
-              if (!actor_id) {
+              if (!raw_actor_id) {
                 throw new HttpError(400, "BAD_REQUEST", "actor_id is required");
+              }
+
+              // OWNERSHIP CHECK: actor_id must belong to the caller.
+              // If actor_id matches the JWT device_id, allow (self-like).
+              // Otherwise, check via account_devices → account_personas binding.
+              const actor_id = raw_actor_id;
+              if (actor_id !== jwt_user_id) {
+                const { data: deviceBinding } = await sb(env)
+                  .from("account_devices")
+                  .select("account_id")
+                  .eq("device_id", jwt_user_id)
+                  .maybeSingle();
+
+                if (!deviceBinding?.account_id) {
+                  console.warn(`[like-auth] REJECTED: unclaimed device ${jwt_user_id} tried to like as actor_id ${actor_id}`);
+                  throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+                }
+
+                const { data: personaBinding } = await sb(env)
+                  .from("account_personas")
+                  .select("persona_author_id")
+                  .eq("account_id", deviceBinding.account_id)
+                  .eq("persona_author_id", actor_id)
+                  .maybeSingle();
+
+                if (!personaBinding) {
+                  console.warn(`[like-auth] REJECTED: device ${jwt_user_id} account ${deviceBinding.account_id} does not own actor ${actor_id}`);
+                  throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+                }
               }
 
               // Single upsert - no-op if already liked (ignoreDuplicates)
@@ -2372,11 +2440,43 @@ export default {
 
             // DELETE = ensure unliked (idempotent)
             if (req.method === "DELETE") {
+              // AUTH GATE: require valid JWT — was previously missing entirely.
+              const jwt_device_id = await requireAuth(req, env);
+
               // Parse actor_id from query param
+              // SECURITY: actor_id is untrusted input — must verify caller owns it.
               const actor_id = url.searchParams.get("actor_id")?.trim() || null;
 
               if (!actor_id) {
                 throw new HttpError(400, "BAD_REQUEST", "actor_id query param is required");
+              }
+
+              // OWNERSHIP CHECK: actor_id must belong to the caller.
+              // If actor_id matches the JWT device_id, allow (self-unlike).
+              // Otherwise, check via account_personas binding.
+              if (actor_id !== jwt_device_id) {
+                const { data: deviceBinding } = await sb(env)
+                  .from("account_devices")
+                  .select("account_id")
+                  .eq("device_id", jwt_device_id)
+                  .maybeSingle();
+
+                if (!deviceBinding?.account_id) {
+                  console.warn(`[like-auth] REJECTED: unclaimed device ${jwt_device_id} tried to unlike with actor_id ${actor_id}`);
+                  throw new HttpError(403, "FORBIDDEN", "You do not own this like");
+                }
+
+                const { data: personaBinding } = await sb(env)
+                  .from("account_personas")
+                  .select("persona_author_id")
+                  .eq("account_id", deviceBinding.account_id)
+                  .eq("persona_author_id", actor_id)
+                  .maybeSingle();
+
+                if (!personaBinding) {
+                  console.warn(`[like-auth] REJECTED: device ${jwt_device_id} account ${deviceBinding.account_id} does not own actor ${actor_id}`);
+                  throw new HttpError(403, "FORBIDDEN", "You do not own this like");
+                }
               }
 
               const t1 = Date.now();
@@ -4369,7 +4469,12 @@ export default {
         if (path === "/api/profile" && req.method === "PUT") {
           const p0 = performance.now();
 
+          // AUTH GATE: require valid JWT. The JWT sub is the device_id.
+          const jwt_device_id = await requireAuth(req, env);
+
           const body = (await req.json().catch(() => null)) as any;
+          // SECURITY: body user_id is the persona's author_id — do NOT trust it
+          // for authorization. It must be validated against the caller's identity.
           const user_id = body?.user_id;
 
           if (!user_id || typeof user_id !== "string" || user_id.trim() === "") {
@@ -4377,6 +4482,37 @@ export default {
           }
 
           const trimmedUserId = user_id.trim();
+
+          // OWNERSHIP CHECK: verify the caller is allowed to update this persona.
+          // If trimmedUserId matches the JWT device_id, allow (self-profile).
+          // Otherwise, check if the device is bound to an account that owns this persona.
+          if (trimmedUserId !== jwt_device_id) {
+            // Look up account binding for this device
+            const { data: deviceBinding } = await sb(env)
+              .from("account_devices")
+              .select("account_id")
+              .eq("device_id", jwt_device_id)
+              .maybeSingle();
+
+            if (!deviceBinding?.account_id) {
+              // Unclaimed device trying to update a persona that isn't its own device_id
+              console.warn(`[profile-auth] REJECTED: unclaimed device ${jwt_device_id} tried to update persona ${trimmedUserId}`);
+              throw new HttpError(403, "FORBIDDEN", "You do not own this profile");
+            }
+
+            // Claimed account: verify persona belongs to the same account
+            const { data: personaBinding } = await sb(env)
+              .from("account_personas")
+              .select("persona_author_id")
+              .eq("account_id", deviceBinding.account_id)
+              .eq("persona_author_id", trimmedUserId)
+              .maybeSingle();
+
+            if (!personaBinding) {
+              console.warn(`[profile-auth] REJECTED: device ${jwt_device_id} account ${deviceBinding.account_id} does not own persona ${trimmedUserId}`);
+              throw new HttpError(403, "FORBIDDEN", "You do not own this profile");
+            }
+          }
           const incoming: Record<string, any> = {
             display_name: typeof body?.display_name === "string" ? body.display_name : "Anonymous",
             bio: typeof body?.bio === "string" ? body.bio : null,
@@ -4678,13 +4814,46 @@ export default {
 
         // PUT /api/profile-gallery
         if (path === "/api/profile-gallery" && req.method === "PUT") {
+          // AUTH GATE: require valid JWT. The JWT sub is the device_id.
+          const jwt_device_id = await requireAuth(req, env);
+
           const body = (await req.json().catch(() => null)) as any;
+          // SECURITY: body user_id is the persona's author_id — do NOT trust it
+          // for authorization. It must be validated against the caller's identity.
           const user_id = body?.user_id;
           const slots = body?.slots;
 
           // Validate user_id
           if (!user_id || typeof user_id !== "string" || user_id.trim() === "") {
             throw new HttpError(400, "BAD_REQUEST", "user_id is required");
+          }
+
+          const galleryUserId = user_id.trim();
+
+          // OWNERSHIP CHECK: same logic as PUT /api/profile.
+          if (galleryUserId !== jwt_device_id) {
+            const { data: deviceBinding } = await sb(env)
+              .from("account_devices")
+              .select("account_id")
+              .eq("device_id", jwt_device_id)
+              .maybeSingle();
+
+            if (!deviceBinding?.account_id) {
+              console.warn(`[gallery-auth] REJECTED: unclaimed device ${jwt_device_id} tried to update gallery for ${galleryUserId}`);
+              throw new HttpError(403, "FORBIDDEN", "You do not own this gallery");
+            }
+
+            const { data: personaBinding } = await sb(env)
+              .from("account_personas")
+              .select("persona_author_id")
+              .eq("account_id", deviceBinding.account_id)
+              .eq("persona_author_id", galleryUserId)
+              .maybeSingle();
+
+            if (!personaBinding) {
+              console.warn(`[gallery-auth] REJECTED: device ${jwt_device_id} account ${deviceBinding.account_id} does not own persona ${galleryUserId}`);
+              throw new HttpError(403, "FORBIDDEN", "You do not own this gallery");
+            }
           }
 
           // Validate slots
