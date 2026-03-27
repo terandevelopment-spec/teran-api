@@ -615,7 +615,7 @@ export default {
           // - Single post by id: include full data for PostDetail
           const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods";
           const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,media(type,key,thumb_key)";
-          const selectFields = id_param ? "*" : (light ? lightSelectFields : feedSelectFields);
+          const selectFields = light ? lightSelectFields : feedSelectFields;
 
           // Step 1: log normalized filter + select cols
           const postsFilterShape = {
