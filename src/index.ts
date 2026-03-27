@@ -5809,7 +5809,8 @@ export default {
                 thread_card_style, social_reply_mode,
                 card_glass_enabled, card_glass_style,
                 card_bg_image_key, card_bg_image_opacity,
-                like_color, like_visible, list_icon_shape, list_show_icons
+                like_color, like_visible, list_icon_shape, list_show_icons,
+                room_bg_color, room_bg_image_key, room_bg_image_opacity
               )
             `)
             .eq("user_id", user_id);
