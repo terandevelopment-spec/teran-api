@@ -4252,6 +4252,19 @@ export default {
             .eq("account_id", account.id)
             .order("created_at", { ascending: true });
 
+          // Overlay latest identity from user_profiles (source of truth for name/avatar)
+          const personaAuthorIds = (personas || []).map((p: any) => p.persona_author_id).filter(Boolean);
+          let profileMap: Record<string, { display_name?: string; avatar?: string }> = {};
+          if (personaAuthorIds.length > 0) {
+            const { data: profiles } = await sb(env)
+              .from("user_profiles")
+              .select("user_id, display_name, avatar")
+              .in("user_id", personaAuthorIds);
+            for (const prof of (profiles || [])) {
+              profileMap[(prof as any).user_id] = prof as any;
+            }
+          }
+
           // Fetch room memberships for client-side room list restore
           const { data: memberships } = await sb(env)
             .from("room_members")
@@ -4315,11 +4328,14 @@ export default {
             account_id: account.id,
             teran_handle: account.teran_handle,
             token,
-            personas: (personas || []).map((p: any) => ({
-              author_id: p.persona_author_id,
-              name: p.persona_name,
-              avatar: p.persona_avatar,
-            })),
+            personas: (personas || []).map((p: any) => {
+              const prof = profileMap[p.persona_author_id];
+              return {
+                author_id: p.persona_author_id,
+                name: (prof?.display_name || p.persona_name || "User"),
+                avatar: (prof?.avatar || p.persona_avatar || null),
+              };
+            }),
             rooms: allRoomMemberships,
           });
 
@@ -4689,6 +4705,27 @@ export default {
             env.PROFILE_KV.delete(`profile:${trimmedUserId}`)
               .catch((e: any) => console.error("[profile] KV delete failed", { rid: request_id, user_id: trimmedUserId, error: String(e) }))
           );
+
+          // ── Keep account_personas snapshot in sync (fire-and-forget) ──
+          // This prevents stale name/avatar from being returned by POST /api/accounts/login
+          // when the user clears cache and re-logs in with their teran ID.
+          ctx.waitUntil((async () => {
+            try {
+              const update: Record<string, any> = {};
+              if (incoming.display_name) update.persona_name = incoming.display_name;
+              if (incoming.avatar) update.persona_avatar = incoming.avatar;
+              if (Object.keys(update).length === 0) return;
+
+              await sb(env)
+                .from("account_personas")
+                .update(update as any)
+                .eq("persona_author_id", trimmedUserId);
+            } catch (e: any) {
+              console.warn(`[profile-sync] account_personas sync failed (non-fatal)`, {
+                rid: request_id, user_id: trimmedUserId, error: e?.message,
+              });
+            }
+          })());
 
           console.log(`[profile-sync] write rid=${request_id} user=${trimmedUserId} dn=${incoming.display_name}`);
           console.log(`[perf] profile breakdown rid=${request_id} parse=${(p1 - p0).toFixed(1)} db_read=${(p2 - p1).toFixed(1)} db_write=${(p3 - p2).toFixed(1)} total=${(p3 - p0).toFixed(1)} decision=WRITE`);
