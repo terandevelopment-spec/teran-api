@@ -1408,16 +1408,17 @@ export default {
           mark("validation");
 
           // ── Phase 4: Identity resolution + room permission (DB lookups) ──
-          // Strategy: resolve account_id + all device_ids ONCE, then reuse for
-          // both persona ownership and room membership checks.
+          // Strategy:
+          //   Step 1 — resolve account_id (1 query, sequential)
+          //   Step 2 — persona + room checks in parallel
+          //     Room uses direct-first strategy: try user_id, fallback to siblings on miss
           let author_id: string | null = raw_author_id;
           const needsPersonaCheck = !!author_id && author_id !== user_id;
           const needsRoomCheck = !!room_id && room_id !== "global";
           const needsAccountResolution = needsPersonaCheck || needsRoomCheck;
 
-          // Step 1: Resolve account + all device_ids (shared by persona + room checks)
+          // Step 1: Resolve account_id (shared by persona + room fallback)
           let accountId: string | null = null;
-          let allDeviceIds: string[] = [user_id]; // always includes current device_id
 
           if (needsAccountResolution) {
             const { data: deviceBinding } = await sb(env)
@@ -1429,19 +1430,7 @@ export default {
 
             if (deviceBinding?.account_id) {
               accountId = (deviceBinding as any).account_id;
-
-              // Fetch all sibling device_ids (needed for room membership fallback)
-              if (needsRoomCheck) {
-                const { data: allDevices } = await sb(env)
-                  .from("account_devices")
-                  .select("device_id")
-                  .eq("account_id", accountId!);
-                if (allDevices && allDevices.length > 0) {
-                  allDeviceIds = [...new Set(allDevices.map((d: any) => d.device_id).filter(Boolean))];
-                }
-              }
             } else if (needsPersonaCheck) {
-              // Unclaimed device cannot act as a different persona
               console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
               throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
             }
@@ -1464,19 +1453,46 @@ export default {
           } : null;
 
           const roomCheckFn = needsRoomCheck ? async () => {
-            // Single query using all device_ids bound to this account
-            const { data: membership } = await sb(env)
+            // Fast path: direct check by current device_id (1 query)
+            const { data: directHit } = await sb(env)
               .from("room_members")
               .select("role")
               .eq("room_id", room_id!)
-              .in("user_id", allDeviceIds)
-              .limit(1)
+              .eq("user_id", user_id)
               .maybeSingle();
+            mark("room_direct");
 
-            if (!membership?.role) {
+            if (directHit?.role) return; // ← hot path exits here
+
+            // Slow path: account-aware fallback (only after re-login with new device_id)
+            if (!accountId) {
               throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
             }
-            mark("room_check");
+
+            const { data: siblings } = await sb(env)
+              .from("account_devices")
+              .select("device_id")
+              .eq("account_id", accountId)
+              .neq("device_id", user_id);
+            mark("room_siblings");
+
+            if (!siblings || siblings.length === 0) {
+              throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
+            }
+
+            const siblingIds = siblings.map((s: any) => s.device_id).filter(Boolean);
+            const { data: siblingHit } = await sb(env)
+              .from("room_members")
+              .select("role")
+              .eq("room_id", room_id!)
+              .in("user_id", siblingIds)
+              .limit(1)
+              .maybeSingle();
+            mark("room_fallback");
+
+            if (!siblingHit?.role) {
+              throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
+            }
           } : null;
 
           if (personaCheckFn && roomCheckFn) {
@@ -1629,7 +1645,9 @@ export default {
             validation_ms: delta("validation", "json_parse"),
             acct_resolve_ms: delta("acct_resolve", "validation"),
             persona_check_ms: delta("persona_check", "acct_resolve") ?? delta("persona_check", "validation"),
-            room_check_ms: delta("room_check", "acct_resolve") ?? delta("room_check", "validation"),
+            room_direct_ms: delta("room_direct", "acct_resolve") ?? delta("room_direct", "validation"),
+            room_siblings_ms: delta("room_siblings", "room_direct"),
+            room_fallback_ms: delta("room_fallback", "room_siblings"),
             auth_total_ms: ms("auth_done"),
             post_insert_ms: delta("post_insert_done", "auth_done"),
             media_insert_ms: delta("media_insert_done", "post_insert_done"),
