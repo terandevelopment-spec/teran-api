@@ -47,10 +47,10 @@ function readDeviceIdFromCookie(req: Request): string | null {
 
 function setDeviceIdCookie(origin: string, deviceId: string): string {
   const isSecure = origin.startsWith("https");
-  // Cross-origin (prod): SameSite=None requires Secure
+  // Same-origin (prod via Pages proxy): SameSite=Lax + Secure
   // Same-origin / localhost (dev): SameSite=Lax, no Secure flag
   if (isSecure) {
-    return `teran_device_id=${deviceId}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=31536000`;
+    return `teran_device_id=${deviceId}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=31536000`;
   }
   return `teran_device_id=${deviceId}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000`;
 }
@@ -495,7 +495,7 @@ export default {
             iat: now,
             exp: now + 60 * 60 * 24 * 365, // 1 year
           });
-          console.log(`[identity] rid=${request_id} had_cookie=${had_cookie} device_id=${device_id}`);
+          console.log(`[identity] rid=${request_id} had_cookie=${had_cookie} device_id=${device_id} origin=${req.headers.get("Origin")||"none"} ua=${(req.headers.get("user-agent")||"").slice(0,60)}`);
 
           const resp = ok(req, env, request_id, { user_id, token });
           // Always refresh the cookie Max-Age (rolling expiry)
@@ -1564,7 +1564,7 @@ export default {
             roomDirectRole = directHit?.role ?? null;
 
             if (!accountId && needsPersonaCheck) {
-              console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
+              console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id} ua=${(req.headers.get("user-agent")||"").slice(0,60)}`);
               throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
             }
           } else if (needsAccountResolution) {
