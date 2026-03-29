@@ -1578,12 +1578,6 @@ export default {
             }
           }
 
-          // ── Teran ID gate: only claimed users may post in rooms ──
-          if (needsRoomCheck && !accountId) {
-            console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post in room ${room_id}`);
-            throw new HttpError(403, "TERAN_ID_REQUIRED", "Create a Teran ID to post in rooms");
-          }
-
           // Step 2: Persona + room fallback in parallel
           const personaCheckFn = needsPersonaCheck ? async () => {
             const { data: personaBinding } = await sb(env)
@@ -6296,17 +6290,6 @@ export default {
           const tCreateTotal = performance.now();
           const user_id = await requireAuth(req, env);
           const tAuth = performance.now();
-
-          // ── Teran ID gate: only claimed users may create rooms ──
-          const { data: roomGateBinding } = await sb(env)
-            .from("account_devices")
-            .select("account_id")
-            .eq("device_id", user_id)
-            .maybeSingle();
-          if (!roomGateBinding?.account_id) {
-            throw new HttpError(403, "TERAN_ID_REQUIRED", "Create a Teran ID to make rooms");
-          }
-
           const body = (await req.json().catch(() => null)) as any;
           const tBodyParse = performance.now();
 
