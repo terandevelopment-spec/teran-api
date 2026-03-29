@@ -1563,6 +1563,11 @@ export default {
             accountId = acctResult;
             roomDirectRole = directHit?.role ?? null;
 
+            // ── Teran ID gate: only claimed accounts can post in rooms ──
+            if (!accountId && needsRoomCheck) {
+              console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post in room ${room_id} ua=${(req.headers.get("user-agent")||"").slice(0,60)}`);
+              throw new HttpError(403, "TERAN_ID_REQUIRED", "Create a Teran ID to post in rooms");
+            }
             if (!accountId && needsPersonaCheck) {
               console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id} ua=${(req.headers.get("user-agent")||"").slice(0,60)}`);
               throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
@@ -6290,6 +6295,17 @@ export default {
           const tCreateTotal = performance.now();
           const user_id = await requireAuth(req, env);
           const tAuth = performance.now();
+
+          // ── Teran ID gate: only claimed accounts can create rooms ──
+          const { data: roomCreateDeviceBinding } = await sb(env)
+            .from("account_devices")
+            .select("account_id")
+            .eq("device_id", user_id)
+            .maybeSingle();
+          if (!roomCreateDeviceBinding?.account_id) {
+            throw new HttpError(403, "TERAN_ID_REQUIRED", "Create a Teran ID to make rooms");
+          }
+
           const body = (await req.json().catch(() => null)) as any;
           const tBodyParse = performance.now();
 
