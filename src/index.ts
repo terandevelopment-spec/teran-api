@@ -1579,7 +1579,7 @@ export default {
 
             if (!accountId && needsPersonaCheck) {
               console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
-              throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+              throw new HttpError(403, "TERAN_ID_REQUIRED", "Create a Teran ID to post");
             }
           }
 
