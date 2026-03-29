@@ -4379,6 +4379,14 @@ export default {
             return fail(req, env, request_id, 500, "internal", "Failed to bind device");
           }
 
+          // ── Eagerly overwrite KV cache so POST /api/posts resolves the new account immediately ──
+          // Without this, the stale "__null__" KV entry (from pre-claim browsing) would block
+          // posting for up to 300s after successful claim.
+          ctx.waitUntil(
+            env.PROFILE_KV.put(`acct:dev:${user_id}`, account_id, { expirationTtl: 300 })
+              .catch((e: any) => console.warn("[claim] KV acct cache invalidation failed", { rid: request_id, error: String(e) }))
+          );
+
           // ── STEP 3: Insert persona rows (REQUIRED — already validated above) ──
           const personaRows = validPersonas.map(p => ({
             account_id,
