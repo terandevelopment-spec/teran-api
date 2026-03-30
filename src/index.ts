@@ -6921,6 +6921,340 @@ export default {
           }
         }
 
+        // ══════════════════════════════════════════════════════════════
+        // Room Design Templates — DB-backed template CRUD
+        // ══════════════════════════════════════════════════════════════
+
+        // POST /api/room-design-templates — create a new template
+        if (path === "/api/room-design-templates" && req.method === "POST") {
+          const user_id = await requireAuth(req, env);
+
+          const body = (await req.json().catch(() => null)) as any;
+          const name = typeof body?.name === "string" ? body.name.trim() : "";
+          if (!name || name.length > 120) throw new HttpError(422, "VALIDATION_ERROR", "name is required (max 120 chars)");
+
+          const VALID_STEPS = ["step2", "step3", "full"];
+          const step = typeof body?.step === "string" && VALID_STEPS.includes(body.step) ? body.step : "step2";
+
+          const VALID_CARD_STYLES_T = ["standard", "teran", "social"];
+          const card_styles = Array.isArray(body?.card_styles)
+            ? body.card_styles.filter((s: any) => typeof s === "string" && VALID_CARD_STYLES_T.includes(s))
+            : [];
+
+          // Design JSONB — accept only safe primitives
+          const rawDesign = (body?.design && typeof body.design === "object" && !Array.isArray(body.design)) ? body.design : {};
+          const design: Record<string, any> = {};
+          for (const [k, v] of Object.entries(rawDesign)) {
+            if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+              design[k] = v;
+            }
+          }
+
+          // ImageKeys JSONB — accept only string values (R2 keys)
+          const rawImageKeys = (body?.image_keys && typeof body.image_keys === "object" && !Array.isArray(body.image_keys)) ? body.image_keys : {};
+          const image_keys: Record<string, any> = {};
+          for (const [k, v] of Object.entries(rawImageKeys)) {
+            if (typeof v === "string" && v.length > 0 && v.length <= 300) {
+              image_keys[k] = v;
+            }
+          }
+
+          const VALID_VISIBILITY = ["private", "public"];
+          const visibility = typeof body?.visibility === "string" && VALID_VISIBILITY.includes(body.visibility) ? body.visibility : "private";
+
+          const based_on_id = typeof body?.based_on_id === "string" && body.based_on_id.length > 0 ? body.based_on_id : null;
+
+          const insertObj: Record<string, any> = {
+            name,
+            step,
+            card_styles,
+            created_by: user_id,
+            visibility,
+            design,
+            image_keys,
+          };
+          if (based_on_id) insertObj.based_on_id = based_on_id;
+
+          const { data: template, error } = await sb(env)
+            .from("room_design_templates")
+            .insert(insertObj)
+            .select()
+            .single();
+          if (error) throw new Error(error.message);
+
+          console.log(`[room-design-templates] create id=${(template as any).id} name=${name} step=${step} visibility=${visibility} user=${user_id}`);
+          return ok(req, env, request_id, { template }, 201);
+        }
+
+        // GET /api/room-design-templates — list templates (filtered)
+        if (path === "/api/room-design-templates" && req.method === "GET") {
+          const uid = await optionalAuth(req, env);
+          const url = new URL(req.url);
+          const stepFilter = url.searchParams.get("step");
+          const visibilityFilter = url.searchParams.get("visibility");
+          const mine = url.searchParams.get("mine") === "true";
+
+          let query = sb(env)
+            .from("room_design_templates")
+            .select("*")
+            .order("created_at", { ascending: false })
+            .limit(100);
+
+          if (stepFilter && ["step2", "step3", "full"].includes(stepFilter)) {
+            query = query.eq("step", stepFilter);
+          }
+
+          if (mine && uid) {
+            // Fetch caller's own templates (any visibility)
+            // Account-aware: check sibling device_ids
+            const deviceIds = [uid];
+            const { data: binding } = await sb(env)
+              .from("account_devices")
+              .select("account_id")
+              .eq("device_id", uid)
+              .maybeSingle();
+            if (binding?.account_id) {
+              const { data: siblings } = await sb(env)
+                .from("account_devices")
+                .select("device_id")
+                .eq("account_id", binding.account_id);
+              if (siblings) {
+                for (const s of siblings) {
+                  if ((s as any).device_id && !deviceIds.includes((s as any).device_id)) {
+                    deviceIds.push((s as any).device_id);
+                  }
+                }
+              }
+            }
+            query = query.in("created_by", deviceIds);
+          } else if (visibilityFilter && ["public", "official"].includes(visibilityFilter)) {
+            query = query.eq("visibility", visibilityFilter);
+          } else {
+            // Default: show public + official + own private
+            if (uid) {
+              const deviceIds = [uid];
+              const { data: binding } = await sb(env)
+                .from("account_devices")
+                .select("account_id")
+                .eq("device_id", uid)
+                .maybeSingle();
+              if (binding?.account_id) {
+                const { data: siblings } = await sb(env)
+                  .from("account_devices")
+                  .select("device_id")
+                  .eq("account_id", binding.account_id);
+                if (siblings) {
+                  for (const s of siblings) {
+                    if ((s as any).device_id && !deviceIds.includes((s as any).device_id)) {
+                      deviceIds.push((s as any).device_id);
+                    }
+                  }
+                }
+              }
+              query = query.or(`visibility.in.(public,official),created_by.in.(${deviceIds.join(",")})`);
+            } else {
+              query = query.in("visibility", ["public", "official"]);
+            }
+          }
+
+          const { data: templates, error } = await query;
+          if (error) throw new Error(error.message);
+
+          return ok(req, env, request_id, { templates: templates ?? [] });
+        }
+
+        // GET /api/room-design-templates/:id — single template
+        {
+          const m = path.match(/^\/api\/room-design-templates\/([^/]+)$/);
+          if (m && req.method === "GET") {
+            const templateId = m[1];
+
+            const { data: template, error } = await sb(env)
+              .from("room_design_templates")
+              .select("*")
+              .eq("id", templateId)
+              .maybeSingle();
+            if (error) throw new Error(error.message);
+            if (!template) throw new HttpError(404, "NOT_FOUND", "Template not found");
+
+            // Visibility check: private templates only visible to creator
+            const t = template as any;
+            if (t.visibility === "private") {
+              const uid = await optionalAuth(req, env);
+              if (!uid) throw new HttpError(404, "NOT_FOUND", "Template not found");
+              // Account-aware ownership check
+              const deviceIds = [uid];
+              const { data: binding } = await sb(env)
+                .from("account_devices")
+                .select("account_id")
+                .eq("device_id", uid)
+                .maybeSingle();
+              if (binding?.account_id) {
+                const { data: siblings } = await sb(env)
+                  .from("account_devices")
+                  .select("device_id")
+                  .eq("account_id", binding.account_id);
+                if (siblings) {
+                  for (const s of siblings) {
+                    if ((s as any).device_id && !deviceIds.includes((s as any).device_id)) {
+                      deviceIds.push((s as any).device_id);
+                    }
+                  }
+                }
+              }
+              if (!deviceIds.includes(t.created_by)) {
+                throw new HttpError(404, "NOT_FOUND", "Template not found");
+              }
+            }
+
+            return ok(req, env, request_id, { template });
+          }
+        }
+
+        // PATCH /api/room-design-templates/:id — owner update
+        {
+          const m = path.match(/^\/api\/room-design-templates\/([^/]+)$/);
+          if (m && req.method === "PATCH") {
+            const templateId = m[1];
+            const user_id = await requireAuth(req, env);
+
+            // Fetch template + verify ownership (account-aware)
+            const { data: existing, error: fetchErr } = await sb(env)
+              .from("room_design_templates")
+              .select("*")
+              .eq("id", templateId)
+              .maybeSingle();
+            if (fetchErr) throw new Error(fetchErr.message);
+            if (!existing) throw new HttpError(404, "NOT_FOUND", "Template not found");
+
+            const t = existing as any;
+            const deviceIds = [user_id];
+            const { data: binding } = await sb(env)
+              .from("account_devices")
+              .select("account_id")
+              .eq("device_id", user_id)
+              .maybeSingle();
+            if (binding?.account_id) {
+              const { data: siblings } = await sb(env)
+                .from("account_devices")
+                .select("device_id")
+                .eq("account_id", binding.account_id);
+              if (siblings) {
+                for (const s of siblings) {
+                  if ((s as any).device_id && !deviceIds.includes((s as any).device_id)) {
+                    deviceIds.push((s as any).device_id);
+                  }
+                }
+              }
+            }
+            if (!deviceIds.includes(t.created_by)) {
+              throw new HttpError(403, "FORBIDDEN", "Only template creator can update");
+            }
+
+            const body = (await req.json().catch(() => null)) as any;
+            const updates: Record<string, any> = {};
+
+            if (typeof body?.name === "string") {
+              const n = body.name.trim();
+              if (!n || n.length > 120) throw new HttpError(422, "VALIDATION_ERROR", "name max 120 chars");
+              updates.name = n;
+            }
+
+            if (body?.design && typeof body.design === "object" && !Array.isArray(body.design)) {
+              const d: Record<string, any> = {};
+              for (const [k, v] of Object.entries(body.design)) {
+                if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") d[k] = v;
+              }
+              updates.design = d;
+            }
+
+            if (body?.image_keys && typeof body.image_keys === "object" && !Array.isArray(body.image_keys)) {
+              const ik: Record<string, any> = {};
+              for (const [k, v] of Object.entries(body.image_keys)) {
+                if (typeof v === "string" && v.length > 0 && v.length <= 300) ik[k] = v;
+              }
+              updates.image_keys = ik;
+            }
+
+            const VALID_VISIBILITY_U = ["private", "public"];
+            if (typeof body?.visibility === "string" && VALID_VISIBILITY_U.includes(body.visibility)) {
+              updates.visibility = body.visibility;
+            }
+
+            if (Array.isArray(body?.card_styles)) {
+              const VALID_CS = ["standard", "teran", "social"];
+              updates.card_styles = body.card_styles.filter((s: any) => typeof s === "string" && VALID_CS.includes(s));
+            }
+
+            if (Object.keys(updates).length === 0) {
+              throw new HttpError(422, "VALIDATION_ERROR", "No fields to update");
+            }
+            updates.updated_at = new Date().toISOString();
+
+            const { data: template, error } = await sb(env)
+              .from("room_design_templates")
+              .update(updates)
+              .eq("id", templateId)
+              .select()
+              .single();
+            if (error) throw new Error(error.message);
+
+            console.log(`[room-design-templates] update id=${templateId} user=${user_id} fields=${Object.keys(updates).join(",")}`);
+            return ok(req, env, request_id, { template });
+          }
+        }
+
+        // DELETE /api/room-design-templates/:id — owner delete
+        {
+          const m = path.match(/^\/api\/room-design-templates\/([^/]+)$/);
+          if (m && req.method === "DELETE") {
+            const templateId = m[1];
+            const user_id = await requireAuth(req, env);
+
+            // Fetch template + verify ownership (account-aware)
+            const { data: existing, error: fetchErr } = await sb(env)
+              .from("room_design_templates")
+              .select("id,created_by")
+              .eq("id", templateId)
+              .maybeSingle();
+            if (fetchErr) throw new Error(fetchErr.message);
+            if (!existing) throw new HttpError(404, "NOT_FOUND", "Template not found");
+
+            const t = existing as any;
+            const deviceIds = [user_id];
+            const { data: binding } = await sb(env)
+              .from("account_devices")
+              .select("account_id")
+              .eq("device_id", user_id)
+              .maybeSingle();
+            if (binding?.account_id) {
+              const { data: siblings } = await sb(env)
+                .from("account_devices")
+                .select("device_id")
+                .eq("account_id", binding.account_id);
+              if (siblings) {
+                for (const s of siblings) {
+                  if ((s as any).device_id && !deviceIds.includes((s as any).device_id)) {
+                    deviceIds.push((s as any).device_id);
+                  }
+                }
+              }
+            }
+            if (!deviceIds.includes(t.created_by)) {
+              throw new HttpError(403, "FORBIDDEN", "Only template creator can delete");
+            }
+
+            const { error } = await sb(env)
+              .from("room_design_templates")
+              .delete()
+              .eq("id", templateId);
+            if (error) throw new Error(error.message);
+
+            console.log(`[room-design-templates] delete id=${templateId} user=${user_id}`);
+            return ok(req, env, request_id, { ok: true });
+          }
+        }
+
         // POST /api/rooms/:id/join — join public room
         {
           const m = path.match(/^\/api\/rooms\/([^/]+)\/join$/);
