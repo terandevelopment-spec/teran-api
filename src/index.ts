@@ -1946,20 +1946,23 @@ export default {
             return ok(req, env, request_id, { counts: {} });
           }
 
-          // Use RPC for grouped count — zero rows transferred
+          // Count actual comments from the comments table (not reply-posts from posts table)
           const tDb = Date.now();
-          const { data: rpcRows, error } = await sb(env)
-            .rpc("get_comment_counts", { parent_ids: postIds });
+          const { data: countRows, error } = await sb(env)
+            .from("comments")
+            .select("post_id")
+            .in("post_id", postIds);
           const dbMs = Date.now() - tDb;
           if (error) throw error;
 
-          // Build response from RPC result
+          // Build response — tally rows by post_id
           const counts: Record<string, number> = {};
           for (const id of postIds) {
             counts[String(id)] = 0;
           }
-          for (const row of rpcRows ?? []) {
-            counts[String((row as any).parent_post_id)] = (row as any).comment_count ?? 0;
+          for (const row of countRows ?? []) {
+            const key = String((row as any).post_id);
+            counts[key] = (counts[key] || 0) + 1;
           }
 
           const totalMs = Date.now() - t0;
