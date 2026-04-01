@@ -4646,6 +4646,42 @@ export default {
             } else {
               console.log(`[login] reassigned rooms.owner_id from sibling devices to ${device_id}`);
             }
+
+            // ── Durable migration: copy echoes (follows) to new device_id ──
+            // Echoes rows use (user_id, echoed_user_id) as the unique constraint.
+            const { data: oldEchoes } = await sb(env)
+              .from("echoes")
+              .select("echoed_user_id, created_at")
+              .in("user_id", otherDeviceIds);
+
+            if (oldEchoes && oldEchoes.length > 0) {
+              // Dedupe: keep earliest created_at per echoed_user_id
+              const seen = new Map<string, string>();
+              for (const e of oldEchoes) {
+                const target = (e as any).echoed_user_id;
+                const ts = (e as any).created_at;
+                if (!seen.has(target) || ts < seen.get(target)!) {
+                  seen.set(target, ts);
+                }
+              }
+              const echoRows = [...seen.entries()]
+                .filter(([target]) => target !== device_id) // never echo yourself
+                .map(([target, ts]) => ({
+                  user_id: device_id,
+                  echoed_user_id: target,
+                  created_at: ts,
+                }));
+              if (echoRows.length > 0) {
+                const { error: echoErr } = await sb(env)
+                  .from("echoes")
+                  .upsert(echoRows as any, { onConflict: "user_id,echoed_user_id", ignoreDuplicates: true });
+                if (echoErr) {
+                  console.warn(`[login] echoes migration failed:`, echoErr.message);
+                } else {
+                  console.log(`[login] migrated ${echoRows.length} echoes to device ${device_id}`);
+                }
+              }
+            }
           }
 
           console.log(`[AccountsLoginFix] login success`, {
