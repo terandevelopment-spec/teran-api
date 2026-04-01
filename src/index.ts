@@ -4580,12 +4580,13 @@ export default {
             .map((m: any) => ({ ...m.rooms, my_role: m.role }));
 
           // Merge memberships from other devices bound to same account
+          // AND migrate them to the new device_id so subsequent queries work.
           if (otherDevices && otherDevices.length > 0) {
             const otherDeviceIds = otherDevices.map((d: any) => d.device_id);
             const { data: otherMemberships } = await sb(env)
               .from("room_members")
               .select(`
-                role,
+                room_id, role,
                 rooms:room_id (
                   id, name, room_key, icon_key, emoji, visibility
                 )
@@ -4593,11 +4594,45 @@ export default {
               .in("user_id", otherDeviceIds);
 
             const existingRoomIds = new Set(allRoomMemberships.map((r: any) => r.id));
+            // Collect sibling memberships to migrate to new device_id
+            const toMigrate: { room_id: string; role: string }[] = [];
             for (const m of (otherMemberships || [])) {
               if ((m as any).rooms && !existingRoomIds.has((m as any).rooms.id)) {
                 allRoomMemberships.push({ ...(m as any).rooms, my_role: (m as any).role });
                 existingRoomIds.add((m as any).rooms.id);
+                toMigrate.push({ room_id: (m as any).room_id, role: (m as any).role });
               }
+            }
+
+            // ── Durable migration: copy missing room_members to new device_id ──
+            // Uses upsert on (room_id, user_id) to prevent duplicates.
+            if (toMigrate.length > 0) {
+              const rows = toMigrate.map(({ room_id, role }) => ({
+                room_id,
+                user_id: device_id,
+                role,
+                joined_at: now,
+              }));
+              const { error: migrateErr } = await sb(env)
+                .from("room_members")
+                .upsert(rows as any, { onConflict: "room_id,user_id", ignoreDuplicates: true });
+              if (migrateErr) {
+                console.warn(`[login] room_members migration failed:`, migrateErr.message);
+              } else {
+                console.log(`[login] migrated ${rows.length} room_members to device ${device_id}`);
+              }
+            }
+
+            // ── Durable migration: reassign rooms.owner_id to new device_id ──
+            // Rooms owned by any sibling device should now show under owner_id=me.
+            const { error: ownerErr } = await sb(env)
+              .from("rooms")
+              .update({ owner_id: device_id } as any)
+              .in("owner_id", otherDeviceIds);
+            if (ownerErr) {
+              console.warn(`[login] rooms.owner_id reassignment failed:`, ownerErr.message);
+            } else {
+              console.log(`[login] reassigned rooms.owner_id from sibling devices to ${device_id}`);
             }
           }
 
