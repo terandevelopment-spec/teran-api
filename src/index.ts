@@ -296,6 +296,28 @@ async function sha256Hex(str: string): Promise<string> {
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
+// --------- Room metadata helper ----------
+async function resolveRoomMeta(
+  env: Env,
+  room_id: string | null | undefined
+): Promise<{ room_id: string | null; room_icon_key: string | null; room_emoji: string | null }> {
+  if (!room_id) return { room_id: null, room_icon_key: null, room_emoji: null };
+  try {
+    const { data } = await sb(env)
+      .from("rooms")
+      .select("icon_key, emoji")
+      .eq("id", room_id)
+      .single();
+    return {
+      room_id,
+      room_icon_key: (data as any)?.icon_key ?? null,
+      room_emoji: (data as any)?.emoji ?? null,
+    };
+  } catch {
+    return { room_id, room_icon_key: null, room_emoji: null };
+  }
+}
+
 // --------- Notifications Helper ----------
 async function createNotification(
   env: Env,
@@ -311,6 +333,8 @@ async function createNotification(
     parent_comment_id?: number;
     news_id?: string;
     room_id?: string | null;
+    room_icon_key?: string | null;
+    room_emoji?: string | null;
 
     group_key: string;
     snippet?: string | null;
@@ -351,6 +375,8 @@ async function createNotification(
     group_key: payload.group_key,
     news_id: payload.news_id ?? null,
     room_id: payload.room_id ?? null,
+    room_icon_key: payload.room_icon_key ?? null,
+    room_emoji: payload.room_emoji ?? null,
   };
 
 
@@ -1764,6 +1790,7 @@ export default {
             const { data: parentPost, error: parentFetchError } = await sb(env)
               .from("posts")
               .select("user_id, author_id, room_id")
+              // room_id used for notification room meta
               .eq("id", parent_post_id)
               .single();
 
@@ -1783,6 +1810,8 @@ export default {
                 actor_persona_id: author_id,
                 parent_author_id: parentPost.author_id,
               });
+              const replyRoomId = (parentPost as any).room_id ?? room_id ?? null;
+              const replyRoomMeta = await resolveRoomMeta(env, replyRoomId);
               await createNotification(env, {
                 recipient_user_id: parentPost.user_id,  // JWT sub of parent post owner
                 actor_user_id: user_id,                  // JWT sub of replier
@@ -1791,7 +1820,7 @@ export default {
                 type: "post_reply",
                 post_id: parent_post_id, // Link to parent so notification opens the thread
                 root_post_id: root_post_id ?? parent_post_id, // Always point to root for navigation
-                room_id: (parentPost as any).room_id ?? room_id ?? null, // For room-post routing
+                ...replyRoomMeta,
                 group_key: `post_reply:${parent_post_id}`,
               }, request_id);
               mark("notif_insert_done");
@@ -2524,10 +2553,11 @@ export default {
             // Top-level comment on a post -> notify post owner
             const { data: postData } = await sb(env)
               .from("posts")
-              .select("user_id")
+              .select("user_id, room_id")
               .eq("id", post_id)
               .single();
             if (postData) {
+              const pcRoomMeta = await resolveRoomMeta(env, (postData as any).room_id);
               await createNotification(env, {
                 recipient_user_id: postData.user_id,
                 actor_user_id: user_id,
@@ -2536,6 +2566,7 @@ export default {
                 type: "post_comment",
                 post_id,
                 comment_id: data.id,
+                ...pcRoomMeta,
                 group_key: `pc:${post_id}`,
               }, request_id);
             }
@@ -2546,6 +2577,12 @@ export default {
               .select("user_id, post_id")
               .eq("id", parent_comment_id)
               .single();
+            // Resolve room from parent comment's post
+            let replyCommentRoomMeta = { room_id: null as string | null, room_icon_key: null as string | null, room_emoji: null as string | null };
+            if (parentComment) {
+              const { data: replyPostData } = await sb(env).from("posts").select("room_id").eq("id", (parentComment as any).post_id).single();
+              replyCommentRoomMeta = await resolveRoomMeta(env, (replyPostData as any)?.room_id);
+            }
             if (parentComment) {
               await createNotification(env, {
                 recipient_user_id: parentComment.user_id,
@@ -2556,6 +2593,7 @@ export default {
                 post_id: parentComment.post_id,
                 comment_id: data.id,
                 parent_comment_id,
+                ...replyCommentRoomMeta,
                 group_key: `rp:${parent_comment_id}`,
               }, request_id);
             }
@@ -2612,6 +2650,9 @@ export default {
                   .eq("id", comment_id)
                   .single();
                 if (commentData) {
+                  // Resolve room from liked comment's post
+                  const { data: clPostData } = await sb(env).from("posts").select("room_id").eq("id", (commentData as any).post_id).single();
+                  const clRoomMeta = await resolveRoomMeta(env, (clPostData as any)?.room_id);
                   await createNotification(env, {
                     recipient_user_id: commentData.user_id,
                     actor_user_id: user_id,
@@ -2621,6 +2662,7 @@ export default {
                     post_id: commentData.post_id,
                     comment_id,
                     parent_comment_id: commentData.parent_comment_id,
+                    ...clRoomMeta,
                     group_key: `cl:${comment_id}`,
                   }, request_id);
                 }
@@ -2747,6 +2789,7 @@ export default {
                   });
                   // Resolve root_post_id for navigation
                   const likedPostRootId = postData.root_post_id ?? post_id;
+                  const plRoomMeta = await resolveRoomMeta(env, (postData as any).room_id);
                   await createNotification(env, {
                     recipient_user_id: postData.user_id,  // JWT sub of post owner
                     actor_user_id: jwt_user_id,           // JWT sub of liker
@@ -2755,7 +2798,7 @@ export default {
                     type: "post_like",
                     post_id,
                     root_post_id: likedPostRootId,
-                    room_id: (postData as any).room_id ?? null, // For room-post routing
+                    ...plRoomMeta,
                     group_key: `post_like:${post_id}`,
                   }, request_id);
                 } else if (!postData?.user_id) {
