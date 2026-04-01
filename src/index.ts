@@ -310,6 +310,7 @@ async function createNotification(
     comment_id?: number;
     parent_comment_id?: number;
     news_id?: string;
+    room_id?: string | null;
 
     group_key: string;
     snippet?: string | null;
@@ -349,6 +350,7 @@ async function createNotification(
     parent_comment_id: payload.parent_comment_id ?? null,
     group_key: payload.group_key,
     news_id: payload.news_id ?? null,
+    room_id: payload.room_id ?? null,
   };
 
 
@@ -1761,7 +1763,7 @@ export default {
             // Fetch the parent post owner's user_id (NOT author_id/persona)
             const { data: parentPost, error: parentFetchError } = await sb(env)
               .from("posts")
-              .select("user_id, author_id")
+              .select("user_id, author_id, room_id")
               .eq("id", parent_post_id)
               .single();
 
@@ -1789,6 +1791,7 @@ export default {
                 type: "post_reply",
                 post_id: parent_post_id, // Link to parent so notification opens the thread
                 root_post_id: root_post_id ?? parent_post_id, // Always point to root for navigation
+                room_id: (parentPost as any).room_id ?? room_id ?? null, // For room-post routing
                 group_key: `post_reply:${parent_post_id}`,
               }, request_id);
               mark("notif_insert_done");
@@ -2724,7 +2727,7 @@ export default {
                 // Fetch the post owner's user_id (NOT author_id/persona)
                 const { data: postData, error: postFetchError } = await sb(env)
                   .from("posts")
-                  .select("user_id, author_id, root_post_id")
+                  .select("user_id, author_id, root_post_id, room_id")
                   .eq("id", post_id)
                   .single();
 
@@ -2752,6 +2755,7 @@ export default {
                     type: "post_like",
                     post_id,
                     root_post_id: likedPostRootId,
+                    room_id: (postData as any).room_id ?? null, // For room-post routing
                     group_key: `post_like:${post_id}`,
                   }, request_id);
                 } else if (!postData?.user_id) {
