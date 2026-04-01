@@ -4562,7 +4562,13 @@ export default {
             .select(`
               role,
               rooms:room_id (
-                id, name, room_key, icon_key, emoji, visibility
+                id, name, room_key, icon_key, emoji, visibility,
+                thread_card_style, social_reply_mode,
+                card_bg_color, card_text_color,
+                card_glass_enabled, card_glass_style,
+                card_bg_image_key, card_bg_image_opacity,
+                like_color, like_visible, list_icon_shape, list_show_icons,
+                room_bg_color, room_bg_image_key, room_bg_image_opacity
               )
             `)
             .eq("user_id", device_id);
@@ -4588,7 +4594,13 @@ export default {
               .select(`
                 room_id, role,
                 rooms:room_id (
-                  id, name, room_key, icon_key, emoji, visibility
+                  id, name, room_key, icon_key, emoji, visibility,
+                  thread_card_style, social_reply_mode,
+                  card_bg_color, card_text_color,
+                  card_glass_enabled, card_glass_style,
+                  card_bg_image_key, card_bg_image_opacity,
+                  like_color, like_visible, list_icon_shape, list_show_icons,
+                  room_bg_color, room_bg_image_key, room_bg_image_opacity
                 )
               `)
               .in("user_id", otherDeviceIds);
