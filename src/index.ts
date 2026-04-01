@@ -2976,6 +2976,9 @@ export default {
               parent_comment_id: n.parent_comment_id,
               news_id: n.news_id ?? null,
               news_url: n.news_url ?? null,
+              room_id: n.room_id ?? null,
+              room_icon_key: n.room_icon_key ?? null,
+              room_emoji: n.room_emoji ?? null,
               primary_text,
               secondary_text,
             };
