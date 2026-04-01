@@ -1959,7 +1959,7 @@ export default {
             counts[String(id)] = 0;
           }
           for (const row of rpcRows ?? []) {
-            counts[String((row as any).parent_id)] = (row as any).comment_count ?? 0;
+            counts[String((row as any).parent_post_id)] = (row as any).comment_count ?? 0;
           }
 
           const totalMs = Date.now() - t0;
