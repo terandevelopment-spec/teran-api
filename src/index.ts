@@ -300,22 +300,21 @@ async function sha256Hex(str: string): Promise<string> {
 async function resolveRoomMeta(
   env: Env,
   room_id: string | null | undefined
-): Promise<{ room_id: string | null; room_icon_key: string | null; room_emoji: string | null; room_name: string | null }> {
-  if (!room_id) return { room_id: null, room_icon_key: null, room_emoji: null, room_name: null };
+): Promise<{ room_id: string | null; room_icon_key: string | null; room_emoji: string | null }> {
+  if (!room_id) return { room_id: null, room_icon_key: null, room_emoji: null };
   try {
     const { data } = await sb(env)
       .from("rooms")
-      .select("icon_key, emoji, name")
+      .select("icon_key, emoji")
       .eq("id", room_id)
       .single();
     return {
       room_id,
       room_icon_key: (data as any)?.icon_key ?? null,
       room_emoji: (data as any)?.emoji ?? null,
-      room_name: (data as any)?.name ?? null,
     };
   } catch {
-    return { room_id, room_icon_key: null, room_emoji: null, room_name: null };
+    return { room_id, room_icon_key: null, room_emoji: null };
   }
 }
 
@@ -336,7 +335,6 @@ async function createNotification(
     room_id?: string | null;
     room_icon_key?: string | null;
     room_emoji?: string | null;
-    room_name?: string | null;
 
     group_key: string;
     snippet?: string | null;
@@ -379,7 +377,6 @@ async function createNotification(
     room_id: payload.room_id ?? null,
     room_icon_key: payload.room_icon_key ?? null,
     room_emoji: payload.room_emoji ?? null,
-    room_name: payload.room_name ?? null,
   };
 
 
