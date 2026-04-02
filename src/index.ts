@@ -2880,8 +2880,25 @@ export default {
         if (path === "/api/notifications" && req.method === "GET") {
           const user_id = await requireAuth(req, env);
 
+          // ── DIAGNOSTIC: identity keys used for notification fetch ──
+          const cookieHeader = req.headers.get("cookie") ?? "";
+          const deviceIdMatch = cookieHeader.match(/device_id=([^;]+)/);
+          const deviceIdFromCookie = deviceIdMatch ? deviceIdMatch[1] : null;
+          const authHeader = req.headers.get("Authorization") ?? "";
+
           const limitParam = url.searchParams.get("limit");
           const cursorParam = url.searchParams.get("cursor");
+
+          console.log(`[news-notif:fetch][${request_id}] identity + query`, {
+            route: "GET /api/notifications",
+            jwtUserId: user_id,
+            recipientWhereKey: "recipient_user_id",
+            recipientWhereValue: user_id,
+            deviceIdFromCookie,
+            authHeaderPrefix: authHeader.slice(0, 20) + "...",
+            queryParams: { limit: limitParam, cursor: cursorParam },
+            categoryFilter: "none (fetches all types)",
+          });
 
           let limit = 50;
           if (limitParam) {
