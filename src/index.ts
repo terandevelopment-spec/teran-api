@@ -326,12 +326,13 @@ async function createNotification(
     actor_user_id: string;
     actor_name?: string | null;
     actor_avatar?: string | null;
-    type: "comment_like" | "reply" | "post_comment" | "post_like" | "post_reply";
+    type: "comment_like" | "reply" | "post_comment" | "post_like" | "post_reply" | "news_comment_like" | "news_comment_reply";
     post_id?: number;
     root_post_id?: number;
     comment_id?: number;
     parent_comment_id?: number;
     news_id?: string;
+    news_image_url?: string | null;
     room_id?: string | null;
     room_icon_key?: string | null;
     room_emoji?: string | null;
@@ -374,6 +375,7 @@ async function createNotification(
     parent_comment_id: payload.parent_comment_id ?? null,
     group_key: payload.group_key,
     news_id: payload.news_id ?? null,
+    news_image_url: payload.news_image_url ?? null,
     room_id: payload.room_id ?? null,
     room_icon_key: payload.room_icon_key ?? null,
     room_emoji: payload.room_emoji ?? null,
@@ -2976,6 +2978,7 @@ export default {
               parent_comment_id: n.parent_comment_id,
               news_id: n.news_id ?? null,
               news_url: n.news_url ?? null,
+              news_image_url: n.news_image_url ?? null,
               room_id: n.room_id ?? null,
               room_icon_key: n.room_icon_key ?? null,
               room_emoji: n.room_emoji ?? null,
@@ -5689,6 +5692,35 @@ export default {
             console.log("[NEWS COMMENT CREATE] media inserted:", mediaRows.length);
           }
 
+          // ── Non-blocking notification for news_comment_reply ──
+          if (parent_comment_id) {
+            try {
+              const news_image_url_reply = typeof body?.news_image_url === "string" ? body.news_image_url : null;
+              const { data: parentComment } = await sb(env)
+                .from("news_comments")
+                .select("user_id")
+                .eq("id", parent_comment_id)
+                .single();
+              if (parentComment && parentComment.user_id) {
+                await createNotification(env, {
+                  recipient_user_id: parentComment.user_id,
+                  actor_user_id: user_id,
+                  actor_name: author_name,
+                  actor_avatar: author_avatar,
+                  type: "news_comment_reply",
+                  comment_id: data.id,
+                  parent_comment_id,
+                  news_id,
+                  news_image_url: news_image_url_reply,
+                  group_key: `ncr:${parent_comment_id}`,
+                  snippet: content ? content.slice(0, 80) : null,
+                }, request_id);
+              }
+            } catch (notifErr: any) {
+              console.error(`[news-notif][${request_id}] news_comment_reply notification failed`, notifErr?.message);
+            }
+          }
+
           return ok(req, env, request_id, {
             comment: { ...data, like_count: 0, liked_by_me: false, media: mediaRows }
           }, 201);
@@ -5733,6 +5765,9 @@ export default {
             const user_id = await requireAuth(req, env);
             const comment_id = Number(m[1]);
 
+            // Parse optional body for actor identity & news thumbnail
+            const likeBody = (await req.json().catch(() => null)) as any;
+            const news_image_url = typeof likeBody?.news_image_url === "string" ? likeBody.news_image_url : null;
 
             if (!Number.isFinite(comment_id)) {
               throw new HttpError(400, "BAD_REQUEST", "Invalid comment_id");
@@ -5755,6 +5790,42 @@ export default {
             }
 
             if (insertError) throw insertError;
+
+            // ── Non-blocking notification for news_comment_like ──
+            try {
+              const { data: commentData } = await sb(env)
+                .from("news_comments")
+                .select("user_id, news_id, news_url, content")
+                .eq("id", comment_id)
+                .single();
+              if (commentData && commentData.user_id) {
+                // Fetch actor identity from user_profiles
+                let actorName: string | null = null;
+                let actorAvatar: string | null = null;
+                const { data: profile } = await sb(env)
+                  .from("user_profiles")
+                  .select("display_name, avatar")
+                  .eq("user_id", user_id)
+                  .single();
+                if (profile) {
+                  actorName = profile.display_name ?? null;
+                  actorAvatar = profile.avatar ?? null;
+                }
+                await createNotification(env, {
+                  recipient_user_id: commentData.user_id,
+                  actor_user_id: user_id,
+                  actor_name: actorName,
+                  actor_avatar: actorAvatar,
+                  type: "news_comment_like",
+                  comment_id,
+                  news_id: commentData.news_id,
+                  news_image_url,
+                  group_key: `ncl:${comment_id}`,
+                }, request_id);
+              }
+            } catch (notifErr: any) {
+              console.error(`[news-notif][${request_id}] news_comment_like notification failed`, notifErr?.message);
+            }
 
             return ok(req, env, request_id, { liked: true }, 201);
           }
