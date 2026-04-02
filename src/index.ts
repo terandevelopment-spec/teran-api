@@ -5913,22 +5913,41 @@ export default {
                   actorIdType: typeof user_id,
                   recipientIdType: typeof commentData.user_id,
                 });
-                // Fetch actor identity from user_profiles
-                let actorName: string | null = null;
-                let actorAvatar: string | null = null;
-                const { data: profile, error: profileErr } = await sb(env)
-                  .from("user_profiles")
-                  .select("display_name, avatar")
-                  .eq("user_id", user_id)
-                  .single();
-                console.log(`[news-notif:create][${request_id}] profile lookup:`, {
-                  profile: profile ? { display_name: profile.display_name } : null,
-                  profileErr: profileErr ? { code: profileErr.code, message: profileErr.message } : null,
-                });
-                if (profile) {
-                  actorName = profile.display_name ?? null;
-                  actorAvatar = profile.avatar ?? null;
+                // Resolve actor identity: body (primary) → user_profiles (fallback)
+                const bodyActorName = typeof likeBody?.author_name === "string" ? likeBody.author_name : null;
+                const bodyActorAvatar = typeof likeBody?.author_avatar === "string" ? likeBody.author_avatar : null;
+
+                let actorName: string | null = bodyActorName;
+                let actorAvatar: string | null = bodyActorAvatar;
+                let actorSource = "request_body";
+
+                if (!actorName && !actorAvatar) {
+                  // Fallback: lookup user_profiles
+                  const { data: profile, error: profileErr } = await sb(env)
+                    .from("user_profiles")
+                    .select("display_name, avatar")
+                    .eq("user_id", user_id)
+                    .single();
+                  console.log(`[news-notif:create][${request_id}] profile fallback lookup:`, {
+                    profile: profile ? { display_name: profile.display_name } : null,
+                    profileErr: profileErr ? { code: profileErr.code, message: profileErr.message } : null,
+                  });
+                  if (profile) {
+                    actorName = profile.display_name ?? null;
+                    actorAvatar = profile.avatar ?? null;
+                    actorSource = "user_profiles";
+                  } else {
+                    actorSource = "none";
+                  }
                 }
+
+                console.log(`[news-notif:create][${request_id}] LIKE actor identity resolved`, {
+                  actorId: user_id,
+                  actorName,
+                  actorAvatar,
+                  actorSource,
+                });
+
                 const notifPayload = {
                   recipient_user_id: commentData.user_id,
                   actor_user_id: user_id,
