@@ -5790,10 +5790,12 @@ export default {
                   comment_id: data.id,
                   parent_comment_id,
                   news_id,
+                  news_url: canonicalUrl,
                   news_image_url: news_image_url_reply,
                   group_key: `ncr:${parent_comment_id}`,
                   snippet: content ? content.slice(0, 80) : null,
                 };
+                console.log(`[news-notif:create][${request_id}] reply deep-link`, { type: 'news_comment_reply', comment_id: data.id, news_id, news_url: canonicalUrl });
                 console.log(`[news-notif:create][${request_id}] calling createNotification for reply`, JSON.stringify(notifPayload));
                 await createNotification(env, notifPayload, request_id);
                 console.log(`[news-notif:create][${request_id}] ✓ createNotification returned for reply`);
@@ -5956,9 +5958,11 @@ export default {
                   type: "news_comment_like" as const,
                   comment_id,
                   news_id: commentData.news_id,
+                  news_url: commentData.news_url,
                   news_image_url,
                   group_key: `ncl:${comment_id}`,
                 };
+                console.log(`[news-notif:create][${request_id}] like deep-link`, { type: 'news_comment_like', comment_id, news_id: commentData.news_id, news_url: commentData.news_url });
                 console.log(`[news-notif:create][${request_id}] calling createNotification for like`, JSON.stringify(notifPayload));
                 await createNotification(env, notifPayload, request_id);
                 console.log(`[news-notif:create][${request_id}] createNotification returned for like`);
