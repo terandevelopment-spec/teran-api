@@ -343,25 +343,28 @@ async function createNotification(
   request_id?: string
 ) {
 
+  // ── DIAGNOSTIC: entry ──
+  console.log(`[news-notif:create][${request_id}] createNotification ENTERED`, {
+    type: payload.type,
+    recipientId: payload.recipient_user_id,
+    actorId: payload.actor_user_id,
+    commentId: payload.comment_id,
+    parentCommentId: payload.parent_comment_id,
+    newsId: payload.news_id,
+    newsImageUrl: payload.news_image_url,
+    groupKey: payload.group_key,
+  });
+
   // Skip self-notification
   if (payload.recipient_user_id === payload.actor_user_id) {
-    console.log(`[notif][${request_id}] skipping self-notification`, {
+    console.log(`[news-notif:create][${request_id}] SKIPPED self-notification`, {
       type: payload.type,
-      actor: payload.actor_user_id,
+      actorId: payload.actor_user_id,
     });
     return;
   }
 
-
-  console.log(`[notif][${request_id}] inserting notification`, {
-    recipient_user_id: payload.recipient_user_id,
-    actor_user_id: payload.actor_user_id,
-    type: payload.type,
-    post_id: payload.post_id,
-    root_post_id: payload.root_post_id,
-    comment_id: payload.comment_id,
-    group_key: payload.group_key,
-  });
+  console.log(`[news-notif:create][${request_id}] passed self-check, building insert payload`);
 
   const insertPayload = {
     recipient_user_id: payload.recipient_user_id,
@@ -381,19 +384,19 @@ async function createNotification(
     room_emoji: payload.room_emoji ?? null,
   };
 
+  console.log(`[news-notif:create][${request_id}] DB insert start`, JSON.stringify(insertPayload));
 
   const { data, error } = await sb(env).from("notifications").insert(insertPayload).select("id");
 
   if (error) {
-    console.error(`[notif][${request_id}] INSERT FAILED`, {
+    console.error(`[news-notif:create][${request_id}] DB insert FAILED`, {
       code: error.code,
       message: error.message,
       details: error.details,
       hint: error.hint,
-      payload: insertPayload,
     });
   } else {
-    console.log(`[notif][${request_id}] INSERT SUCCESS`, { data });
+    console.log(`[news-notif:create][${request_id}] DB insert SUCCESS`, { id: data?.[0]?.id });
   }
 }
 
@@ -2904,6 +2907,17 @@ export default {
           }
 
           const { data, error } = await q;
+
+          console.log(`[news-notif:fetch][${request_id}] query result`, {
+            userId: user_id,
+            limit,
+            cursor: cursorParam,
+            rowCount: data?.length ?? 0,
+            error: error ? { code: error.code, message: error.message } : null,
+            types: data ? [...new Set(data.map((n: any) => n.type))] : [],
+            newsRows: data ? data.filter((n: any) => n.type?.startsWith('news_')).length : 0,
+          });
+
           if (error) throw error;
 
           const notifications = data ?? [];
@@ -5694,30 +5708,48 @@ export default {
 
           // ── Non-blocking notification for news_comment_reply ──
           if (parent_comment_id) {
+            console.log(`[news-notif:create][${request_id}] ▶ REPLY NOTIF BLOCK ENTERED`, {
+              parent_comment_id,
+              new_reply_id: data?.id,
+              actor_user_id: user_id,
+            });
             try {
               const news_image_url_reply = typeof body?.news_image_url === "string" ? body.news_image_url : null;
-              const { data: parentComment } = await sb(env)
+              console.log(`[news-notif:create][${request_id}] news_image_url_reply:`, news_image_url_reply);
+              const { data: parentComment, error: parentErr } = await sb(env)
                 .from("news_comments")
                 .select("user_id")
                 .eq("id", parent_comment_id)
                 .single();
+              console.log(`[news-notif:create][${request_id}] parent lookup result:`, {
+                parentComment,
+                parentErr: parentErr ? { code: parentErr.code, message: parentErr.message } : null,
+              });
               if (parentComment && parentComment.user_id) {
-                await createNotification(env, {
+                const notifPayload = {
                   recipient_user_id: parentComment.user_id,
                   actor_user_id: user_id,
                   actor_name: author_name,
                   actor_avatar: author_avatar,
-                  type: "news_comment_reply",
+                  type: "news_comment_reply" as const,
                   comment_id: data.id,
                   parent_comment_id,
                   news_id,
                   news_image_url: news_image_url_reply,
                   group_key: `ncr:${parent_comment_id}`,
                   snippet: content ? content.slice(0, 80) : null,
-                }, request_id);
+                };
+                console.log(`[news-notif:create][${request_id}] ▶ calling createNotification for reply`, JSON.stringify(notifPayload));
+                await createNotification(env, notifPayload, request_id);
+                console.log(`[news-notif:create][${request_id}] ✓ createNotification returned for reply`);
+              } else {
+                console.log(`[news-notif:create][${request_id}] ✗ SKIPPED reply notif: no parentComment or user_id`);
               }
             } catch (notifErr: any) {
-              console.error(`[news-notif][${request_id}] news_comment_reply notification failed`, notifErr?.message);
+              console.error(`[news-notif:create][${request_id}] ✗ news_comment_reply notification THREW`, {
+                message: notifErr?.message,
+                stack: notifErr?.stack,
+              });
             }
           }
 
@@ -5792,39 +5824,60 @@ export default {
             if (insertError) throw insertError;
 
             // ── Non-blocking notification for news_comment_like ──
+            console.log(`[news-notif][${request_id}] ▶ LIKE NOTIF BLOCK ENTERED`, {
+              comment_id,
+              actor_user_id: user_id,
+              news_image_url,
+            });
             try {
-              const { data: commentData } = await sb(env)
+              const { data: commentData, error: commentErr } = await sb(env)
                 .from("news_comments")
                 .select("user_id, news_id, news_url, content")
                 .eq("id", comment_id)
                 .single();
+              console.log(`[news-notif][${request_id}] comment lookup result:`, {
+                commentData: commentData ? { user_id: commentData.user_id, news_id: commentData.news_id } : null,
+                commentErr: commentErr ? { code: commentErr.code, message: commentErr.message } : null,
+              });
               if (commentData && commentData.user_id) {
                 // Fetch actor identity from user_profiles
                 let actorName: string | null = null;
                 let actorAvatar: string | null = null;
-                const { data: profile } = await sb(env)
+                const { data: profile, error: profileErr } = await sb(env)
                   .from("user_profiles")
                   .select("display_name, avatar")
                   .eq("user_id", user_id)
                   .single();
+                console.log(`[news-notif][${request_id}] profile lookup:`, {
+                  profile: profile ? { display_name: profile.display_name } : null,
+                  profileErr: profileErr ? { code: profileErr.code, message: profileErr.message } : null,
+                });
                 if (profile) {
                   actorName = profile.display_name ?? null;
                   actorAvatar = profile.avatar ?? null;
                 }
-                await createNotification(env, {
+                const notifPayload = {
                   recipient_user_id: commentData.user_id,
                   actor_user_id: user_id,
                   actor_name: actorName,
                   actor_avatar: actorAvatar,
-                  type: "news_comment_like",
+                  type: "news_comment_like" as const,
                   comment_id,
                   news_id: commentData.news_id,
                   news_image_url,
                   group_key: `ncl:${comment_id}`,
-                }, request_id);
+                };
+                console.log(`[news-notif][${request_id}] ▶ calling createNotification for like`, JSON.stringify(notifPayload));
+                await createNotification(env, notifPayload, request_id);
+                console.log(`[news-notif][${request_id}] ✓ createNotification returned for like`);
+              } else {
+                console.log(`[news-notif][${request_id}] ✗ SKIPPED like notif: no commentData or user_id`);
               }
             } catch (notifErr: any) {
-              console.error(`[news-notif][${request_id}] news_comment_like notification failed`, notifErr?.message);
+              console.error(`[news-notif][${request_id}] ✗ news_comment_like notification THREW`, {
+                message: notifErr?.message,
+                stack: notifErr?.stack,
+              });
             }
 
             return ok(req, env, request_id, { liked: true }, 201);
