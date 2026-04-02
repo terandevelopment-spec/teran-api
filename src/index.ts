@@ -350,9 +350,14 @@ async function createNotification(
     actorId: payload.actor_user_id,
     commentId: payload.comment_id,
     parentCommentId: payload.parent_comment_id,
+    postId: payload.post_id,
     newsId: payload.news_id,
     newsImageUrl: payload.news_image_url,
     groupKey: payload.group_key,
+    recipientIdType: typeof payload.recipient_user_id,
+    recipientIdLength: payload.recipient_user_id?.length,
+    actorIdType: typeof payload.actor_user_id,
+    actorIdLength: payload.actor_user_id?.length,
   });
 
   // Skip self-notification
@@ -360,11 +365,17 @@ async function createNotification(
     console.log(`[news-notif:create][${request_id}] SKIPPED self-notification`, {
       type: payload.type,
       actorId: payload.actor_user_id,
+      recipientId: payload.recipient_user_id,
+      exactMatch: payload.recipient_user_id === payload.actor_user_id,
     });
     return;
   }
 
-  console.log(`[news-notif:create][${request_id}] passed self-check, building insert payload`);
+  console.log(`[news-notif:create][${request_id}] passed self-check, building insert payload`, {
+    recipientId: payload.recipient_user_id,
+    actorId: payload.actor_user_id,
+    areDifferent: payload.recipient_user_id !== payload.actor_user_id,
+  });
 
   const insertPayload = {
     recipient_user_id: payload.recipient_user_id,
@@ -384,9 +395,9 @@ async function createNotification(
     room_emoji: payload.room_emoji ?? null,
   };
 
-  console.log(`[news-notif:create][${request_id}] DB insert start`, JSON.stringify(insertPayload));
+  console.log(`[news-notif:create][${request_id}] DB insert start — full payload:`, JSON.stringify(insertPayload));
 
-  const { data, error } = await sb(env).from("notifications").insert(insertPayload).select("id");
+  const { data, error } = await sb(env).from("notifications").insert(insertPayload).select("id, recipient_user_id, actor_user_id, type");
 
   if (error) {
     console.error(`[news-notif:create][${request_id}] DB insert FAILED`, {
@@ -394,9 +405,16 @@ async function createNotification(
       message: error.message,
       details: error.details,
       hint: error.hint,
+      insertPayloadRecipient: insertPayload.recipient_user_id,
+      insertPayloadType: insertPayload.type,
     });
   } else {
-    console.log(`[news-notif:create][${request_id}] DB insert SUCCESS`, { id: data?.[0]?.id });
+    console.log(`[news-notif:create][${request_id}] DB insert SUCCESS`, {
+      insertedId: data?.[0]?.id,
+      insertedRecipientId: (data?.[0] as any)?.recipient_user_id,
+      insertedActorId: (data?.[0] as any)?.actor_user_id,
+      insertedType: (data?.[0] as any)?.type,
+    });
   }
 }
 
@@ -5725,10 +5743,19 @@ export default {
 
           // ── Non-blocking notification for news_comment_reply ──
           if (parent_comment_id) {
-            console.log(`[news-notif:create][${request_id}] ▶ REPLY NOTIF BLOCK ENTERED`, {
+            // Identity context available in reply handler scope
+            const cookieHeader_reply = req.headers.get("cookie") ?? "";
+            const deviceIdMatch_reply = cookieHeader_reply.match(/device_id=([^;]+)/);
+            const deviceId_reply = deviceIdMatch_reply ? deviceIdMatch_reply[1] : null;
+
+            console.log(`[news-notif:create][${request_id}] REPLY NOTIF BLOCK ENTERED`, {
               parent_comment_id,
               new_reply_id: data?.id,
               actor_user_id: user_id,
+              jwtSub: user_id,
+              deviceId: deviceId_reply,
+              author_id: user_id,
+              author_name,
             });
             try {
               const news_image_url_reply = typeof body?.news_image_url === "string" ? body.news_image_url : null;
@@ -5741,8 +5768,19 @@ export default {
               console.log(`[news-notif:create][${request_id}] parent lookup result:`, {
                 parentComment,
                 parentErr: parentErr ? { code: parentErr.code, message: parentErr.message } : null,
+                recipientSource: 'news_comments.user_id WHERE id = parent_comment_id',
+                resolvedRecipientId: parentComment?.user_id ?? null,
+                resolvedRecipientIdType: typeof parentComment?.user_id,
+                resolvedRecipientIdLength: parentComment?.user_id?.length,
               });
               if (parentComment && parentComment.user_id) {
+                console.log(`[news-notif:create][${request_id}] REPLY identity comparison`, {
+                  actorId: user_id,
+                  recipientId: parentComment.user_id,
+                  areSame: user_id === parentComment.user_id,
+                  actorIdType: typeof user_id,
+                  recipientIdType: typeof parentComment.user_id,
+                });
                 const notifPayload = {
                   recipient_user_id: parentComment.user_id,
                   actor_user_id: user_id,
@@ -5756,7 +5794,7 @@ export default {
                   group_key: `ncr:${parent_comment_id}`,
                   snippet: content ? content.slice(0, 80) : null,
                 };
-                console.log(`[news-notif:create][${request_id}] ▶ calling createNotification for reply`, JSON.stringify(notifPayload));
+                console.log(`[news-notif:create][${request_id}] calling createNotification for reply`, JSON.stringify(notifPayload));
                 await createNotification(env, notifPayload, request_id);
                 console.log(`[news-notif:create][${request_id}] ✓ createNotification returned for reply`);
               } else {
@@ -5841,9 +5879,16 @@ export default {
             if (insertError) throw insertError;
 
             // ── Non-blocking notification for news_comment_like ──
-            console.log(`[news-notif][${request_id}] ▶ LIKE NOTIF BLOCK ENTERED`, {
+            // Identity context available in like handler scope
+            const cookieHeader_like = req.headers.get("cookie") ?? "";
+            const deviceIdMatch_like = cookieHeader_like.match(/device_id=([^;]+)/);
+            const deviceId_like = deviceIdMatch_like ? deviceIdMatch_like[1] : null;
+
+            console.log(`[news-notif:create][${request_id}] LIKE NOTIF BLOCK ENTERED`, {
               comment_id,
               actor_user_id: user_id,
+              jwtSub: user_id,
+              deviceId: deviceId_like,
               news_image_url,
             });
             try {
@@ -5852,11 +5897,22 @@ export default {
                 .select("user_id, news_id, news_url, content")
                 .eq("id", comment_id)
                 .single();
-              console.log(`[news-notif][${request_id}] comment lookup result:`, {
+              console.log(`[news-notif:create][${request_id}] comment lookup result:`, {
                 commentData: commentData ? { user_id: commentData.user_id, news_id: commentData.news_id } : null,
                 commentErr: commentErr ? { code: commentErr.code, message: commentErr.message } : null,
+                recipientSource: 'news_comments.user_id WHERE id = comment_id',
+                resolvedRecipientId: commentData?.user_id ?? null,
+                resolvedRecipientIdType: typeof commentData?.user_id,
+                resolvedRecipientIdLength: commentData?.user_id?.length,
               });
               if (commentData && commentData.user_id) {
+                console.log(`[news-notif:create][${request_id}] LIKE identity comparison`, {
+                  actorId: user_id,
+                  recipientId: commentData.user_id,
+                  areSame: user_id === commentData.user_id,
+                  actorIdType: typeof user_id,
+                  recipientIdType: typeof commentData.user_id,
+                });
                 // Fetch actor identity from user_profiles
                 let actorName: string | null = null;
                 let actorAvatar: string | null = null;
@@ -5865,7 +5921,7 @@ export default {
                   .select("display_name, avatar")
                   .eq("user_id", user_id)
                   .single();
-                console.log(`[news-notif][${request_id}] profile lookup:`, {
+                console.log(`[news-notif:create][${request_id}] profile lookup:`, {
                   profile: profile ? { display_name: profile.display_name } : null,
                   profileErr: profileErr ? { code: profileErr.code, message: profileErr.message } : null,
                 });
@@ -5884,14 +5940,14 @@ export default {
                   news_image_url,
                   group_key: `ncl:${comment_id}`,
                 };
-                console.log(`[news-notif][${request_id}] ▶ calling createNotification for like`, JSON.stringify(notifPayload));
+                console.log(`[news-notif:create][${request_id}] calling createNotification for like`, JSON.stringify(notifPayload));
                 await createNotification(env, notifPayload, request_id);
-                console.log(`[news-notif][${request_id}] ✓ createNotification returned for like`);
+                console.log(`[news-notif:create][${request_id}] createNotification returned for like`);
               } else {
-                console.log(`[news-notif][${request_id}] ✗ SKIPPED like notif: no commentData or user_id`);
+                console.log(`[news-notif:create][${request_id}] SKIPPED like notif: no commentData or user_id`);
               }
             } catch (notifErr: any) {
-              console.error(`[news-notif][${request_id}] ✗ news_comment_like notification THREW`, {
+              console.error(`[news-notif:create][${request_id}] news_comment_like notification THREW`, {
                 message: notifErr?.message,
                 stack: notifErr?.stack,
               });
