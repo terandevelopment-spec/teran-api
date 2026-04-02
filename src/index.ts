@@ -332,6 +332,7 @@ async function createNotification(
     comment_id?: number;
     parent_comment_id?: number;
     news_id?: string;
+    news_url?: string | null;
     news_image_url?: string | null;
     room_id?: string | null;
     room_icon_key?: string | null;
@@ -389,6 +390,7 @@ async function createNotification(
     parent_comment_id: payload.parent_comment_id ?? null,
     group_key: payload.group_key,
     news_id: payload.news_id ?? null,
+    news_url: payload.news_url ?? null,
     news_image_url: payload.news_image_url ?? null,
     room_id: payload.room_id ?? null,
     room_icon_key: payload.room_icon_key ?? null,
