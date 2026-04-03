@@ -714,7 +714,9 @@ export default {
             }
 
             // ── post_type filter ──
-            // For thread feed: include both post_type='thread' AND show_in_feed=true posts
+            // For thread feed: include both post_type='thread' AND show_in_feed=true posts.
+            // BUT: only expand with show_in_feed when NOT scoped to room_scope='rooms',
+            // because profile room-thread queries should not leak status posts via show_in_feed.
             if (post_type_param) {
               const VALID_POST_TYPES = ["status", "thread", "share"];
               const types = post_type_param.split(",").map(t => t.trim()).filter(Boolean);
@@ -724,13 +726,14 @@ export default {
                 }
               }
               const includesThread = types.includes("thread");
-              if (includesThread && types.length === 1) {
+              const isThreadFeedContext = includesThread && room_scope_param !== "rooms";
+              if (isThreadFeedContext && types.length === 1) {
                 // Thread feed: include post_type='thread' OR show_in_feed=true
                 q = q.or("post_type.eq.thread,show_in_feed.eq.true");
               } else if (types.length === 1) {
                 q = q.eq("post_type", types[0]);
               } else if (types.length > 1) {
-                if (includesThread) {
+                if (isThreadFeedContext) {
                   // Multi-type including thread: include those types OR show_in_feed=true
                   q = q.or(`post_type.in.(${types.join(",")}),show_in_feed.eq.true`);
                 } else {
