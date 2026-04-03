@@ -1461,6 +1461,7 @@ export default {
           const author_avatar = rawAuthorAvatar;
           const room_id = typeof body?.room_id === "string" ? body.room_id : null;
           const rawShowInFeed = body?.show_in_feed === true || body?.show_in_feed === "true";
+          console.log(`[ROOM_FEED_DEBUG][POST_PARSE]`, { rid: request_id, room_id, raw_show_in_feed: body?.show_in_feed, rawShowInFeed, raw_post_type: body?.post_type, resolved_post_type: typeof body?.post_type === "string" && ["status","share","thread"].includes(body.post_type) ? body.post_type : "status" });
 
           // Parse reply/share fields with robust numeric coercion
           const rawParentPostId = body?.parent_post_id;
@@ -1775,6 +1776,7 @@ export default {
               });
             }
           }
+          console.log(`[ROOM_FEED_DEBUG][ROOM_ELIGIBILITY]`, { rid: request_id, room_id, rawShowInFeed, show_in_feed, room_category, entered_lookup: !!(rawShowInFeed && room_id && room_id !== "global") });
           mark("feed_eligibility");
 
           // ── Resolve root_post_id before insert ──
@@ -1796,6 +1798,7 @@ export default {
           // Narrow select on insert: only return columns needed for response + post-insert logic
           const POST_RETURN_COLS = "id, user_id, content, title, author_id, author_name, author_avatar, room_id, parent_post_id, root_post_id, post_type, shared_post_id, mode, moods, created_at";
           let data: any;
+          console.log(`[ROOM_FEED_DEBUG][POST_INSERT]`, { rid: request_id, room_id, show_in_feed, room_category, post_type, parent_post_id, has_title: !!(title && title.trim()) });
           try {
             const insertResult = await sb(env)
               .from("posts")
