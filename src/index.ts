@@ -610,6 +610,8 @@ export default {
           const mood_param = url.searchParams.get("mood");                 // CSV: "Happy,Curious"
           const q_param = url.searchParams.get("q");                       // keyword search
           const light = url.searchParams.get("light") === "1";              // lightweight mode: skip enrichment
+          const room_category_param = url.searchParams.get("room_category"); // CSV: "games,music"
+          const include_global_param = url.searchParams.get("include_global"); // "0" to exclude global threads
           const isReplyQuery = !!parent_post_id_param;
           const isScopedQuery = !!post_type_param || !!root_only_param || !!mode_param || !!mood_param || !!q_param;
           const cursor = (isReplyQuery || isScopedQuery) ? parseCursor(cursor_param) : null;
@@ -618,7 +620,7 @@ export default {
           // ── Edge cache: eligible for public, non-personalized feeds ──
           // Allow the standard scoped main feed (post_type=status, root_only, room_scope=global)
           // as well as the legacy unfiltered feed.
-          const hasPersonalizedFilters = !!mode_param || !!mood_param || !!q_param;
+          const hasPersonalizedFilters = !!mode_param || !!mood_param || !!q_param || !!room_category_param || include_global_param === "0";
           const isStandardScopedFeed = (
             post_type_param === "status" &&
             (root_only_param === "1" || root_only_param === "true") &&
@@ -638,6 +640,8 @@ export default {
             if (post_type_param) cacheUrl.searchParams.set("pt", post_type_param);
             if (root_only_param) cacheUrl.searchParams.set("ro", root_only_param);
             if (room_scope_param) cacheUrl.searchParams.set("rs", room_scope_param);
+            if (room_category_param) cacheUrl.searchParams.set("rc", room_category_param);
+            if (include_global_param) cacheUrl.searchParams.set("ig", include_global_param);
             feedCacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
             const cacheT0 = performance.now();
@@ -667,7 +671,7 @@ export default {
           // - Feed lists: lightweight select (content included for card preview)
           // - Single post by id: include full data for PostDetail
           const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods";
-          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,media(type,key,thumb_key)";
+          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,show_in_feed,room_category,media(type,key,thumb_key)";
           const selectFields = light ? lightSelectFields : feedSelectFields;
 
           // Step 1: log normalized filter + select cols
@@ -710,6 +714,7 @@ export default {
             }
 
             // ── post_type filter ──
+            // For thread feed: include both post_type='thread' AND show_in_feed=true posts
             if (post_type_param) {
               const VALID_POST_TYPES = ["status", "thread", "share"];
               const types = post_type_param.split(",").map(t => t.trim()).filter(Boolean);
@@ -718,10 +723,19 @@ export default {
                   throw new HttpError(400, "BAD_REQUEST", `invalid post_type: ${t}`);
                 }
               }
-              if (types.length === 1) {
+              const includesThread = types.includes("thread");
+              if (includesThread && types.length === 1) {
+                // Thread feed: include post_type='thread' OR show_in_feed=true
+                q = q.or("post_type.eq.thread,show_in_feed.eq.true");
+              } else if (types.length === 1) {
                 q = q.eq("post_type", types[0]);
               } else if (types.length > 1) {
-                q = q.in("post_type", types);
+                if (includesThread) {
+                  // Multi-type including thread: include those types OR show_in_feed=true
+                  q = q.or(`post_type.in.(${types.join(",")}),show_in_feed.eq.true`);
+                } else {
+                  q = q.in("post_type", types);
+                }
               }
             }
 
@@ -804,6 +818,21 @@ export default {
               q = q.or(
                 `title.ilike.${keyword},content.ilike.${keyword}`
               );
+            }
+
+            // ── room_category filter (CSV → .in) ──
+            if (room_category_param) {
+              const categories = room_category_param.split(",").map(c => c.trim()).filter(Boolean);
+              if (categories.length > 0) {
+                q = q.in("room_category", categories);
+              }
+            }
+
+            // ── include_global filter ──
+            // When include_global=0, exclude global/non-room thread posts
+            // (only show room-origin feed posts). Default: include everything.
+            if (include_global_param === "0") {
+              q = q.not("room_id", "is", null).neq("room_id", "global");
             }
 
             // Determine limit — for reply queries default 20/max 200, otherwise 50/max 200
@@ -1431,6 +1460,7 @@ export default {
           }
           const author_avatar = rawAuthorAvatar;
           const room_id = typeof body?.room_id === "string" ? body.room_id : null;
+          const rawShowInFeed = body?.show_in_feed === true || body?.show_in_feed === "true";
 
           // Parse reply/share fields with robust numeric coercion
           const rawParentPostId = body?.parent_post_id;
@@ -1720,6 +1750,33 @@ export default {
 
           mark("auth_done");
 
+          // ── Resolve feed inclusion eligibility ──────────────────────────
+          // Only public room posts may opt into the thread feed.
+          // Private rooms silently force show_in_feed = false.
+          let show_in_feed = false;
+          let room_category: string | null = null;
+
+          if (rawShowInFeed && room_id && room_id !== "global") {
+            try {
+              const { data: roomRow } = await sb(env)
+                .from("rooms")
+                .select("visibility, category")
+                .eq("id", room_id)
+                .maybeSingle();
+              if (roomRow && roomRow.visibility === "public" && roomRow.category) {
+                show_in_feed = true;
+                room_category = roomRow.category;
+              }
+              // else: private room, missing room, or missing category → stay false
+            } catch (e: any) {
+              // Fail closed: if room lookup fails, do not allow feed inclusion
+              console.warn(`[posts] feed_eligibility lookup failed (non-fatal)`, {
+                rid: request_id, room_id, error: e?.message,
+              });
+            }
+          }
+          mark("feed_eligibility");
+
           // ── Resolve root_post_id before insert ──
           let root_post_id: number | null = null;
           if (parent_post_id) {
@@ -1756,6 +1813,8 @@ export default {
                 shared_post_id,
                 mode,
                 moods,
+                show_in_feed,
+                room_category,
               })
               .select(POST_RETURN_COLS)
               .single();
@@ -2538,6 +2597,27 @@ export default {
               });
             } else {
               throw new HttpError(422, "VALIDATION_ERROR", "Media type must be 'image' or 'video'");
+            }
+          }
+
+          // ── Room membership gate ──────────────────────────────────────
+          // If the parent post belongs to a room (non-global), only room
+          // members may create comments. Global / non-room posts pass through.
+          {
+            const { data: parentPost } = await sb(env)
+              .from("posts")
+              .select("room_id")
+              .eq("id", post_id)
+              .maybeSingle();
+            if (!parentPost) {
+              throw new HttpError(404, "NOT_FOUND", "Parent post not found");
+            }
+            const roomId = parentPost.room_id;
+            if (roomId && roomId !== "global") {
+              const memberRole = await checkRoomMembership(env, roomId, user_id);
+              if (!memberRole) {
+                throw new HttpError(403, "ROOM_MEMBERSHIP_REQUIRED", "You must be a member of this room to comment");
+              }
             }
           }
 
