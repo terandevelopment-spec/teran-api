@@ -1599,7 +1599,7 @@ export default {
           // Avoids cold Supabase round-trip (~200-534ms) on every post.
           // Key: acct:dev:<device_id> → account_id string or "__null__"
           // TTL: 300s (device→account bindings are stable)
-          const ACCT_CACHE_TTL = 300;
+          const ACCT_CACHE_TTL = 3600; // 1 hour — device→account bindings are permanent
           const acctKvKey = `acct:dev:${user_id}`;
           const resolveAccountIdCached = async (): Promise<string | null> => {
             const tDev = Date.now();
@@ -1700,16 +1700,37 @@ export default {
           }
 
           // Step 2: Persona + room fallback in parallel
+          const PERSONA_CACHE_TTL = 3600; // 1 hour — persona bindings are permanent
           const personaCheckFn = needsPersonaCheck ? async () => {
             const tPersona0 = Date.now();
+            const personaKvKey = `persona:own:${accountId}:${author_id}`;
+            let personaSrc: 'kv' | 'db' = 'db';
 
+            // Sub-step 1: KV cache read
+            try {
+              const cached = await env.PROFILE_KV.get(personaKvKey);
+              if (cached === "1") {
+                personaSrc = 'kv';
+                mark("persona_check");
+                console.log(`[perf] /api/posts persona_breakdown rid=${request_id}`, {
+                  persona_total_ms: Date.now() - tPersona0,
+                  src: 'kv',
+                  account_id: accountId,
+                  author_id,
+                });
+                return; // ownership confirmed via cache
+              }
+            } catch { /* KV read failed — fall through to DB */ }
+
+            // Sub-step 2: DB fallback query
+            const tDb = Date.now();
             const { data: personaBinding } = await sb(env)
               .from("account_personas")
               .select("persona_author_id")
               .eq("account_id", accountId!)
               .eq("persona_author_id", author_id!)
               .maybeSingle();
-            const tPersonaQuery = Date.now();
+            const dbQueryMs = Date.now() - tDb;
 
             if (!personaBinding) {
               console.warn(`[posts-auth] REJECTED: device ${user_id} account ${accountId} does not own persona ${author_id}`);
@@ -1718,12 +1739,18 @@ export default {
             mark("persona_check");
 
             console.log(`[perf] /api/posts persona_breakdown rid=${request_id}`, {
-              persona_query_ms: tPersonaQuery - tPersona0,
-              persona_validate_ms: Date.now() - tPersonaQuery,
+              persona_query_ms: dbQueryMs,
               persona_total_ms: Date.now() - tPersona0,
+              src: 'db',
               account_id: accountId,
               author_id,
             });
+
+            // Write-behind: cache confirmed ownership
+            ctx.waitUntil(
+              env.PROFILE_KV.put(personaKvKey, "1", { expirationTtl: PERSONA_CACHE_TTL })
+                .catch(() => {})
+            );
           } : null;
 
           const roomFallbackFn = (needsRoomCheck && !roomDirectRole) ? async () => {
