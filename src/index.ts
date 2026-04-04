@@ -896,7 +896,7 @@ export default {
           if (isReplyQuery) {
             // ── Direct PostgREST fetch for reply queries: HTTP timing + header capture ──
             const parsedPpid = Number(parent_post_id_param);
-            let restUrl = `${env.SUPABASE_URL}/rest/v1/posts?select=${encodeURIComponent(feedSelectFields)}&root_post_id=eq.${parsedPpid}&parent_post_id=not.is.null&deleted_at=is.null&order=created_at.desc,id.desc&limit=${lim}`;
+            let restUrl = `${env.SUPABASE_URL}/rest/v1/posts?select=${encodeURIComponent(selectFields)}&root_post_id=eq.${parsedPpid}&parent_post_id=not.is.null&deleted_at=is.null&order=created_at.desc,id.desc&limit=${lim}`;
             // Append keyset cursor filter if present
             if (cursor) {
               restUrl += `&or=(created_at.lt.${encodeURIComponent(cursor.created_at)},and(created_at.eq.${encodeURIComponent(cursor.created_at)},id.lt.${cursor.id}))`;
