@@ -1838,7 +1838,8 @@ export default {
           }
 
           // Narrow select on insert: only return columns needed for response + post-insert logic
-          const POST_RETURN_COLS = "id, user_id, content, title, author_id, author_name, author_avatar, room_id, parent_post_id, root_post_id, post_type, shared_post_id, mode, moods, created_at";
+          // Narrow select: only DB-generated values; reconstruct rest from input
+          const POST_RETURN_COLS = "id, created_at";
           let data: any;
           console.log(`[ROOM_FEED_DEBUG][POST_INSERT]`, { rid: request_id, room_id, show_in_feed, room_category, post_type, parent_post_id, has_title: !!(title && title.trim()) });
           try {
@@ -1864,7 +1865,24 @@ export default {
               .select(POST_RETURN_COLS)
               .single();
             if (insertResult.error) throw insertResult.error;
-            data = insertResult.data;
+            // Reconstruct full response from input + DB-generated fields
+            const dbRow = insertResult.data as any;
+            data = {
+              ...dbRow,
+              user_id,
+              content,
+              title,
+              author_id,
+              author_name,
+              author_avatar,
+              room_id,
+              parent_post_id,
+              root_post_id,
+              post_type,
+              shared_post_id,
+              mode,
+              moods,
+            };
           } catch (dbErr: any) {
             // Translate DB constraint / validation errors to 400
             const msg = dbErr?.message || String(dbErr);
