@@ -1633,6 +1633,7 @@ export default {
             return acctId;
           };
 
+          const tStep1 = Date.now();
           if (needsAccountResolution && needsRoomCheck) {
             const [acctResult, { data: directHit }] = await Promise.all([
               // Branch A: resolve account_id (KV-cached)
@@ -1646,6 +1647,7 @@ export default {
                 .maybeSingle(),
             ]);
             mark("acct_resolve");
+            console.log(`[perf] /api/posts step1_parallel_ms=${Date.now() - tStep1} rid=${request_id} branches=acct+room_direct room_direct_hit=${!!directHit?.role}`);
 
             accountId = acctResult;
             roomDirectRole = directHit?.role ?? null;
@@ -1663,6 +1665,7 @@ export default {
             // Only persona check needed, no room check
             accountId = await resolveAccountIdCached();
             mark("acct_resolve");
+            console.log(`[perf] /api/posts step1_parallel_ms=${Date.now() - tStep1} rid=${request_id} branches=acct_only`);
 
             if (!accountId && needsPersonaCheck) {
               console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
@@ -1672,18 +1675,29 @@ export default {
 
           // Step 2: Persona + room fallback in parallel
           const personaCheckFn = needsPersonaCheck ? async () => {
+            const tPersona0 = Date.now();
+
             const { data: personaBinding } = await sb(env)
               .from("account_personas")
               .select("persona_author_id")
               .eq("account_id", accountId!)
               .eq("persona_author_id", author_id!)
               .maybeSingle();
+            const tPersonaQuery = Date.now();
 
             if (!personaBinding) {
               console.warn(`[posts-auth] REJECTED: device ${user_id} account ${accountId} does not own persona ${author_id}`);
               throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
             }
             mark("persona_check");
+
+            console.log(`[perf] /api/posts persona_breakdown rid=${request_id}`, {
+              persona_query_ms: tPersonaQuery - tPersona0,
+              persona_validate_ms: Date.now() - tPersonaQuery,
+              persona_total_ms: Date.now() - tPersona0,
+              account_id: accountId,
+              author_id,
+            });
           } : null;
 
           const roomFallbackFn = (needsRoomCheck && !roomDirectRole) ? async () => {
@@ -1746,8 +1760,10 @@ export default {
           const step2Tasks: Promise<void>[] = [];
           if (personaCheckFn) step2Tasks.push(personaCheckFn());
           if (roomFallbackFn) step2Tasks.push(roomFallbackFn());
+          const tStep2 = Date.now();
           if (step2Tasks.length > 0) {
             await Promise.all(step2Tasks);
+            console.log(`[perf] /api/posts step2_parallel_ms=${Date.now() - tStep2} rid=${request_id} tasks=${step2Tasks.length}`);
           } else {
             if (!author_id) author_id = user_id;
           }
