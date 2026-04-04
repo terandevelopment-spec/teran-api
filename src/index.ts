@@ -1864,8 +1864,9 @@ export default {
                 room_category,
               })
               .select(POST_RETURN_COLS)
-              .single();
+              .maybeSingle();
             if (insertResult.error) throw insertResult.error;
+            if (!insertResult.data) throw new Error("Insert returned no row");
             // Reconstruct full response from input + DB-generated fields
             const dbRow = insertResult.data as any;
             data = {
