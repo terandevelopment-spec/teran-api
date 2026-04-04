@@ -1704,15 +1704,16 @@ export default {
           const personaCheckFn = needsPersonaCheck ? async () => {
             const tPersona0 = Date.now();
             const personaKvKey = `persona:own:${accountId}:${author_id}`;
-            let personaSrc: 'kv' | 'db' = 'db';
 
             // Sub-step 1: KV cache read
+            const tKv = Date.now();
             try {
               const cached = await env.PROFILE_KV.get(personaKvKey);
+              const kvMs = Date.now() - tKv;
               if (cached === "1") {
-                personaSrc = 'kv';
                 mark("persona_check");
                 console.log(`[perf] /api/posts persona_breakdown rid=${request_id}`, {
+                  persona_kv_ms: kvMs,
                   persona_total_ms: Date.now() - tPersona0,
                   src: 'kv',
                   account_id: accountId,
@@ -1721,6 +1722,7 @@ export default {
                 return; // ownership confirmed via cache
               }
             } catch { /* KV read failed — fall through to DB */ }
+            const personaKvMs = Date.now() - tKv;
 
             // Sub-step 2: DB fallback query
             const tDb = Date.now();
@@ -1739,6 +1741,7 @@ export default {
             mark("persona_check");
 
             console.log(`[perf] /api/posts persona_breakdown rid=${request_id}`, {
+              persona_kv_ms: personaKvMs,
               persona_query_ms: dbQueryMs,
               persona_total_ms: Date.now() - tPersona0,
               src: 'db',
