@@ -1603,27 +1603,53 @@ export default {
           const acctKvKey = `acct:dev:${user_id}`;
           const resolveAccountIdCached = async (): Promise<string | null> => {
             const tDev = Date.now();
-            let kvHit = false;
+            let kvStatus: 'hit' | 'miss' | 'error' = 'miss';
+            let kvReadMs = 0;
+
+            // Sub-step 1: KV cache read
             try {
+              const tKv = Date.now();
               const cached = await env.PROFILE_KV.get(acctKvKey);
+              kvReadMs = Date.now() - tKv;
+
               if (cached !== null) {
-                kvHit = true;
+                kvStatus = 'hit';
                 mark("acct_devices");
-                console.log(`[perf] /api/posts acct_devices_ms=${Date.now() - tDev} rid=${request_id} src=kv`);
+                console.log(`[perf] /api/posts acct_breakdown rid=${request_id}`, {
+                  kv_read_ms: kvReadMs,
+                  kv_status: kvStatus,
+                  total_ms: Date.now() - tDev,
+                  src: 'kv',
+                });
                 return cached === "__null__" ? null : cached;
               }
-            } catch { /* KV read failed — fall through to DB */ }
+            } catch {
+              kvStatus = 'error';
+              kvReadMs = Date.now() - tDev;
+            }
 
+            // Sub-step 2: DB fallback query
+            const tDb = Date.now();
             const { data: deviceBinding } = await sb(env)
               .from("account_devices")
               .select("account_id")
               .eq("device_id", user_id)
               .maybeSingle();
+            const dbQueryMs = Date.now() - tDb;
+
             mark("acct_devices");
             const acctId = deviceBinding?.account_id
               ? ((deviceBinding as any).account_id as string)
               : null;
-            console.log(`[perf] /api/posts acct_devices_ms=${Date.now() - tDev} rid=${request_id} src=db`);
+
+            console.log(`[perf] /api/posts acct_breakdown rid=${request_id}`, {
+              kv_read_ms: kvReadMs,
+              kv_status: kvStatus,
+              db_query_ms: dbQueryMs,
+              total_ms: Date.now() - tDev,
+              src: 'db',
+              result: acctId ? 'found' : 'null',
+            });
 
             // Write-behind: cache result for subsequent requests
             ctx.waitUntil(
