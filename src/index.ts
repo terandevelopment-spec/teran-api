@@ -1917,7 +1917,10 @@ export default {
             post_insert_total_ms: (marks["post_insert_done"] && marks["auth_done"]) ? +((marks["post_insert_done"] - marks["auth_done"]).toFixed(1)) : null,
           });
 
-          // Insert media rows into unified 'media' table
+          // Insert media rows into unified 'media' table (fire-and-forget)
+          // Media data is reconstructed from validated input for the response;
+          // the actual DB insert is deferred to avoid blocking the response with
+          // another ~500ms Supabase round-trip.
           let mediaRows: any[] = [];
           if (validatedMedia.length > 0) {
             const postId = data.id;
@@ -1931,12 +1934,21 @@ export default {
               bytes: m.bytes ?? null,
               duration_ms: m.duration_ms ?? null,
             }));
-            const { data: insertedMedia, error: mediaError } = await sb(env)
-              .from("media")
-              .insert(mediaInsert)
-              .select("*");
-            if (mediaError) throw mediaError;
-            mediaRows = insertedMedia ?? [];
+
+            // Reconstruct response rows from input (no DB id needed by client)
+            mediaRows = mediaInsert;
+
+            // Deferred DB write
+            ctx.waitUntil(
+              Promise.resolve(
+                sb(env)
+                  .from("media")
+                  .insert(mediaInsert)
+              ).then(({ error }) => {
+                if (error) console.error(`[posts][${request_id}] media insert failed (deferred)`, { error: error.message, postId, count: mediaInsert.length });
+                else console.log(`[perf] /api/posts media_deferred_ok rid=${request_id} count=${mediaInsert.length}`);
+              }).catch((e: any) => console.error(`[posts][${request_id}] media insert threw (deferred)`, { error: e?.message }))
+            );
             mark("media_insert_done");
           }
 
