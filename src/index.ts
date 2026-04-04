@@ -1598,141 +1598,100 @@ export default {
           // ── KV-cached device→account_id resolver ──
           // Avoids cold Supabase round-trip (~200-534ms) on every post.
           // Key: acct:dev:<device_id> → account_id string or "__null__"
-          // TTL: 300s (device→account bindings are stable)
           const ACCT_CACHE_TTL = 3600; // 1 hour — device→account bindings are permanent
+          const PERSONA_CACHE_TTL = 3600; // 1 hour — persona bindings are permanent
           const acctKvKey = `acct:dev:${user_id}`;
-          const resolveAccountIdCached = async (): Promise<string | null> => {
-            const tDev = Date.now();
-            let kvStatus: 'hit' | 'miss' | 'error' = 'miss';
-            let kvReadMs = 0;
+          // Persona KV key uses device_id (not accountId) so both reads can fire in parallel
+          const personaKvKey = needsPersonaCheck ? `persona:dev:${user_id}:${author_id}` : null;
 
-            // Sub-step 1: KV cache read
-            try {
-              const tKv = Date.now();
-              const cached = await env.PROFILE_KV.get(acctKvKey);
-              kvReadMs = Date.now() - tKv;
+          // ── Speculative parallel KV batch ──
+          // Fire both KV reads simultaneously to avoid serial ~250ms + ~250ms
+          const tKvBatch = Date.now();
+          const [acctKvRaw, personaKvRaw] = await Promise.all([
+            needsAccountResolution
+              ? env.PROFILE_KV.get(acctKvKey).catch(() => null)
+              : Promise.resolve(null),
+            personaKvKey
+              ? env.PROFILE_KV.get(personaKvKey).catch(() => null)
+              : Promise.resolve(null),
+          ]);
+          const kvBatchMs = Date.now() - tKvBatch;
 
-              if (cached !== null) {
-                kvStatus = 'hit';
-                mark("acct_devices");
-                console.log(`[perf] /api/posts acct_breakdown rid=${request_id}`, {
-                  kv_read_ms: kvReadMs,
-                  kv_status: kvStatus,
-                  total_ms: Date.now() - tDev,
-                  src: 'kv',
-                });
-                return cached === "__null__" ? null : cached;
-              }
-            } catch {
-              kvStatus = 'error';
-              kvReadMs = Date.now() - tDev;
-            }
+          // Parse acct KV result
+          let acctKvHit = false;
+          if (acctKvRaw !== null) {
+            acctKvHit = true;
+            accountId = acctKvRaw === "__null__" ? null : acctKvRaw;
+            mark("acct_devices");
+          }
 
-            // Sub-step 2: DB fallback query
+          // Parse persona KV result
+          let personaKvHit = personaKvRaw === "1";
+
+          console.log(`[perf] /api/posts kv_batch rid=${request_id}`, {
+            kv_batch_ms: kvBatchMs,
+            acct_kv: acctKvHit ? 'hit' : 'miss',
+            persona_kv: personaKvKey ? (personaKvHit ? 'hit' : 'miss') : 'n/a',
+          });
+
+          // ── Acct DB fallback (only if KV missed) ──
+          if (needsAccountResolution && !acctKvHit) {
             const tDb = Date.now();
             const { data: deviceBinding } = await sb(env)
               .from("account_devices")
               .select("account_id")
               .eq("device_id", user_id)
               .maybeSingle();
-            const dbQueryMs = Date.now() - tDb;
-
+            const dbMs = Date.now() - tDb;
             mark("acct_devices");
-            const acctId = deviceBinding?.account_id
+            accountId = deviceBinding?.account_id
               ? ((deviceBinding as any).account_id as string)
               : null;
-
-            console.log(`[perf] /api/posts acct_breakdown rid=${request_id}`, {
-              kv_read_ms: kvReadMs,
-              kv_status: kvStatus,
-              db_query_ms: dbQueryMs,
-              total_ms: Date.now() - tDev,
-              src: 'db',
-              result: acctId ? 'found' : 'null',
+            console.log(`[perf] /api/posts acct_db_fallback rid=${request_id}`, {
+              db_query_ms: dbMs,
+              result: accountId ? 'found' : 'null',
             });
-
-            // Write-behind: cache result for subsequent requests
+            // Write-behind: cache for next request
             ctx.waitUntil(
-              env.PROFILE_KV.put(acctKvKey, acctId ?? "__null__", { expirationTtl: ACCT_CACHE_TTL })
+              env.PROFILE_KV.put(acctKvKey, accountId ?? "__null__", { expirationTtl: ACCT_CACHE_TTL })
                 .catch(() => {})
             );
-            return acctId;
-          };
-
-          const tStep1 = Date.now();
-          if (needsAccountResolution && needsRoomCheck) {
-            const [acctResult, { data: directHit }] = await Promise.all([
-              // Branch A: resolve account_id (KV-cached)
-              resolveAccountIdCached(),
-              // Branch B: room direct check (only needs user_id)
-              sb(env)
-                .from("room_members")
-                .select("role")
-                .eq("room_id", room_id!)
-                .eq("user_id", user_id)
-                .maybeSingle(),
-            ]);
-            mark("acct_resolve");
-            console.log(`[perf] /api/posts step1_parallel_ms=${Date.now() - tStep1} rid=${request_id} branches=acct+room_direct room_direct_hit=${!!directHit?.role}`);
-
-            accountId = acctResult;
-            roomDirectRole = directHit?.role ?? null;
-
-            // ── Teran ID gate: only claimed accounts can post in rooms ──
-            if (!accountId && needsRoomCheck) {
-              console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post in room ${room_id} ua=${(req.headers.get("user-agent")||"").slice(0,60)}`);
-              throw new HttpError(403, "TERAN_ID_REQUIRED", "Create a Teran ID to post in rooms");
-            }
-            if (!accountId && needsPersonaCheck) {
-              console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id} ua=${(req.headers.get("user-agent")||"").slice(0,60)}`);
-              throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
-            }
-          } else if (needsAccountResolution) {
-            // Only persona check needed, no room check
-            accountId = await resolveAccountIdCached();
-            mark("acct_resolve");
-            console.log(`[perf] /api/posts step1_parallel_ms=${Date.now() - tStep1} rid=${request_id} branches=acct_only`);
-
-            if (!accountId && needsPersonaCheck) {
-              console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
-              throw new HttpError(403, "TERAN_ID_REQUIRED", "Create a Teran ID to post");
-            }
           }
 
-          // Step 2: Persona + room fallback in parallel
-          const PERSONA_CACHE_TTL = 3600; // 1 hour — persona bindings are permanent
-          const personaCheckFn = needsPersonaCheck ? async () => {
+          // ── Room direct check (parallel with acct DB fallback when applicable) ──
+          const tStep1 = Date.now();
+          if (needsRoomCheck) {
+            const { data: directHit } = await sb(env)
+              .from("room_members")
+              .select("role")
+              .eq("room_id", room_id!)
+              .eq("user_id", user_id)
+              .maybeSingle();
+            roomDirectRole = directHit?.role ?? null;
+          }
+          mark("acct_resolve");
+          console.log(`[perf] /api/posts step1_ms=${Date.now() - tStep1} rid=${request_id} acct_src=${acctKvHit ? 'kv' : 'db'} room_check=${needsRoomCheck}`);
+
+          // ── Teran ID gates ──
+          if (!accountId && needsRoomCheck) {
+            console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post in room ${room_id}`);
+            throw new HttpError(403, "TERAN_ID_REQUIRED", "Create a Teran ID to post in rooms");
+          }
+          if (!accountId && needsPersonaCheck) {
+            console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
+            throw new HttpError(403, "TERAN_ID_REQUIRED", "Create a Teran ID to post");
+          }
+
+          // Step 2: Persona DB fallback + room fallback in parallel (only if KV missed)
+          const personaCheckFn = (needsPersonaCheck && !personaKvHit) ? async () => {
             const tPersona0 = Date.now();
-            const personaKvKey = `persona:own:${accountId}:${author_id}`;
-
-            // Sub-step 1: KV cache read
-            const tKv = Date.now();
-            try {
-              const cached = await env.PROFILE_KV.get(personaKvKey);
-              const kvMs = Date.now() - tKv;
-              if (cached === "1") {
-                mark("persona_check");
-                console.log(`[perf] /api/posts persona_breakdown rid=${request_id}`, {
-                  persona_kv_ms: kvMs,
-                  persona_total_ms: Date.now() - tPersona0,
-                  src: 'kv',
-                  account_id: accountId,
-                  author_id,
-                });
-                return; // ownership confirmed via cache
-              }
-            } catch { /* KV read failed — fall through to DB */ }
-            const personaKvMs = Date.now() - tKv;
-
-            // Sub-step 2: DB fallback query
-            const tDb = Date.now();
             const { data: personaBinding } = await sb(env)
               .from("account_personas")
               .select("persona_author_id")
               .eq("account_id", accountId!)
               .eq("persona_author_id", author_id!)
               .maybeSingle();
-            const dbQueryMs = Date.now() - tDb;
+            const dbQueryMs = Date.now() - tPersona0;
 
             if (!personaBinding) {
               console.warn(`[posts-auth] REJECTED: device ${user_id} account ${accountId} does not own persona ${author_id}`);
@@ -1741,19 +1700,27 @@ export default {
             mark("persona_check");
 
             console.log(`[perf] /api/posts persona_breakdown rid=${request_id}`, {
-              persona_kv_ms: personaKvMs,
               persona_query_ms: dbQueryMs,
-              persona_total_ms: Date.now() - tPersona0,
+              persona_total_ms: dbQueryMs,
               src: 'db',
               account_id: accountId,
               author_id,
             });
 
-            // Write-behind: cache confirmed ownership
+            // Write-behind: cache confirmed ownership (device-keyed)
             ctx.waitUntil(
-              env.PROFILE_KV.put(personaKvKey, "1", { expirationTtl: PERSONA_CACHE_TTL })
+              env.PROFILE_KV.put(`persona:dev:${user_id}:${author_id}`, "1", { expirationTtl: PERSONA_CACHE_TTL })
                 .catch(() => {})
             );
+          } : needsPersonaCheck ? async () => {
+            // KV hit path — just mark the timing
+            mark("persona_check");
+            console.log(`[perf] /api/posts persona_breakdown rid=${request_id}`, {
+              persona_total_ms: 0,
+              src: 'kv_batch',
+              account_id: accountId,
+              author_id,
+            });
           } : null;
 
           const roomFallbackFn = (needsRoomCheck && !roomDirectRole) ? async () => {
