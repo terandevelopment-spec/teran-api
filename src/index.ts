@@ -1842,6 +1842,7 @@ export default {
           const POST_RETURN_COLS = "id, created_at";
           let data: any;
           console.log(`[ROOM_FEED_DEBUG][POST_INSERT]`, { rid: request_id, room_id, show_in_feed, room_category, post_type, parent_post_id, has_title: !!(title && title.trim()) });
+          const tInsert = Date.now();
           try {
             const insertResult = await sb(env)
               .from("posts")
@@ -1907,6 +1908,13 @@ export default {
             );
           }
           mark("post_insert_done");
+          const insertMs = Date.now() - tInsert;
+
+          console.log(`[perf] /api/posts insert_breakdown rid=${request_id}`, {
+            feed_eligibility_ms: (marks["feed_eligibility"] && marks["auth_done"]) ? +((marks["feed_eligibility"] - marks["auth_done"]).toFixed(1)) : null,
+            pure_insert_ms: insertMs,
+            post_insert_total_ms: (marks["post_insert_done"] && marks["auth_done"]) ? +((marks["post_insert_done"] - marks["auth_done"]).toFixed(1)) : null,
+          });
 
           // Insert media rows into unified 'media' table
           let mediaRows: any[] = [];
@@ -1995,6 +2003,8 @@ export default {
             room_fallback_ms: delta("room_fallback", "acct_resolve"),
             auth_total_ms: ms("auth_done"),
             post_insert_ms: delta("post_insert_done", "auth_done"),
+            feed_eligibility_ms: delta("feed_eligibility", "auth_done"),
+            pure_insert_ms: delta("post_insert_done", "feed_eligibility"),
             media_insert_ms: delta("media_insert_done", "post_insert_done"),
             notif_prepare_ms: delta("notif_prepare_done", "media_insert_done") ?? delta("notif_prepare_done", "post_insert_done"),
             notif_insert_ms: delta("notif_insert_done", "notif_prepare_done"),
