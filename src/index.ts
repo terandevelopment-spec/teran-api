@@ -2916,32 +2916,37 @@ export default {
                 throw new HttpError(400, "BAD_REQUEST", "actor_id is required");
               }
 
-              // Phase 3: Ownership verification — single RPC call (JOIN inside Postgres)
+              // Phase 3: Ownership verification — parallel account lookups
+              // NOTE: single-query RPC was tested (694ms) but is SLOWER than parallel SELECTs (440ms)
+              // due to Supabase PostgREST RPC overhead. Keeping the faster empirical path.
               const actor_id = raw_actor_id;
               const isSelfDevice = actor_id === jwt_user_id;
               let ownershipMs = 0;
 
               if (!isSelfDevice) {
                 const t_own = Date.now();
-                const { data: isOwner, error: rpcError } = await sb(env)
-                  .rpc("verify_persona_ownership", {
-                    p_device_id: jwt_user_id,
-                    p_persona_author_id: actor_id,
-                  });
+                const [deviceResult, personaResult] = await Promise.all([
+                  sb(env).from("account_devices").select("account_id").eq("device_id", jwt_user_id).maybeSingle(),
+                  sb(env).from("account_personas").select("account_id").eq("persona_author_id", actor_id).maybeSingle(),
+                ]);
                 ownershipMs = Date.now() - t_own;
 
-                if (rpcError) {
-                  console.error(`[like-auth] ownership RPC error`, { post_id, error: rpcError });
-                  throw new HttpError(403, "FORBIDDEN", "Ownership verification failed");
-                }
+                const deviceAccountId = (deviceResult.data as any)?.account_id;
+                const personaAccountId = (personaResult.data as any)?.account_id;
 
-                _like("ownership_rpc_verify", {
+                _like("ownership_verify", {
                   ownership_ms: ownershipMs,
-                  isOwner: !!isOwner,
+                  deviceFound: !!deviceAccountId,
+                  personaFound: !!personaAccountId,
+                  match: deviceAccountId != null && deviceAccountId === personaAccountId,
                 });
 
-                if (!isOwner) {
-                  console.warn(`[like-auth] REJECTED: device ${jwt_user_id} does not own actor ${actor_id}`);
+                if (!deviceAccountId) {
+                  console.warn(`[like-auth] REJECTED: unclaimed device ${jwt_user_id} tried to like as actor_id ${actor_id}`);
+                  throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+                }
+                if (!personaAccountId || personaAccountId !== deviceAccountId) {
+                  console.warn(`[like-auth] REJECTED: device ${jwt_user_id} account ${deviceAccountId} does not own actor ${actor_id} (persona account: ${personaAccountId})`);
                   throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
                 }
               } else {
