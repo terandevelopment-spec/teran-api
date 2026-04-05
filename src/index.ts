@@ -2925,9 +2925,20 @@ export default {
 
               if (!isSelfDevice) {
                 const t_own = Date.now();
+                let deviceMs = 0, personaMs = 0;
                 const [deviceResult, personaResult] = await Promise.all([
-                  sb(env).from("account_devices").select("account_id").eq("device_id", jwt_user_id).maybeSingle(),
-                  sb(env).from("account_personas").select("account_id").eq("persona_author_id", actor_id).maybeSingle(),
+                  (async () => {
+                    const t = Date.now();
+                    const r = await sb(env).from("account_devices").select("account_id").eq("device_id", jwt_user_id).maybeSingle();
+                    deviceMs = Date.now() - t;
+                    return r;
+                  })(),
+                  (async () => {
+                    const t = Date.now();
+                    const r = await sb(env).from("account_personas").select("account_id").eq("persona_author_id", actor_id).maybeSingle();
+                    personaMs = Date.now() - t;
+                    return r;
+                  })(),
                 ]);
                 ownershipMs = Date.now() - t_own;
 
@@ -2936,6 +2947,8 @@ export default {
 
                 _like("ownership_verify", {
                   ownership_ms: ownershipMs,
+                  device_ms: deviceMs,
+                  persona_ms: personaMs,
                   deviceFound: !!deviceAccountId,
                   personaFound: !!personaAccountId,
                   match: deviceAccountId != null && deviceAccountId === personaAccountId,
