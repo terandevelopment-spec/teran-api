@@ -1802,6 +1802,7 @@ export default {
               .eq("author_id", author_id)
               .eq("shared_post_id", shared_post_id)
               .eq("post_type", "status")
+              .is("deleted_at", null)
               .maybeSingle();
             if (existingRepost) {
               throw new HttpError(409, "ALREADY_REPOSTED", "You have already reposted this post");
