@@ -1793,6 +1793,21 @@ export default {
 
           mark("auth_done");
 
+          // ── Duplicate repost prevention ──
+          // A user (persona) may only have one repost (normal or quote) per source post.
+          if (shared_post_id && author_id) {
+            const { data: existingRepost } = await sb(env)
+              .from("posts")
+              .select("id")
+              .eq("author_id", author_id)
+              .eq("shared_post_id", shared_post_id)
+              .eq("post_type", "status")
+              .maybeSingle();
+            if (existingRepost) {
+              throw new HttpError(409, "ALREADY_REPOSTED", "You have already reposted this post");
+            }
+          }
+
           // ── Resolve feed inclusion eligibility ──────────────────────────
           // Only public room posts may opt into the thread feed.
           // Private rooms silently force show_in_feed = false.
