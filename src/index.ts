@@ -2916,108 +2916,107 @@ export default {
                 throw new HttpError(400, "BAD_REQUEST", "actor_id is required");
               }
 
-              // Phase 3: Ownership check
+              // Phase 3: Ownership verification
               const actor_id = raw_actor_id;
+              const isSelfDevice = actor_id === jwt_user_id;
               let ownershipMs = 0;
-              if (actor_id !== jwt_user_id) {
-                const t_own = Date.now();
-                const { data: deviceBinding } = await sb(env)
-                  .from("account_devices")
-                  .select("account_id")
-                  .eq("device_id", jwt_user_id)
-                  .maybeSingle();
-                const deviceBindMs = Date.now() - t_own;
-                _like("ownership_device_bind", { deviceBind_ms: deviceBindMs, found: !!deviceBinding?.account_id });
 
-                if (!deviceBinding?.account_id) {
+              if (!isSelfDevice) {
+                // Parallel ownership: fire both lookups simultaneously, verify account_id match
+                const t_own = Date.now();
+                const [deviceResult, personaResult] = await Promise.all([
+                  sb(env).from("account_devices").select("account_id").eq("device_id", jwt_user_id).maybeSingle(),
+                  sb(env).from("account_personas").select("account_id").eq("persona_author_id", actor_id).maybeSingle(),
+                ]);
+                ownershipMs = Date.now() - t_own;
+
+                const deviceAccountId = (deviceResult.data as any)?.account_id;
+                const personaAccountId = (personaResult.data as any)?.account_id;
+                _like("ownership_parallel", {
+                  ownership_ms: ownershipMs,
+                  deviceFound: !!deviceAccountId,
+                  personaFound: !!personaAccountId,
+                  match: deviceAccountId != null && deviceAccountId === personaAccountId,
+                });
+
+                if (!deviceAccountId) {
                   console.warn(`[like-auth] REJECTED: unclaimed device ${jwt_user_id} tried to like as actor_id ${actor_id}`);
                   throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
                 }
-
-                const t_persona = Date.now();
-                const { data: personaBinding } = await sb(env)
-                  .from("account_personas")
-                  .select("persona_author_id")
-                  .eq("account_id", deviceBinding.account_id)
-                  .eq("persona_author_id", actor_id)
-                  .maybeSingle();
-                const personaBindMs = Date.now() - t_persona;
-                _like("ownership_persona_bind", { personaBind_ms: personaBindMs, found: !!personaBinding });
-                ownershipMs = Date.now() - t_own;
-
-                if (!personaBinding) {
-                  console.warn(`[like-auth] REJECTED: device ${jwt_user_id} account ${deviceBinding.account_id} does not own actor ${actor_id}`);
+                if (!personaAccountId || personaAccountId !== deviceAccountId) {
+                  console.warn(`[like-auth] REJECTED: device ${jwt_user_id} account ${deviceAccountId} does not own actor ${actor_id} (persona account: ${personaAccountId})`);
                   throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
                 }
               } else {
                 _like("ownership_skip (self-device)");
               }
 
-              // Phase 4: Upsert
-              const t_upsert = Date.now();
-              const { data, error: insertError } = await sb(env)
-                .from("post_likes")
-                .upsert(
-                  { post_id, actor_id, actor_name, actor_avatar },
-                  { onConflict: "post_id,actor_id", ignoreDuplicates: true }
-                )
-                .select("post_id");
-              const wasInserted = (data?.length ?? 0) > 0;
-              const upsertMs = Date.now() - t_upsert;
-              _like("upsert", { upsert_ms: upsertMs, wasInserted });
-
-              if (insertError) throw insertError;
-
-              // Phase 5: Notification (only if new like)
-              if (wasInserted) {
-                // 5a: Fetch post owner
-                const t_owner = Date.now();
-                const { data: postData, error: postFetchError } = await sb(env)
+              // Phase 4: Upsert + speculative post owner lookup (parallel)
+              // Owner lookup runs alongside upsert so it's ready if we need to send a notification.
+              const t_parallel = Date.now();
+              const [upsertResult, ownerResult] = await Promise.all([
+                sb(env)
+                  .from("post_likes")
+                  .upsert(
+                    { post_id, actor_id, actor_name, actor_avatar },
+                    { onConflict: "post_id,actor_id", ignoreDuplicates: true }
+                  )
+                  .select("post_id"),
+                sb(env)
                   .from("posts")
                   .select("user_id, author_id, root_post_id, room_id")
                   .eq("id", post_id)
-                  .single();
-                const ownerMs = Date.now() - t_owner;
-                const isSelfLike = postData?.user_id === jwt_user_id;
-                _like("notif_owner_lookup", { owner_ms: ownerMs, isSelfLike, found: !!postData?.user_id });
+                  .single(),
+              ]);
+              const parallelMs = Date.now() - t_parallel;
 
-                if (postFetchError) {
-                  console.error(`[notif][${request_id}] failed to fetch post owner`, { post_id, error: postFetchError });
-                }
+              const { data, error: insertError } = upsertResult;
+              const wasInserted = (data?.length ?? 0) > 0;
+              const { data: postData, error: postFetchError } = ownerResult;
+              const isSelfLike = postData?.user_id === jwt_user_id;
 
-                if (postData?.user_id && !isSelfLike) {
-                  // 5b: Resolve room metadata
-                  const t_room = Date.now();
-                  const likedPostRootId = postData.root_post_id ?? post_id;
-                  const plRoomMeta = await resolveRoomMeta(env, (postData as any).room_id);
-                  const roomMetaMs = Date.now() - t_room;
-                  _like("notif_room_meta", { roomMeta_ms: roomMetaMs, room_id: (postData as any).room_id });
+              _like("upsert_and_owner", {
+                parallel_ms: parallelMs,
+                wasInserted,
+                isSelfLike,
+                ownerFound: !!postData?.user_id,
+              });
 
-                  // 5c: Create notification
-                  const t_notif = Date.now();
-                  await createNotification(env, {
-                    recipient_user_id: postData.user_id,
-                    actor_user_id: jwt_user_id,
-                    actor_name,
-                    actor_avatar,
-                    type: "post_like",
-                    post_id,
-                    root_post_id: likedPostRootId,
-                    ...plRoomMeta,
-                    group_key: `post_like:${post_id}`,
-                  }, request_id);
-                  const notifMs = Date.now() - t_notif;
-                  _like("notif_create", { notif_ms: notifMs });
-                } else if (!postData?.user_id) {
-                  _like("notif_skip_no_owner", { isSelfLike });
-                } else {
-                  _like("notif_skip_self_like", { isSelfLike: true });
-                }
+              if (insertError) throw insertError;
+
+              // Phase 5: Notification (only if new like + not self + owner found)
+              if (wasInserted && postData?.user_id && !isSelfLike) {
+                // 5a: Resolve room metadata
+                const t_room = Date.now();
+                const likedPostRootId = postData.root_post_id ?? post_id;
+                const plRoomMeta = await resolveRoomMeta(env, (postData as any).room_id);
+                const roomMetaMs = Date.now() - t_room;
+                _like("notif_room_meta", { roomMeta_ms: roomMetaMs, room_id: (postData as any).room_id });
+
+                // 5b: Create notification
+                const t_notif = Date.now();
+                await createNotification(env, {
+                  recipient_user_id: postData.user_id,
+                  actor_user_id: jwt_user_id,
+                  actor_name,
+                  actor_avatar,
+                  type: "post_like",
+                  post_id,
+                  root_post_id: likedPostRootId,
+                  ...plRoomMeta,
+                  group_key: `post_like:${post_id}`,
+                }, request_id);
+                const notifMs = Date.now() - t_notif;
+                _like("notif_create", { notif_ms: notifMs });
+              } else if (wasInserted && !postData?.user_id) {
+                _like("notif_skip_no_owner");
+              } else if (wasInserted && isSelfLike) {
+                _like("notif_skip_self_like");
               } else {
                 _like("notif_skip_duplicate");
               }
 
-              _like("total", { ownership_ms: ownershipMs, upsert_ms: upsertMs, wasInserted });
+              _like("total", { ownership_ms: ownershipMs, parallel_ms: parallelMs, wasInserted, isSelfLike });
               return ok(req, env, request_id, { liked: true }, wasInserted ? 201 : 200);
             }
 
