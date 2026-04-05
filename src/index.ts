@@ -2916,46 +2916,31 @@ export default {
                 throw new HttpError(400, "BAD_REQUEST", "actor_id is required");
               }
 
-              // Phase 3: Ownership verification — single JOIN query via raw PostgREST
+              // Phase 3: Ownership verification — single RPC call (JOIN inside Postgres)
               const actor_id = raw_actor_id;
               const isSelfDevice = actor_id === jwt_user_id;
               let ownershipMs = 0;
 
               if (!isSelfDevice) {
                 const t_own = Date.now();
-                // Single query: account_devices JOIN account_personas via shared account_id
-                // PostgREST resource embedding with !inner ensures both must exist and match
-                const ownershipUrl = `${env.SUPABASE_URL}/rest/v1/account_devices?` +
-                  `select=account_id,account_personas!inner(persona_author_id)&` +
-                  `device_id=eq.${encodeURIComponent(jwt_user_id)}&` +
-                  `account_personas.persona_author_id=eq.${encodeURIComponent(actor_id)}&` +
-                  `limit=1`;
-                const ownershipResp = await fetch(ownershipUrl, {
-                  method: "GET",
-                  headers: {
-                    "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
-                    "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-                    "Accept": "application/json",
-                  },
-                });
+                const { data: isOwner, error: rpcError } = await sb(env)
+                  .rpc("verify_persona_ownership", {
+                    p_device_id: jwt_user_id,
+                    p_persona_author_id: actor_id,
+                  });
                 ownershipMs = Date.now() - t_own;
 
-                let ownershipRows: any[] = [];
-                if (ownershipResp.ok) {
-                  ownershipRows = await ownershipResp.json() as any[];
-                } else {
-                  const errBody = await ownershipResp.text().catch(() => "");
-                  console.error(`[like-auth] ownership JOIN failed ${ownershipResp.status}: ${errBody}`);
-                  // Fallback: reject as unauthorized
+                if (rpcError) {
+                  console.error(`[like-auth] ownership RPC error`, { post_id, error: rpcError });
                   throw new HttpError(403, "FORBIDDEN", "Ownership verification failed");
                 }
 
-                _like("ownership_join_verify", {
+                _like("ownership_rpc_verify", {
                   ownership_ms: ownershipMs,
-                  found: ownershipRows.length > 0,
+                  isOwner: !!isOwner,
                 });
 
-                if (ownershipRows.length === 0) {
+                if (!isOwner) {
                   console.warn(`[like-auth] REJECTED: device ${jwt_user_id} does not own actor ${actor_id}`);
                   throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
                 }
