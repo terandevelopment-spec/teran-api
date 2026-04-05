@@ -2953,8 +2953,9 @@ export default {
                 _like("ownership_skip (self-device)");
               }
 
-              // Phase 4: Upsert + speculative post owner+room lookup (parallel)
-              // Post owner query now embeds rooms(icon_key, emoji) to avoid a separate resolveRoomMeta call.
+              // Phase 4: Upsert + speculative post owner lookup (parallel)
+              // NOTE: do NOT embed rooms() here — posts with room_id=null cause the entire
+              // row to disappear due to inner-join semantics in PostgREST resource embedding.
               const t_parallel = Date.now();
               const [upsertResult, ownerResult] = await Promise.all([
                 sb(env)
@@ -2966,7 +2967,7 @@ export default {
                   .select("post_id"),
                 sb(env)
                   .from("posts")
-                  .select("user_id, author_id, root_post_id, room_id, rooms(icon_key, emoji)")
+                  .select("user_id, author_id, root_post_id, room_id")
                   .eq("id", post_id)
                   .maybeSingle(),
               ]);
@@ -2982,7 +2983,7 @@ export default {
                 wasInserted,
                 isSelfLike,
                 ownerFound: !!postData?.user_id,
-                hasRoomMeta: !!(postData?.rooms),
+                ownerError: ownerResult.error ? ownerResult.error.message : null,
               });
 
               if (insertError) throw insertError;
@@ -2990,12 +2991,10 @@ export default {
               // Phase 5: Notification (only if new like + not self + owner found)
               if (wasInserted && postData?.user_id && !isSelfLike) {
                 const likedPostRootId = postData.root_post_id ?? post_id;
-                // Room meta is already embedded from the owner query — no separate fetch needed
-                const roomMeta = {
-                  room_id: postData.room_id ?? null,
-                  room_icon_key: postData.rooms?.icon_key ?? null,
-                  room_emoji: postData.rooms?.emoji ?? null,
-                };
+                // Resolve room meta only when actually creating a notification and post has a room
+                const roomMeta = postData.room_id
+                  ? await resolveRoomMeta(env, postData.room_id)
+                  : { room_id: null, room_icon_key: null, room_emoji: null };
 
                 const t_notif = Date.now();
                 await createNotification(env, {
