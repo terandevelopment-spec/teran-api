@@ -2896,52 +2896,65 @@ export default {
 
             // POST = ensure liked (idempotent)
             if (req.method === "POST") {
-              // Get JWT user_id for notifications
-              const jwt_user_id = await requireAuth(req, env);
+              const _like = (label: string, extra?: Record<string, any>) =>
+                console.log(`[perf] /api/posts/:id/like POST ${label} ${Date.now() - handlerStart}ms`, { post_id, rid: request_id, ...extra });
 
-              // Parse actor fields from request body (for post_likes table and UI display)
-              // SECURITY: actor_id from body is untrusted — must verify the caller
-              // owns this persona before allowing them to like as it.
+              // Phase 1: Auth
+              const t_auth = Date.now();
+              const jwt_user_id = await requireAuth(req, env);
+              _like("auth", { auth_ms: Date.now() - t_auth });
+
+              // Phase 2: Body parse
+              const t_body = Date.now();
               const body = (await req.json().catch(() => ({}))) as any;
               const raw_actor_id = typeof body?.actor_id === "string" ? body.actor_id.trim() : null;
               const actor_name = typeof body?.actor_name === "string" ? body.actor_name : null;
               const actor_avatar = typeof body?.actor_avatar === "string" ? body.actor_avatar : null;
+              _like("body_parse", { body_ms: Date.now() - t_body });
 
               if (!raw_actor_id) {
                 throw new HttpError(400, "BAD_REQUEST", "actor_id is required");
               }
 
-              // OWNERSHIP CHECK: actor_id must belong to the caller.
-              // If actor_id matches the JWT device_id, allow (self-like).
-              // Otherwise, check via account_devices → account_personas binding.
+              // Phase 3: Ownership check
               const actor_id = raw_actor_id;
+              let ownershipMs = 0;
               if (actor_id !== jwt_user_id) {
+                const t_own = Date.now();
                 const { data: deviceBinding } = await sb(env)
                   .from("account_devices")
                   .select("account_id")
                   .eq("device_id", jwt_user_id)
                   .maybeSingle();
+                const deviceBindMs = Date.now() - t_own;
+                _like("ownership_device_bind", { deviceBind_ms: deviceBindMs, found: !!deviceBinding?.account_id });
 
                 if (!deviceBinding?.account_id) {
                   console.warn(`[like-auth] REJECTED: unclaimed device ${jwt_user_id} tried to like as actor_id ${actor_id}`);
                   throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
                 }
 
+                const t_persona = Date.now();
                 const { data: personaBinding } = await sb(env)
                   .from("account_personas")
                   .select("persona_author_id")
                   .eq("account_id", deviceBinding.account_id)
                   .eq("persona_author_id", actor_id)
                   .maybeSingle();
+                const personaBindMs = Date.now() - t_persona;
+                _like("ownership_persona_bind", { personaBind_ms: personaBindMs, found: !!personaBinding });
+                ownershipMs = Date.now() - t_own;
 
                 if (!personaBinding) {
                   console.warn(`[like-auth] REJECTED: device ${jwt_user_id} account ${deviceBinding.account_id} does not own actor ${actor_id}`);
                   throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
                 }
+              } else {
+                _like("ownership_skip (self-device)");
               }
 
-              // Single upsert - no-op if already liked (ignoreDuplicates)
-              let t1 = Date.now();
+              // Phase 4: Upsert
+              const t_upsert = Date.now();
               const { data, error: insertError } = await sb(env)
                 .from("post_likes")
                 .upsert(
@@ -2950,40 +2963,41 @@ export default {
                 )
                 .select("post_id");
               const wasInserted = (data?.length ?? 0) > 0;
-              console.log(`[perf] /api/posts/:id/like POST upsert ${Date.now() - t1}ms`, { post_id, wasInserted });
+              const upsertMs = Date.now() - t_upsert;
+              _like("upsert", { upsert_ms: upsertMs, wasInserted });
 
               if (insertError) throw insertError;
 
-              // Create notification if this was a new like
+              // Phase 5: Notification (only if new like)
               if (wasInserted) {
-                t1 = Date.now();
-                // Fetch the post owner's user_id (NOT author_id/persona)
+                // 5a: Fetch post owner
+                const t_owner = Date.now();
                 const { data: postData, error: postFetchError } = await sb(env)
                   .from("posts")
                   .select("user_id, author_id, root_post_id, room_id")
                   .eq("id", post_id)
                   .single();
+                const ownerMs = Date.now() - t_owner;
+                const isSelfLike = postData?.user_id === jwt_user_id;
+                _like("notif_owner_lookup", { owner_ms: ownerMs, isSelfLike, found: !!postData?.user_id });
 
                 if (postFetchError) {
                   console.error(`[notif][${request_id}] failed to fetch post owner`, { post_id, error: postFetchError });
                 }
 
-                // Use user_id (JWT sub) for notification recipient, NOT author_id (persona)
-                if (postData?.user_id && postData.user_id !== jwt_user_id) {
-                  console.log(`[notif] creating post_like`, {
-                    request_id,
-                    post_id,
-                    actor_user_id: jwt_user_id,
-                    recipient_user_id: postData.user_id,
-                    actor_persona_id: actor_id,
-                    post_author_id: postData.author_id,
-                  });
-                  // Resolve root_post_id for navigation
+                if (postData?.user_id && !isSelfLike) {
+                  // 5b: Resolve room metadata
+                  const t_room = Date.now();
                   const likedPostRootId = postData.root_post_id ?? post_id;
                   const plRoomMeta = await resolveRoomMeta(env, (postData as any).room_id);
+                  const roomMetaMs = Date.now() - t_room;
+                  _like("notif_room_meta", { roomMeta_ms: roomMetaMs, room_id: (postData as any).room_id });
+
+                  // 5c: Create notification
+                  const t_notif = Date.now();
                   await createNotification(env, {
-                    recipient_user_id: postData.user_id,  // JWT sub of post owner
-                    actor_user_id: jwt_user_id,           // JWT sub of liker
+                    recipient_user_id: postData.user_id,
+                    actor_user_id: jwt_user_id,
                     actor_name,
                     actor_avatar,
                     type: "post_like",
@@ -2992,15 +3006,18 @@ export default {
                     ...plRoomMeta,
                     group_key: `post_like:${post_id}`,
                   }, request_id);
+                  const notifMs = Date.now() - t_notif;
+                  _like("notif_create", { notif_ms: notifMs });
                 } else if (!postData?.user_id) {
-                  console.warn(`[notif][${request_id}] post user_id not found, skipping notification`, { post_id });
+                  _like("notif_skip_no_owner", { isSelfLike });
                 } else {
-                  console.log(`[notif][${request_id}] skipping self-like`, { post_id, user_id: jwt_user_id });
+                  _like("notif_skip_self_like", { isSelfLike: true });
                 }
-                console.log(`[perf] /api/posts/:id/like POST notification ${Date.now() - t1}ms`);
+              } else {
+                _like("notif_skip_duplicate");
               }
 
-              console.log(`[perf] /api/posts/:id/like POST total ${Date.now() - handlerStart}ms`, { post_id });
+              _like("total", { ownership_ms: ownershipMs, upsert_ms: upsertMs, wasInserted });
               return ok(req, env, request_id, { liked: true }, wasInserted ? 201 : 200);
             }
 
