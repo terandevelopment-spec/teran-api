@@ -1596,9 +1596,9 @@ export default {
           let roomDirectRole: string | null = null;
 
           // ── KV-cached device→account_id resolver ──
-          // Avoids cold Supabase round-trip (~200-534ms) on every post.
+          // Avoids cold Supabase round-trip (~200-1000ms) on every post.
           // Key: acct:dev:<device_id> → account_id string or "__null__"
-          const ACCT_CACHE_TTL = 3600; // 1 hour — device→account bindings are permanent
+          const ACCT_CACHE_TTL = 86400; // 24 hours — device→account bindings are permanent
           const PERSONA_CACHE_TTL = 3600; // 1 hour — persona bindings are permanent
           const acctKvKey = `acct:dev:${user_id}`;
           // Persona KV key uses device_id (not accountId) so both reads can fire in parallel
@@ -1634,43 +1634,55 @@ export default {
             persona_kv: personaKvKey ? (personaKvHit ? 'hit' : 'miss') : 'n/a',
           });
 
-          // ── Acct DB fallback (only if KV missed) ──
-          if (needsAccountResolution && !acctKvHit) {
-            const tDb = Date.now();
-            const { data: deviceBinding } = await sb(env)
-              .from("account_devices")
-              .select("account_id")
-              .eq("device_id", user_id)
-              .maybeSingle();
-            const dbMs = Date.now() - tDb;
-            mark("acct_devices");
-            accountId = deviceBinding?.account_id
-              ? ((deviceBinding as any).account_id as string)
-              : null;
-            console.log(`[perf] /api/posts acct_db_fallback rid=${request_id}`, {
-              db_query_ms: dbMs,
-              result: accountId ? 'found' : 'null',
-            });
-            // Write-behind: cache for next request
-            ctx.waitUntil(
-              env.PROFILE_KV.put(acctKvKey, accountId ?? "__null__", { expirationTtl: ACCT_CACHE_TTL })
-                .catch(() => {})
-            );
+          // ── Acct DB fallback + Room direct check (parallel when both needed) ──
+          const tStep1 = Date.now();
+          const needsDbFallback = needsAccountResolution && !acctKvHit;
+
+          // Build parallel task array — DB fallback and room check run concurrently
+          const step1Tasks: Promise<void>[] = [];
+
+          if (needsDbFallback) {
+            step1Tasks.push((async () => {
+              const tDb = Date.now();
+              const { data: deviceBinding } = await sb(env)
+                .from("account_devices")
+                .select("account_id")
+                .eq("device_id", user_id)
+                .maybeSingle();
+              const dbMs = Date.now() - tDb;
+              mark("acct_devices");
+              accountId = deviceBinding?.account_id
+                ? ((deviceBinding as any).account_id as string)
+                : null;
+              console.log(`[perf] /api/posts acct_db_fallback rid=${request_id}`, {
+                db_query_ms: dbMs,
+                result: accountId ? 'found' : 'null',
+              });
+              // Write-behind: cache for next request (24h TTL)
+              ctx.waitUntil(
+                env.PROFILE_KV.put(acctKvKey, accountId ?? "__null__", { expirationTtl: ACCT_CACHE_TTL })
+                  .catch(() => {})
+              );
+            })());
           }
 
-          // ── Room direct check (parallel with acct DB fallback when applicable) ──
-          const tStep1 = Date.now();
           if (needsRoomCheck) {
-            const { data: directHit } = await sb(env)
-              .from("room_members")
-              .select("role")
-              .eq("room_id", room_id!)
-              .eq("user_id", user_id)
-              .maybeSingle();
-            roomDirectRole = directHit?.role ?? null;
+            step1Tasks.push((async () => {
+              const { data: directHit } = await sb(env)
+                .from("room_members")
+                .select("role")
+                .eq("room_id", room_id!)
+                .eq("user_id", user_id)
+                .maybeSingle();
+              roomDirectRole = directHit?.role ?? null;
+            })());
+          }
+
+          if (step1Tasks.length > 0) {
+            await Promise.all(step1Tasks);
           }
           mark("acct_resolve");
-          console.log(`[perf] /api/posts step1_ms=${Date.now() - tStep1} rid=${request_id} acct_src=${acctKvHit ? 'kv' : 'db'} room_check=${needsRoomCheck}`);
+          console.log(`[perf] /api/posts step1_ms=${Date.now() - tStep1} rid=${request_id} acct_src=${acctKvHit ? 'kv' : 'db'} room_check=${needsRoomCheck} parallel=${step1Tasks.length}`);
 
           // ── Teran ID gates ──
           if (!accountId && needsRoomCheck) {
