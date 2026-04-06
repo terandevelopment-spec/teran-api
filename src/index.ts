@@ -1489,6 +1489,10 @@ export default {
           const rawSharedPostId = body?.shared_post_id;
           const shared_post_id = rawSharedPostId != null ? (Number.isFinite(Number(rawSharedPostId)) ? Number(rawSharedPostId) : null) : null;
 
+          // Parse client-provided root_post_id (optimization: skips parent lookup when valid)
+          const rawClientRootPostId = body?.root_post_id;
+          const clientRootPostId = rawClientRootPostId != null ? (Number.isFinite(Number(rawClientRootPostId)) ? Number(rawClientRootPostId) : null) : null;
+
           // ── Mode + Moods ──
           // Canonical mode values — enforced here at the API layer, client, and DB (posts_mode_check constraint).
           const ALLOWED_MODES = new Set(["Ask", "Discuss", "Share"]);
@@ -1851,19 +1855,32 @@ export default {
 
           // ── Resolve root_post_id before insert ──
           let root_post_id: number | null = null;
+          let rootPostSrc: string = 'none';
           if (parent_post_id) {
-            const { data: parentRow, error: parentErr } = await sb(env)
-              .from("posts")
-              .select("id, root_post_id")
-              .eq("id", parent_post_id)
-              .single();
-            if (parentErr) {
-              console.error(`[posts][${request_id}] failed to fetch parent for root_post_id`, { parent_post_id, error: parentErr });
-            }
-            if (parentRow) {
-              root_post_id = parentRow.root_post_id ?? parentRow.id;
+            if (clientRootPostId && clientRootPostId > 0) {
+              // Client provided a valid root_post_id — use it directly, skip DB lookup
+              root_post_id = clientRootPostId;
+              rootPostSrc = 'client';
+            } else {
+              // Fallback: fetch from parent post (adds ~300-700ms Supabase round-trip)
+              const tParent = Date.now();
+              const { data: parentRow, error: parentErr } = await sb(env)
+                .from("posts")
+                .select("id, root_post_id")
+                .eq("id", parent_post_id)
+                .single();
+              const parentMs = Date.now() - tParent;
+              if (parentErr) {
+                console.error(`[posts][${request_id}] failed to fetch parent for root_post_id`, { parent_post_id, error: parentErr });
+              }
+              if (parentRow) {
+                root_post_id = parentRow.root_post_id ?? parentRow.id;
+              }
+              rootPostSrc = 'db';
+              console.log(`[perf] /api/posts parent_root_lookup rid=${request_id}`, { parent_ms: parentMs, root_post_id, src: 'db_fallback' });
             }
           }
+          mark("root_resolved");
 
           // Narrow select on insert: only return columns needed for response + post-insert logic
           // Narrow select: only DB-generated values; reconstruct rest from input
@@ -2059,7 +2076,9 @@ export default {
             auth_total_ms: ms("auth_done"),
             post_insert_ms: delta("post_insert_done", "auth_done"),
             feed_eligibility_ms: delta("feed_eligibility", "auth_done"),
-            pure_insert_ms: delta("post_insert_done", "feed_eligibility"),
+            root_post_src: rootPostSrc,
+            root_resolve_ms: delta("root_resolved", "feed_eligibility"),
+            pure_insert_ms: delta("post_insert_done", "root_resolved"),
             media_insert_ms: delta("media_insert_done", "post_insert_done"),
             notif_deferred: !!parent_post_id,
             total_ms: ms("handler_done"),
