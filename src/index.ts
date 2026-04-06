@@ -1968,51 +1968,65 @@ export default {
             mark("media_insert_done");
           }
 
-          // Create notification for replies (if this is a reply to another post)
+          // Defer notification for replies — runs after response is sent
           if (parent_post_id) {
-            // Fetch the parent post owner's user_id (NOT author_id/persona)
-            const { data: parentPost, error: parentFetchError } = await sb(env)
-              .from("posts")
-              .select("user_id, author_id, room_id")
-              // room_id used for notification room meta
-              .eq("id", parent_post_id)
-              .single();
+            const _notifParentPostId = parent_post_id;
+            const _notifUserId = user_id;
+            const _notifAuthorId = author_id;
+            const _notifAuthorName = author_name;
+            const _notifAuthorAvatar = author_avatar;
+            const _notifRoomId = room_id;
+            const _notifRootPostId = root_post_id;
+            const _notifRequestId = request_id;
 
-            if (parentFetchError) {
-              console.error(`[notif][${request_id}] failed to fetch parent post owner`, { parent_post_id, error: parentFetchError });
-            }
+            ctx.waitUntil((async () => {
+              const tNotif = Date.now();
+              try {
+                // Fetch the parent post owner's user_id (NOT author_id/persona)
+                const { data: parentPost, error: parentFetchError } = await sb(env)
+                  .from("posts")
+                  .select("user_id, author_id, room_id")
+                  .eq("id", _notifParentPostId)
+                  .single();
 
-            mark("notif_prepare_done");
+                if (parentFetchError) {
+                  console.error(`[notif-deferred][${_notifRequestId}] failed to fetch parent post owner`, { parent_post_id: _notifParentPostId, error: parentFetchError });
+                  return;
+                }
 
-            // Use user_id (JWT sub) for notification recipient, NOT author_id (persona)
-            if (parentPost?.user_id && parentPost.user_id !== user_id) {
-              console.log(`[notif] creating post_reply`, {
-                request_id,
-                parent_post_id,
-                actor_user_id: user_id,
-                recipient_user_id: parentPost.user_id,
-                actor_persona_id: author_id,
-                parent_author_id: parentPost.author_id,
-              });
-              const replyRoomId = (parentPost as any).room_id ?? room_id ?? null;
-              const replyRoomMeta = await resolveRoomMeta(env, replyRoomId);
-              await createNotification(env, {
-                recipient_user_id: parentPost.user_id,  // JWT sub of parent post owner
-                actor_user_id: user_id,                  // JWT sub of replier
-                actor_name: author_name,
-                actor_avatar: author_avatar,
-                type: "post_reply",
-                post_id: parent_post_id, // Link to parent so notification opens the thread
-                root_post_id: root_post_id ?? parent_post_id, // Always point to root for navigation
-                ...replyRoomMeta,
-                group_key: `post_reply:${parent_post_id}`,
-              }, request_id);
-              mark("notif_insert_done");
-            } else if (!parentPost?.user_id) {
-              console.warn(`[notif][${request_id}] parent post user_id not found, skipping notification`, { parent_post_id });
-            } else {
-              console.log(`[notif][${request_id}] skipping self-reply`, { parent_post_id, user_id });
-            }
+                // Use user_id (JWT sub) for notification recipient, NOT author_id (persona)
+                if (parentPost?.user_id && parentPost.user_id !== _notifUserId) {
+                  console.log(`[notif-deferred] creating post_reply`, {
+                    request_id: _notifRequestId,
+                    parent_post_id: _notifParentPostId,
+                    actor_user_id: _notifUserId,
+                    recipient_user_id: parentPost.user_id,
+                    actor_persona_id: _notifAuthorId,
+                    parent_author_id: parentPost.author_id,
+                  });
+                  const replyRoomId = (parentPost as any).room_id ?? _notifRoomId ?? null;
+                  const replyRoomMeta = await resolveRoomMeta(env, replyRoomId);
+                  await createNotification(env, {
+                    recipient_user_id: parentPost.user_id,
+                    actor_user_id: _notifUserId,
+                    actor_name: _notifAuthorName,
+                    actor_avatar: _notifAuthorAvatar,
+                    type: "post_reply",
+                    post_id: _notifParentPostId,
+                    root_post_id: _notifRootPostId ?? _notifParentPostId,
+                    ...replyRoomMeta,
+                    group_key: `post_reply:${_notifParentPostId}`,
+                  }, _notifRequestId);
+                  console.log(`[notif-deferred][${_notifRequestId}] post_reply notification created OK in ${Date.now() - tNotif}ms`);
+                } else if (!parentPost?.user_id) {
+                  console.warn(`[notif-deferred][${_notifRequestId}] parent post user_id not found, skipping notification`, { parent_post_id: _notifParentPostId });
+                } else {
+                  console.log(`[notif-deferred][${_notifRequestId}] skipping self-reply`, { parent_post_id: _notifParentPostId, user_id: _notifUserId });
+                }
+              } catch (e: any) {
+                console.error(`[notif-deferred][${_notifRequestId}] failed (non-fatal)`, { error: e?.message, parent_post_id: _notifParentPostId });
+              }
+            })());
           }
 
           mark("handler_done");
@@ -2035,8 +2049,7 @@ export default {
             feed_eligibility_ms: delta("feed_eligibility", "auth_done"),
             pure_insert_ms: delta("post_insert_done", "feed_eligibility"),
             media_insert_ms: delta("media_insert_done", "post_insert_done"),
-            notif_prepare_ms: delta("notif_prepare_done", "media_insert_done") ?? delta("notif_prepare_done", "post_insert_done"),
-            notif_insert_ms: delta("notif_insert_done", "notif_prepare_done"),
+            notif_deferred: !!parent_post_id,
             total_ms: ms("handler_done"),
           });
 
