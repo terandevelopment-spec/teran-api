@@ -2000,6 +2000,7 @@ export default {
           // Defer notification for replies — runs after response is sent
           if (parent_post_id) {
             const _notifParentPostId = parent_post_id;
+            const _notifReplyPostId = data.id;  // the newly created reply post ID
             const _notifUserId = user_id;
             const _notifAuthorId = author_id;
             const _notifAuthorName = author_name;
@@ -2043,6 +2044,7 @@ export default {
                     type: "post_reply",
                     post_id: _notifParentPostId,
                     root_post_id: _notifRootPostId ?? _notifParentPostId,
+                    comment_id: _notifReplyPostId,  // store reply post ID for content enrichment
                     ...replyRoomMeta,
                     group_key: `post_reply:${_notifParentPostId}`,
                   }, _notifRequestId);
@@ -3254,6 +3256,19 @@ export default {
               .in("id", missingIds);
             for (const c of newsCommentsData ?? []) {
               commentsMap[c.id] = c.content;
+            }
+          }
+
+          // For IDs still not found (post_reply stores reply post id in comment_id),
+          // fall back to posts table
+          const stillMissingIds = postCommentIds.filter(id => !(id in commentsMap));
+          if (stillMissingIds.length > 0) {
+            const { data: postsData } = await sb(env)
+              .from("posts")
+              .select("id, content")
+              .in("id", stillMissingIds);
+            for (const p of postsData ?? []) {
+              commentsMap[p.id] = p.content;
             }
           }
 
