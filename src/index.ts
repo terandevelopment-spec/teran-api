@@ -6808,7 +6808,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled");
+            .select("id,room_key,name,description,emoji,icon_key,icon_thumb_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled");
 
           if (owner_id_param) {
             // Support "me" alias: resolve to the authenticated caller's user_id
@@ -7061,8 +7061,12 @@ export default {
 
           const description = typeof body?.description === "string" ? body.description.trim().slice(0, 500) : null;
           const icon_key = typeof body?.icon_key === "string" ? body.icon_key.trim() : null;
+          const icon_thumb_key = typeof body?.icon_thumb_key === "string" ? body.icon_thumb_key.trim() : null;
           if (icon_key && icon_key.startsWith("data:")) {
             throw new HttpError(422, "VALIDATION_ERROR", "icon_key must not be a data URI");
+          }
+          if (icon_thumb_key && icon_thumb_key.startsWith("data:")) {
+            throw new HttpError(422, "VALIDATION_ERROR", "icon_thumb_key must not be a data URI");
           }
 
           // Visibility: 'public' (default) | 'private'
@@ -7164,7 +7168,7 @@ export default {
 
           const tDbInsertRoom = performance.now();
           const insertObj: Record<string, any> = {
-            name, description, icon_key, category, room_key,
+            name, description, icon_key, icon_thumb_key, category, room_key,
             owner_id: user_id,
             visibility, read_policy: "public", post_policy: "members_only",
           };
@@ -7308,6 +7312,13 @@ export default {
                 throw new HttpError(422, "VALIDATION_ERROR", "icon_key must not be a data URI");
               }
               updates.icon_key = ik;
+            }
+            if (body?.icon_thumb_key !== undefined) {
+              const itk = typeof body.icon_thumb_key === "string" ? body.icon_thumb_key.trim() : null;
+              if (itk && itk.startsWith("data:")) {
+                throw new HttpError(422, "VALIDATION_ERROR", "icon_thumb_key must not be a data URI");
+              }
+              updates.icon_thumb_key = itk;
             }
             if (typeof body?.visibility === "string") {
               if (!["public", "private_invite_only"].includes(body.visibility)) {
