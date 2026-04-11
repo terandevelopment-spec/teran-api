@@ -989,7 +989,7 @@ export default {
             // Step 3: parallel_skipped for empty posts
             console.log(`[perf] /api/posts total ${Date.now() - handlerStart}ms (empty)`);
             console.log(`[perf] /api/posts breakdown rid=${request_id} params=${(p1 - p0).toFixed(1)} client=${(p2 - p1).toFixed(1)} db_posts=${(p3 - p2).toFixed(1)} transform=0 total=${(p3 - p0).toFixed(1)} rows=0`);
-            console.log(`[perf] /api/posts parallel_skipped`, JSON.stringify({ rid: request_id, reason: "empty_posts", room_id: room_id_param || "none", limit: limit_param || 50, db_posts_ms: +(p3 - p2).toFixed(1), total_ms: +(p3 - p0).toFixed(1) }));
+            console.log(`[perf] /api/posts parallel_skipped`, JSON.stringify({ rid: request_id, reason: "empty_posts", room_id: room_id_param || "none", limit: limit_param || 50, db_posts_ms: +(p3 - p2).toFixed(1), total_ms: +(p3 - p0).toFixed(1), policy_mode: (q as any).__roomPolicyPromise ? "parallel" : "none" }));
             if (isReplyQuery) {
               return ok(req, env, request_id, { items: [], next_cursor: null });
             }
