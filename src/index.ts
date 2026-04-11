@@ -1670,16 +1670,22 @@ export default {
           const acctKvKey = `acct:dev:${user_id}`;
           // Persona KV key uses device_id (not accountId) so both reads can fire in parallel
           const personaKvKey = needsPersonaCheck ? `persona:dev:${user_id}:${author_id}` : null;
+          // Room-member KV key (short-lived, 300s): device-scoped per room
+          const ROOM_MEMBER_CACHE_TTL = 300;
+          const roomMemberKvKey = (needsRoomCheck && room_id) ? `room_member:${room_id}:${user_id}` : null;
 
           // ── Speculative parallel KV batch ──
-          // Fire both KV reads simultaneously to avoid serial ~250ms + ~250ms
+          // Fire all three KV reads simultaneously: acct, persona, room-member
           const tKvBatch = Date.now();
-          const [acctKvRaw, personaKvRaw] = await Promise.all([
+          const [acctKvRaw, personaKvRaw, roomMemberKvRaw] = await Promise.all([
             needsAccountResolution
               ? env.PROFILE_KV.get(acctKvKey).catch(() => null)
               : Promise.resolve(null),
             personaKvKey
               ? env.PROFILE_KV.get(personaKvKey).catch(() => null)
+              : Promise.resolve(null),
+            roomMemberKvKey
+              ? env.PROFILE_KV.get(roomMemberKvKey).catch(() => null)
               : Promise.resolve(null),
           ]);
           const kvBatchMs = Date.now() - tKvBatch;
@@ -1699,6 +1705,7 @@ export default {
             kv_batch_ms: kvBatchMs,
             acct_kv: acctKvHit ? 'hit' : 'miss',
             persona_kv: personaKvKey ? (personaKvHit ? 'hit' : 'miss') : 'n/a',
+            rm_kv: roomMemberKvKey ? (roomMemberKvRaw !== null ? 'hit' : 'miss') : 'n/a',
           });
 
           // ── Acct DB fallback + Room direct check (parallel when both needed) ──
@@ -1733,7 +1740,22 @@ export default {
             })());
           }
 
-          if (needsRoomCheck) {
+          // Pre-declare feed-elig slot so the parallel task can write into it
+          let feedEligRoomRow: { visibility: string; category: string | null } | null = null;
+          let feedEligMs = 0;
+
+          // Parse room-member KV result (read in the kv_batch above)
+          let roomMemberKvHit = roomMemberKvRaw !== null;
+          if (roomMemberKvHit) {
+            roomDirectRole = (roomMemberKvRaw === "__none__") ? null : roomMemberKvRaw;
+          }
+          console.log(`[perf] /api/posts room_member_kv rid=${request_id}`, {
+            rm_kv: roomMemberKvHit ? 'hit' : 'miss',
+            role: roomMemberKvHit ? (roomDirectRole ?? 'none') : 'n/a',
+          });
+
+          if (needsRoomCheck && !roomMemberKvHit) {
+            // KV miss — must query room_members
             step1Tasks.push((async () => {
               const tRoomDirect = Date.now();
               const { data: directHit } = await sb(env)
@@ -1747,8 +1769,49 @@ export default {
               console.log(`[perf] /api/posts room_direct_check rid=${request_id}`, {
                 room_direct_ms: roomDirectMs,
                 hit: !!roomDirectRole,
+                room_member_src: 'db',
                 room_id,
               });
+              // Write-behind: cache result for 300s;
+              // store "__none__" for non-members so we don't skip-miss on next request
+              ctx.waitUntil(
+                env.PROFILE_KV.put(
+                  roomMemberKvKey!,
+                  roomDirectRole ?? "__none__",
+                  { expirationTtl: ROOM_MEMBER_CACHE_TTL }
+                ).catch(() => {})
+              );
+            })());
+          } else if (needsRoomCheck && roomMemberKvHit) {
+            // KV hit — log zero-cost path for diagnostics
+            console.log(`[perf] /api/posts room_direct_check rid=${request_id}`, {
+              room_direct_ms: 0,
+              hit: !!roomDirectRole,
+              room_member_src: 'kv',
+              room_id,
+            });
+          }
+
+          // Fix 2: hoist feed-eligibility rooms SELECT into step1 so it overlaps
+          // with the room_members check (and any acct DB fallback) instead of
+          // running after them in a separate serial await.
+          if (rawShowInFeed && room_id && room_id !== "global") {
+            step1Tasks.push((async () => {
+              const tFE = Date.now();
+              try {
+                const { data: roomRow } = await sb(env)
+                  .from("rooms")
+                  .select("visibility, category")
+                  .eq("id", room_id)
+                  .maybeSingle();
+                feedEligMs = Date.now() - tFE;
+                feedEligRoomRow = roomRow as typeof feedEligRoomRow;
+              } catch (e: any) {
+                feedEligMs = Date.now() - tFE;
+                console.warn(`[posts] feed_eligibility prefetch failed (non-fatal)`, {
+                  rid: request_id, room_id, error: e?.message,
+                });
+              }
             })());
           }
 
@@ -1904,34 +1967,23 @@ export default {
           // ── Resolve feed inclusion eligibility ──────────────────────────
           // Only public room posts may opt into the thread feed.
           // Private rooms silently force show_in_feed = false.
+          // The rooms SELECT was hoisted into step1Tasks (parallel with room_members),
+          // so feedEligRoomRow is already populated by the time we reach here.
           let show_in_feed = false;
           let room_category: string | null = null;
 
           if (rawShowInFeed && room_id && room_id !== "global") {
-            try {
-              const tFeedElig = Date.now();
-              const { data: roomRow } = await sb(env)
-                .from("rooms")
-                .select("visibility, category")
-                .eq("id", room_id)
-                .maybeSingle();
-              const feedEligMs = Date.now() - tFeedElig;
-              if (roomRow && roomRow.visibility === "public" && roomRow.category) {
-                show_in_feed = true;
-                room_category = roomRow.category;
-              }
-              // else: private room, missing room, or missing category → stay false
-              console.log(`[perf] /api/posts feed_elig_check rid=${request_id}`, {
-                feed_elig_ms: feedEligMs,
-                show_in_feed,
-                rawShowInFeed,
-              });
-            } catch (e: any) {
-              // Fail closed: if room lookup fails, do not allow feed inclusion
-              console.warn(`[posts] feed_eligibility lookup failed (non-fatal)`, {
-                rid: request_id, room_id, error: e?.message,
-              });
+            const roomRow = feedEligRoomRow;
+            if (roomRow && (roomRow as any).visibility === "public" && (roomRow as any).category) {
+              show_in_feed = true;
+              room_category = (roomRow as any).category;
             }
+            console.log(`[perf] /api/posts feed_elig_check rid=${request_id}`, {
+              feed_elig_ms: feedEligMs,
+              show_in_feed,
+              rawShowInFeed,
+              src: 'parallel_step1',
+            });
           }
           console.log(`[ROOM_FEED_DEBUG][ROOM_ELIGIBILITY]`, { rid: request_id, room_id, rawShowInFeed, show_in_feed, room_category, entered_lookup: !!(rawShowInFeed && room_id && room_id !== "global") });
           mark("feed_eligibility");
