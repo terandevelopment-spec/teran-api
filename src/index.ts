@@ -6902,22 +6902,67 @@ export default {
             const roomId = m[1];
             const caller = req.headers.get("x-teran-caller") || "unknown";
 
-            // 1) DB: fetch room (sequential — needed for visibility gate)
-            const tDbRoom = performance.now();
-            const { data: room, error } = await sb(env)
-              .from("rooms")
-              .select("*")
-              .eq("id", roomId)
-              .maybeSingle();
-            const dbRoomMs = performance.now() - tDbRoom;
-            if (error) throw new Error(error.message);
-            if (!room) {
-              const totalMs = performance.now() - tTotal;
-              console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: "NONE", db_room_ms: +dbRoomMs.toFixed(1), db_counts_ms: 0, db_membership_ms: 0, transform_ms: 0, total_ms: +totalMs.toFixed(1), rows_room: 0, caller }));
-              throw new HttpError(404, "NOT_FOUND", "Room not found");
+            // ── Room row cache (30s TTL, public rooms only) ──────────────────
+            // Caches the stable room row so repeated room-enter requests skip
+            // the ~130ms Supabase round-trip. my_role is always resolved fresh
+            // (user-specific — never cached). Private rooms are excluded.
+            const ROOM_CACHE_TTL = 30; // seconds
+            const roomCacheUrl = new URL(`https://cache.internal/rooms/${roomId}/row`);
+            const roomCacheKey = new Request(roomCacheUrl.toString(), { method: "GET" });
+            const roomCache = caches.default;
+
+            let room: any = null;
+            let dbRoomMs = 0;
+            let cacheStatus = "MISS";
+
+            const tCacheLookup = performance.now();
+            const cachedRoomRes = await roomCache.match(roomCacheKey);
+            const cacheLookupMs = performance.now() - tCacheLookup;
+
+            if (cachedRoomRes) {
+              // Cache HIT — parse room row from edge cache
+              room = await cachedRoomRes.json();
+              cacheStatus = "HIT";
+              console.log(`[perf] /api/rooms/:id cache=HIT rid=${request_id} room_id=${roomId} cache_ms=${cacheLookupMs.toFixed(1)} caller=${caller}`);
+            } else {
+              // Cache MISS — fetch from DB
+              const tDbRoom = performance.now();
+              const { data: roomRow, error } = await sb(env)
+                .from("rooms")
+                .select("*")
+                .eq("id", roomId)
+                .maybeSingle();
+              dbRoomMs = performance.now() - tDbRoom;
+
+              if (error) throw new Error(error.message);
+              if (!roomRow) {
+                const totalMs = performance.now() - tTotal;
+                console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: "MISS", db_room_ms: +dbRoomMs.toFixed(1), db_counts_ms: 0, db_membership_ms: 0, transform_ms: 0, total_ms: +totalMs.toFixed(1), rows_room: 0, caller }));
+                throw new HttpError(404, "NOT_FOUND", "Room not found");
+              }
+
+              room = roomRow;
+
+              // Write to cache only for non-private rooms (safe to share at edge)
+              if ((room as any).visibility !== "private_invite_only") {
+                const roomJson = JSON.stringify(room);
+                const cacheRes = new Response(roomJson, {
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Cache-Control": `public, max-age=${ROOM_CACHE_TTL}`,
+                  },
+                });
+                // fire-and-forget: don't block the response on the cache write
+                roomCache.put(roomCacheKey, cacheRes).catch((err: any) =>
+                  console.warn(`[perf] /api/rooms/:id cache put failed rid=${request_id}`, err)
+                );
+              } else {
+                // Private room — bypass cache
+                cacheStatus = "BYPASS";
+              }
             }
 
-            // Private rooms: only members can see details (must check before parallel)
+            // Private rooms: only members can see details (must check before enrichment)
             if ((room as any).visibility === "private_invite_only") {
               const privCaller = await optionalAuth(req, env);
               if (!privCaller) throw new HttpError(404, "NOT_FOUND", "Room not found");
@@ -6925,7 +6970,7 @@ export default {
               if (!privRole) throw new HttpError(404, "NOT_FOUND", "Room not found");
             }
 
-            // 2) Enrichment: fetch my_role only (member_count removed — unused by frontend)
+            // 2) Enrichment: fetch my_role only — always fresh, never cached (user-specific)
             // my_role is needed for canPost (composer) on ALL room types
             const tEnrich = performance.now();
             const uid = await optionalAuth(req, env);
@@ -6939,7 +6984,7 @@ export default {
             const payloadBytes = JSON.stringify(payload).length;
             const totalMs = performance.now() - tTotal;
 
-            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: "NONE", db_room_ms: +dbRoomMs.toFixed(1), enrich_ms: +enrichMs.toFixed(1), total_ms: +totalMs.toFixed(1), rows_room: 1, payload_bytes: payloadBytes, caller }));
+            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: +enrichMs.toFixed(1), total_ms: +totalMs.toFixed(1), rows_room: 1, payload_bytes: payloadBytes, caller }));
 
             return ok(req, env, request_id, payload);
           }
