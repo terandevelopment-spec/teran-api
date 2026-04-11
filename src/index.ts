@@ -1735,13 +1735,20 @@ export default {
 
           if (needsRoomCheck) {
             step1Tasks.push((async () => {
+              const tRoomDirect = Date.now();
               const { data: directHit } = await sb(env)
                 .from("room_members")
                 .select("role")
                 .eq("room_id", room_id!)
                 .eq("user_id", user_id)
                 .maybeSingle();
+              const roomDirectMs = Date.now() - tRoomDirect;
               roomDirectRole = directHit?.role ?? null;
+              console.log(`[perf] /api/posts room_direct_check rid=${request_id}`, {
+                room_direct_ms: roomDirectMs,
+                hit: !!roomDirectRole,
+                room_id,
+              });
             })());
           }
 
@@ -1749,7 +1756,13 @@ export default {
             await Promise.all(step1Tasks);
           }
           mark("acct_resolve");
-          console.log(`[perf] /api/posts step1_ms=${Date.now() - tStep1} rid=${request_id} acct_src=${acctKvHit ? 'kv' : 'db'} room_check=${needsRoomCheck} parallel=${step1Tasks.length}`);
+          console.log(`[perf] /api/posts step1_breakdown rid=${request_id}`, {
+            step1_ms: Date.now() - tStep1,
+            acct_src: acctKvHit ? 'kv' : 'db',
+            room_check: needsRoomCheck,
+            parallel_tasks: step1Tasks.length,
+            // room_direct_ms is logged separately in room_direct_check above
+          });
 
           // ── Teran ID gates ──
           if (!accountId && needsRoomCheck) {
@@ -1896,16 +1909,23 @@ export default {
 
           if (rawShowInFeed && room_id && room_id !== "global") {
             try {
+              const tFeedElig = Date.now();
               const { data: roomRow } = await sb(env)
                 .from("rooms")
                 .select("visibility, category")
                 .eq("id", room_id)
                 .maybeSingle();
+              const feedEligMs = Date.now() - tFeedElig;
               if (roomRow && roomRow.visibility === "public" && roomRow.category) {
                 show_in_feed = true;
                 room_category = roomRow.category;
               }
               // else: private room, missing room, or missing category → stay false
+              console.log(`[perf] /api/posts feed_elig_check rid=${request_id}`, {
+                feed_elig_ms: feedEligMs,
+                show_in_feed,
+                rawShowInFeed,
+              });
             } catch (e: any) {
               // Fail closed: if room lookup fails, do not allow feed inclusion
               console.warn(`[posts] feed_eligibility lookup failed (non-fatal)`, {
