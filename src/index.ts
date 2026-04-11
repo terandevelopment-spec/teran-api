@@ -671,7 +671,7 @@ export default {
           // - Feed lists: lightweight select (content included for card preview)
           // - Single post by id: include full data for PostDetail
           const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods";
-          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,show_in_feed,room_category,media(type,key,thumb_key)";
+          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,show_in_feed,room_category,media(type,key,thumb_key),room:rooms(icon_key,icon_thumb_key,name)";
           const selectFields = light ? lightSelectFields : feedSelectFields;
 
           // Step 1: log normalized filter + select cols
