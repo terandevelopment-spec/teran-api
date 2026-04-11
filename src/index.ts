@@ -772,15 +772,14 @@ export default {
             // room_id takes precedence for specific-room queries;
             // room_scope adds global/rooms scoping for profile tabs.
             if (room_id_param && room_id_param !== "global") {
-              // Specific room: enforce membership policy
-              const { data: roomRow } = await sb(env).from("rooms").select("read_policy").eq("id", room_id_param).maybeSingle();
-              if (roomRow && roomRow.read_policy === "members_only") {
-                const callerId = await optionalAuth(req, env);
-                if (!callerId) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
-                const memberRole = await checkRoomMembership(env, room_id_param, callerId);
-                if (!memberRole) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
-              }
-              q = q.eq("room_id", room_id_param);
+              // Specific room: enforce membership policy.
+              // Hoist the read_policy lookup into a lazy Promise so it can run
+              // in parallel with the posts SELECT rather than blocking before it.
+              // The 403 gate is evaluated after both queries settle (see await below).
+              const roomPolicyPromise = sb(env).from("rooms").select("read_policy").eq("id", room_id_param).maybeSingle();
+              q = q.eq("room_id", room_id_param); // apply filter immediately — builder is non-blocking
+              // Store promise on a scoped variable; consumed in the execution block below.
+              (q as any).__roomPolicyPromise = roomPolicyPromise;
             } else {
               // Determine effective room scope
               let effectiveScope = "any";
@@ -936,10 +935,28 @@ export default {
             };
           } else {
             // ── Standard Supabase client for non-reply queries ──
-            const { data, error: qErr } = await q;
-            postsQueryMs = Date.now() - t1;
-            if (qErr) throw qErr;
-            posts = data;
+            // If a room_id policy check was hoisted above, run it in parallel with
+            // the posts SELECT so both round-trips overlap instead of being serial.
+            const roomPolicyPromise: Promise<{ data: { read_policy: string } | null, error: any }> | undefined =
+              (q as any).__roomPolicyPromise;
+            if (roomPolicyPromise) {
+              const [{ data, error: qErr }, { data: roomRow }] = await Promise.all([q, roomPolicyPromise]);
+              postsQueryMs = Date.now() - t1;
+              if (qErr) throw qErr;
+              // Enforce policy now that both results are available
+              if (roomRow && roomRow.read_policy === "members_only") {
+                const callerId = await optionalAuth(req, env);
+                if (!callerId) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
+                const memberRole = await checkRoomMembership(env, room_id_param!, callerId);
+                if (!memberRole) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
+              }
+              posts = data;
+            } else {
+              const { data, error: qErr } = await q;
+              postsQueryMs = Date.now() - t1;
+              if (qErr) throw qErr;
+              posts = data;
+            }
           }
           const p3 = performance.now();
 
