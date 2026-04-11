@@ -31,8 +31,8 @@
  * Safe to stop: yes — each room is committed independently; restart resumes.
  */
 
-import { createClient } from '../node_modules/@supabase/supabase-js/dist/module/index.js';
-import { AwsClient } from '../node_modules/aws4fetch/dist/aws4fetch.esm.js';
+import { createClient } from '@supabase/supabase-js';
+import { AwsClient } from 'aws4fetch';
 import sharp from 'sharp';
 import { randomUUID } from 'crypto';
 
