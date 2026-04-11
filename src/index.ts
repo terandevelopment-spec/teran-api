@@ -671,7 +671,9 @@ export default {
           // - Feed lists: lightweight select (content included for card preview)
           // - Single post by id: include full data for PostDetail
           const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods";
-          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,show_in_feed,room_category,media(type,key,thumb_key),room:rooms(icon_key,icon_thumb_key,name)";
+          // NOTE: posts.room_id has no FK to rooms.id, so PostgREST cannot auto-join.
+          //       Room metadata (icon, name) is attached manually in the light-mode transform below.
+          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,show_in_feed,room_category,media(type,key,thumb_key)";
           const selectFields = light ? lightSelectFields : feedSelectFields;
 
           // Step 1: log normalized filter + select cols
@@ -1221,16 +1223,51 @@ export default {
             p4 = performance.now();
 
             let totalMediaRows = 0;
-            enrichedPosts = (posts ?? []).map((p: any) => {
+            const lightPosts = (posts ?? []).map((p: any) => {
               let avatar = p.author_avatar;
               if (typeof avatar === "string" && avatar.startsWith("data:")) {
                 avatar = null;
               }
-              // media is already attached by PostgREST embed as p.media[]
               const embeddedMedia = Array.isArray(p.media) ? p.media : [];
               totalMediaRows += embeddedMedia.length;
               return { ...p, author_avatar: avatar, media: embeddedMedia, like_count: 0, liked_by_me: false, comment_count: 0, teran_id: null };
             });
+
+            // Manually attach room metadata (icon_key, icon_thumb_key, name) to each post.
+            // posts.room_id is plain text with no FK → PostgREST cannot auto-join.
+            // Only batch-fetch for posts that actually have a real room_id.
+            const roomIds = [...new Set(
+              lightPosts
+                .map((p: any) => p.room_id)
+                .filter((rid: any) => rid && rid !== "global")
+            )] as string[];
+
+            if (roomIds.length > 0) {
+              try {
+                const { data: roomRows } = await sb(env)
+                  .from("rooms")
+                  .select("id, name, icon_key, icon_thumb_key")
+                  .in("id", roomIds);
+                const roomMap: Record<string, any> = {};
+                for (const r of (roomRows ?? [])) {
+                  roomMap[(r as any).id] = {
+                    icon_key: (r as any).icon_key ?? null,
+                    icon_thumb_key: (r as any).icon_thumb_key ?? null,
+                    name: (r as any).name ?? null,
+                  };
+                }
+                enrichedPosts = lightPosts.map((p: any) =>
+                  p.room_id && roomMap[p.room_id]
+                    ? { ...p, room: roomMap[p.room_id] }
+                    : p
+                );
+              } catch {
+                // non-fatal: fall back to posts without room metadata
+                enrichedPosts = lightPosts;
+              }
+            } else {
+              enrichedPosts = lightPosts;
+            }
             mediaRows = []; // not used in light mode, but keep variable populated for downstream logging
             p5 = performance.now();
             console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} media_rows=${totalMediaRows} media_embed=true transform_ms=${(p5 - p4).toFixed(1)} skip=likes,commentCounts,teranId,mediaSeparateFetch`);
