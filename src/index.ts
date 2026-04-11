@@ -940,21 +940,67 @@ export default {
             const roomPolicyPromise: Promise<{ data: { read_policy: string } | null, error: any }> | undefined =
               (q as any).__roomPolicyPromise;
             if (roomPolicyPromise) {
-              const [{ data, error: qErr }, { data: roomRow }] = await Promise.all([q, roomPolicyPromise]);
+              // ── Per-query timing: wrap each via .then() to capture individual durations ──
+              // Both HTTP requests start simultaneously from tParallelIssued.
+              // posts_supabase_ms and policy_supabase_ms measure each independently;
+              // parallel_wall_ms is the actual Promise.all wall time (= max of the two).
+              // This separates Supabase network/client overhead from Postgres execution.
+              let postsSubabaseMs = 0;
+              let policySubabaseMs = 0;
+              const tParallelIssued = performance.now();
+
+              const timedPostsQ = (q as Promise<any>).then(
+                (r: any) => { postsSubabaseMs = +(performance.now() - tParallelIssued).toFixed(1); return r; },
+                (e: any) => { postsSubabaseMs = +(performance.now() - tParallelIssued).toFixed(1); return Promise.reject(e); }
+              );
+              const timedPolicyQ = (roomPolicyPromise as Promise<any>).then(
+                (r: any) => { policySubabaseMs = +(performance.now() - tParallelIssued).toFixed(1); return r; },
+                (e: any) => { policySubabaseMs = +(performance.now() - tParallelIssued).toFixed(1); return Promise.reject(e); }
+              );
+
+              const [{ data, error: qErr }, { data: roomRow }] = await Promise.all([timedPostsQ, timedPolicyQ]);
+              const parallelWallMs = +(performance.now() - tParallelIssued).toFixed(1);
               postsQueryMs = Date.now() - t1;
               if (qErr) throw qErr;
-              // Enforce policy now that both results are available
+
+              // Enforce policy; time auth + membership separately when applicable
+              let authMs = 0;
+              let membershipMs = 0;
               if (roomRow && roomRow.read_policy === "members_only") {
+                const tAuth = performance.now();
                 const callerId = await optionalAuth(req, env);
+                authMs = +(performance.now() - tAuth).toFixed(1);
                 if (!callerId) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
+                const tMembership = performance.now();
                 const memberRole = await checkRoomMembership(env, room_id_param!, callerId);
+                membershipMs = +(performance.now() - tMembership).toFixed(1);
                 if (!memberRole) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
               }
+
+              // Per-phase breakdown: emitted on every room-scoped posts request.
+              // posts_supabase_ms = Supabase HTTP round-trip for posts SELECT (incl. network + PostgREST overhead).
+              // policy_supabase_ms = Supabase HTTP round-trip for rooms read_policy SELECT.
+              // parallel_wall_ms = actual wall time of Promise.all (= max(posts, policy)).
+              // Postgres itself executes in ~2ms — the delta is Supabase/network overhead.
+              console.log(`[perf] /api/posts room_query_breakdown`, JSON.stringify({
+                rid: request_id,
+                posts_supabase_ms: postsSubabaseMs,
+                policy_supabase_ms: policySubabaseMs,
+                parallel_wall_ms: parallelWallMs,
+                auth_ms: authMs,
+                membership_ms: membershipMs,
+                read_policy: (roomRow as any)?.read_policy ?? "unknown",
+                room_id: room_id_param,
+              }));
+
               posts = data;
             } else {
+              const tQIssued = performance.now();
               const { data, error: qErr } = await q;
+              const qWallMs = +(performance.now() - tQIssued).toFixed(1);
               postsQueryMs = Date.now() - t1;
               if (qErr) throw qErr;
+              console.log(`[perf] /api/posts nonroom_supabase_ms=${qWallMs} rid=${request_id}`);
               posts = data;
             }
           }
