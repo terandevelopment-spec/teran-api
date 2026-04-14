@@ -2309,6 +2309,184 @@ export default {
           }
         }
 
+        // ── Appearance Overrides ─────────────────────────────────────────────
+        // Presentation-layer overrides for room-origin posts.
+        // Canonical posts table is NEVER touched by these routes.
+
+        // POST /api/posts/appearance-bulk — bulk fetch overrides by post_id list
+        // Note: placed before the /:id pattern to avoid the digit-only regex mis-matching
+        if (path === "/api/posts/appearance-bulk" && req.method === "POST") {
+          const body = (await req.json().catch(() => null)) as any;
+          const rawIds = Array.isArray(body?.post_ids) ? body.post_ids : [];
+          const post_ids: number[] = rawIds
+            .map((v: unknown) => Number(v))
+            .filter((n: number) => Number.isFinite(n) && n > 0);
+
+          // Empty array is valid — return empty map
+          if (post_ids.length === 0) {
+            return ok(req, env, request_id, { overrides: {} });
+          }
+
+          // Cap to 200 to avoid unbounded IN queries
+          const capped = post_ids.slice(0, 200);
+
+          const { data, error } = await sb(env)
+            .from("post_appearance_overrides")
+            .select("post_id,display_name,display_avatar,display_content,is_enabled,updated_at")
+            .in("post_id", capped)
+            .eq("is_enabled", true);
+
+          if (error) throw error;
+
+          // Build { [postId]: row } map for easy client-side lookup
+          const overrides: Record<number, unknown> = {};
+          for (const row of data ?? []) {
+            overrides[(row as any).post_id] = row;
+          }
+          return ok(req, env, request_id, { overrides });
+        }
+
+        // GET /api/posts/:id/appearance — fetch override for a single post (public)
+        {
+          const m = path.match(/^\/api\/posts\/(\d+)\/appearance$/);
+          if (m && req.method === "GET") {
+            const postId = Number(m[1]);
+
+            const { data, error } = await sb(env)
+              .from("post_appearance_overrides")
+              .select("post_id,display_name,display_avatar,display_content,is_enabled,updated_at")
+              .eq("post_id", postId)
+              .maybeSingle();
+
+            if (error) throw error;
+            return ok(req, env, request_id, { override: data ?? null });
+          }
+        }
+
+        // PUT /api/posts/:id/appearance — create or update an override (owner-only)
+        {
+          const m = path.match(/^\/api\/posts\/(\d+)\/appearance$/);
+          if (m && req.method === "PUT") {
+            const user_id = await requireAuth(req, env);
+            const postId = Number(m[1]);
+
+            // Load the post: need user_id (ownership), room_id, post_type
+            const { data: post, error: postErr } = await sb(env)
+              .from("posts")
+              .select("id,user_id,room_id,post_type")
+              .eq("id", postId)
+              .is("deleted_at", null)
+              .maybeSingle();
+
+            if (postErr || !post) {
+              throw new HttpError(404, "NOT_FOUND", "Post not found");
+            }
+
+            // Ownership check — same model as DELETE /api/posts/:id
+            if ((post as any).user_id !== user_id) {
+              throw new HttpError(403, "FORBIDDEN", "You can only edit appearance overrides for your own posts");
+            }
+
+            // Room-origin check: must have a real room_id (not null, not 'global')
+            const roomId: string | null = (post as any).room_id ?? null;
+            if (!roomId || roomId === "global") {
+              throw new HttpError(403, "FORBIDDEN", "Appearance overrides are only allowed for room-origin posts");
+            }
+
+            // Post-type check: exclude share/repost records
+            const postType: string = (post as any).post_type ?? "status";
+            if (postType === "share") {
+              throw new HttpError(400, "INVALID_POST_TYPE", "Appearance overrides are not supported for repost/share records");
+            }
+
+            // Parse and sanitise body — only override fields, never canonical fields
+            const body = (await req.json().catch(() => null)) as any;
+
+            const rawDisplayName = body?.display_name;
+            const display_name = typeof rawDisplayName === "string" ? rawDisplayName.trim() || null : undefined;
+
+            const rawDisplayAvatar = body?.display_avatar;
+            if (typeof rawDisplayAvatar === "string" && rawDisplayAvatar.startsWith("data:")) {
+              throw new HttpError(422, "VALIDATION_ERROR", "display_avatar must be a URL or key, not a data URI");
+            }
+            const display_avatar = typeof rawDisplayAvatar === "string" ? rawDisplayAvatar.trim() || null : undefined;
+
+            const rawDisplayContent = body?.display_content;
+            const display_content = typeof rawDisplayContent === "string" ? rawDisplayContent.trim() || null : undefined;
+
+            const rawIsEnabled = body?.is_enabled;
+            const is_enabled: boolean | undefined =
+              typeof rawIsEnabled === "boolean" ? rawIsEnabled : undefined;
+
+            // Build upsert payload — always sets updated_at to now
+            const upsertPayload: Record<string, unknown> = {
+              post_id: postId,
+              updated_at: new Date().toISOString(),
+            };
+            if (display_name !== undefined) upsertPayload.display_name = display_name;
+            if (display_avatar !== undefined) upsertPayload.display_avatar = display_avatar;
+            if (display_content !== undefined) upsertPayload.display_content = display_content;
+            if (is_enabled !== undefined) upsertPayload.is_enabled = is_enabled;
+
+            const { data: saved, error: upsertErr } = await sb(env)
+              .from("post_appearance_overrides")
+              .upsert(upsertPayload, { onConflict: "post_id" })
+              .select("post_id,display_name,display_avatar,display_content,is_enabled,updated_at")
+              .single();
+
+            if (upsertErr) throw upsertErr;
+            return ok(req, env, request_id, { override: saved });
+          }
+        }
+
+        // DELETE /api/posts/:id/appearance — remove override entirely (owner-only)
+        {
+          const m = path.match(/^\/api\/posts\/(\d+)\/appearance$/);
+          if (m && req.method === "DELETE") {
+            const user_id = await requireAuth(req, env);
+            const postId = Number(m[1]);
+
+            // Load the post: need user_id (ownership) and room_id
+            const { data: post, error: postErr } = await sb(env)
+              .from("posts")
+              .select("id,user_id,room_id,post_type")
+              .eq("id", postId)
+              .is("deleted_at", null)
+              .maybeSingle();
+
+            if (postErr || !post) {
+              throw new HttpError(404, "NOT_FOUND", "Post not found");
+            }
+
+            // Ownership check
+            if ((post as any).user_id !== user_id) {
+              throw new HttpError(403, "FORBIDDEN", "You can only remove appearance overrides for your own posts");
+            }
+
+            // Room-origin check
+            const roomId: string | null = (post as any).room_id ?? null;
+            if (!roomId || roomId === "global") {
+              throw new HttpError(403, "FORBIDDEN", "Appearance overrides are only allowed for room-origin posts");
+            }
+
+            // Post-type check
+            const postType: string = (post as any).post_type ?? "status";
+            if (postType === "share") {
+              throw new HttpError(400, "INVALID_POST_TYPE", "Appearance overrides are not supported for repost/share records");
+            }
+
+            const { error: deleteErr } = await sb(env)
+              .from("post_appearance_overrides")
+              .delete()
+              .eq("post_id", postId);
+
+            if (deleteErr) throw deleteErr;
+            return ok(req, env, request_id, { ok: true });
+          }
+        }
+
+        // ── End Appearance Overrides ─────────────────────────────────────────
+
         // /api/comments/:id (DELETE)
         {
           const m = path.match(/^\/api\/comments\/(\d+)$/);
