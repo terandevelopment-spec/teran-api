@@ -7095,7 +7095,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,icon_thumb_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled");
+            .select("id,room_key,name,description,emoji,icon_key,icon_thumb_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled,card_shape");
 
           if (owner_id_param) {
             // Support "me" alias: resolve to the authenticated caller's user_id
@@ -7398,6 +7398,10 @@ export default {
           const VALID_ICON_SHAPES = ["circle", "roundedSquare", "square", "hexagon", "squircle"];
           const list_icon_shape = typeof design.listIconShape === "string" && VALID_ICON_SHAPES.includes(design.listIconShape) ? design.listIconShape : null;
           const detail_icon_shape = typeof design.detailIconShape === "string" && VALID_ICON_SHAPES.includes(design.detailIconShape) ? design.detailIconShape : null;
+          const VALID_CARD_SHAPES = ["flat", "rounded"];
+          const card_shape = typeof design.cardShape === "string" && VALID_CARD_SHAPES.includes(design.cardShape) ? design.cardShape
+            : typeof design.card_shape === "string" && VALID_CARD_SHAPES.includes(design.card_shape) ? design.card_shape
+            : null;
           const header_bg_image_key = typeof design.headerBgImageKey === "string" && design.headerBgImageKey.length > 0 && design.headerBgImageKey.length <= 300 ? design.headerBgImageKey : null;
           const header_text_enabled = typeof design.headerTextEnabled === "boolean" ? design.headerTextEnabled : null;
           const VALID_HEADER_HEIGHTS = ["small", "medium", "large"];
@@ -7482,6 +7486,7 @@ export default {
           if (list_show_icons !== null) insertObj.list_show_icons = list_show_icons;
           if (list_icon_shape !== null) insertObj.list_icon_shape = list_icon_shape;
           if (detail_icon_shape !== null) insertObj.detail_icon_shape = detail_icon_shape;
+          if (card_shape !== null) insertObj.card_shape = card_shape;
           if (header_bg_image_key !== null) insertObj.header_bg_image_key = header_bg_image_key;
           if (header_text_enabled !== null) insertObj.header_text_enabled = header_text_enabled;
           if (header_height !== null) insertObj.header_height = header_height;
@@ -7686,6 +7691,11 @@ export default {
               updates.detail_icon_shape = design.detailIconShape;
             else if (typeof design?.detail_icon_shape === "string" && VALID_ICON_SHAPES.includes(design.detail_icon_shape))
               updates.detail_icon_shape = design.detail_icon_shape;
+            const VALID_CARD_SHAPES = ["flat", "rounded"];
+            if (typeof design?.cardShape === "string" && VALID_CARD_SHAPES.includes(design.cardShape))
+              updates.card_shape = design.cardShape;
+            else if (typeof design?.card_shape === "string" && VALID_CARD_SHAPES.includes(design.card_shape))
+              updates.card_shape = design.card_shape;
             // Header background image key (string or null to clear)
             if (typeof design?.headerBgImageKey === "string")
               updates.header_bg_image_key = design.headerBgImageKey.length > 0 && design.headerBgImageKey.length <= 300 ? design.headerBgImageKey : null;
