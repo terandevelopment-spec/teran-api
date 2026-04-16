@@ -7083,9 +7083,21 @@ export default {
         // ROOMS API
         // ═══════════════════════════════════════════
 
+        // SYNC REQUIRED: these keys must stay in sync with
+        //   frontend/src/lib/roomCategories.js  AND  DB rooms_category_allowed constraint.
         const ROOM_CATEGORY_KEYS = new Set([
-          'lounge', 'anime_manga', 'games', 'music', 'sports', 'creation',
-          'tech_gadgets', 'local_region', 'work_career', 'politics', 'spiritual'
+          'lounge',
+          'anime_manga',
+          'games',
+          'music',
+          'film_visuals',
+          'fashion_vintage',
+          'art_design',
+          'tech_gadgets',
+          'food_places',
+          'local_city',
+          'work_career',
+          'politics_society',
         ]);
 
         // GET /api/rooms — list public rooms, or rooms by owner_id
