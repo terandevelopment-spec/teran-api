@@ -2382,8 +2382,15 @@ export default {
               throw new HttpError(404, "NOT_FOUND", "Post not found");
             }
 
-            // Ownership check — same model as DELETE /api/posts/:id
-            if ((post as any).user_id !== user_id) {
+            // Ownership check — compare device-level IDs (JWT sub ↔ post.user_id)
+            // Use String() coercion: Supabase may return user_id as a number (BIGINT)
+            // while requireAuth returns a string, causing strict !== to always fail.
+            console.log('[OwnershipCheck][PUT appearance]', {
+              jwt_sub: user_id,
+              post_user_id: (post as any).user_id,
+              post_author_id: (post as any).author_id ?? '(not selected)',
+            });
+            if (String((post as any).user_id) !== String(user_id)) {
               throw new HttpError(403, "FORBIDDEN", "You can only edit appearance overrides for your own posts");
             }
 
@@ -2458,8 +2465,14 @@ export default {
               throw new HttpError(404, "NOT_FOUND", "Post not found");
             }
 
-            // Ownership check
-            if ((post as any).user_id !== user_id) {
+            // Ownership check — compare device-level IDs (JWT sub ↔ post.user_id)
+            // Use String() coercion for type-safe comparison (BIGINT vs string)
+            console.log('[OwnershipCheck][DELETE appearance]', {
+              jwt_sub: user_id,
+              post_user_id: (post as any).user_id,
+              post_author_id: (post as any).author_id ?? '(not selected)',
+            });
+            if (String((post as any).user_id) !== String(user_id)) {
               throw new HttpError(403, "FORBIDDEN", "You can only remove appearance overrides for your own posts");
             }
 
