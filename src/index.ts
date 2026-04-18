@@ -673,7 +673,10 @@ export default {
           const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods";
           // NOTE: posts.room_id has no FK to rooms.id, so PostgREST cannot auto-join.
           //       Room metadata (icon, name) is attached manually in the light-mode transform below.
-          const lightSelectFields = "id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,show_in_feed,room_category,media(type,key,thumb_key)";
+          // user_id is intentionally included here even in light mode:
+          // ownership checks (e.g. appearance overrides) require it, and
+          // omitting it causes String(undefined) !== jwt_sub → silent 403.
+          const lightSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,show_in_feed,room_category,media(type,key,thumb_key)";
           const selectFields = light ? lightSelectFields : feedSelectFields;
 
           // Step 1: log normalized filter + select cols
