@@ -2388,12 +2388,22 @@ export default {
             // Ownership check — compare device-level IDs (JWT sub ↔ post.user_id)
             // Use String() coercion: Supabase may return user_id as a number (BIGINT)
             // while requireAuth returns a string, causing strict !== to always fail.
-            console.log('[OwnershipCheck][PUT appearance]', {
-              jwt_sub: user_id,
-              post_user_id: (post as any).user_id,
-              post_author_id: (post as any).author_id ?? '(not selected)',
+            const _ownershipMatch = String((post as any).user_id) === String(user_id);
+            console.log('[Appearance403Debug]', {
+              requestId: request_id,
+              postId,
+              jwtSub: user_id,
+              postUserId: (post as any).user_id,
+              postAuthorId: (post as any).author_id ?? '(not selected)',
+              roomId: (post as any).room_id ?? null,
+              postType: (post as any).post_type ?? null,
+              ownershipMatch: _ownershipMatch,
+              rejection: !_ownershipMatch ? 'OWNERSHIP_MISMATCH'
+                : (!(post as any).room_id || (post as any).room_id === 'global') ? 'NOT_ROOM_ORIGIN'
+                : (post as any).post_type === 'share' ? 'SHARE_POST_TYPE'
+                : 'none',
             });
-            if (String((post as any).user_id) !== String(user_id)) {
+            if (!_ownershipMatch) {
               throw new HttpError(403, "FORBIDDEN", "You can only edit appearance overrides for your own posts");
             }
 
@@ -2470,12 +2480,19 @@ export default {
 
             // Ownership check — compare device-level IDs (JWT sub ↔ post.user_id)
             // Use String() coercion for type-safe comparison (BIGINT vs string)
-            console.log('[OwnershipCheck][DELETE appearance]', {
-              jwt_sub: user_id,
-              post_user_id: (post as any).user_id,
-              post_author_id: (post as any).author_id ?? '(not selected)',
+            const _deleteOwnershipMatch = String((post as any).user_id) === String(user_id);
+            console.log('[Appearance403Debug][DELETE]', {
+              requestId: request_id,
+              postId,
+              jwtSub: user_id,
+              postUserId: (post as any).user_id,
+              postAuthorId: (post as any).author_id ?? '(not selected)',
+              roomId: (post as any).room_id ?? null,
+              postType: (post as any).post_type ?? null,
+              ownershipMatch: _deleteOwnershipMatch,
+              rejection: !_deleteOwnershipMatch ? 'OWNERSHIP_MISMATCH' : 'none',
             });
-            if (String((post as any).user_id) !== String(user_id)) {
+            if (!_deleteOwnershipMatch) {
               throw new HttpError(403, "FORBIDDEN", "You can only remove appearance overrides for your own posts");
             }
 
@@ -5427,7 +5444,26 @@ export default {
                 }
               }
             }
+
+            // ── Durable migration: reassign posts.user_id to new device_id ──
+            // Posts created under sibling device_ids retain the old user_id.
+            // After Teran ID login the JWT sub changes to the new device_id, so
+            // ownership checks (JWT sub ↔ post.user_id) would fail for old posts.
+            // Non-blocking: fire-and-forget via ctx.waitUntil so login is not delayed.
+            ctx.waitUntil((async () => {
+              const { error: postsReassignErr, count: postsReassignCount } = await sb(env)
+                .from("posts")
+                .update({ user_id: device_id } as any)
+                .in("user_id", otherDeviceIds)
+                .is("deleted_at", null);
+              if (postsReassignErr) {
+                console.warn(`[login] posts.user_id reassignment failed:`, postsReassignErr.message);
+              } else {
+                console.log(`[login] reassigned posts.user_id from sibling devices to ${device_id}`, { count: postsReassignCount });
+              }
+            })());
           }
+
 
           console.log(`[AccountsLoginFix] login success`, {
             rid: request_id, teran_handle: handle, account_id: account.id,
