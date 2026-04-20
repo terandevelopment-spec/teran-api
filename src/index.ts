@@ -7290,11 +7290,42 @@ export default {
           return ok(req, env, request_id, { room: data });
         }
 
-        // GET /api/rooms/mine — authenticated user's joined/owned rooms
+        // GET /api/rooms/mine — authenticated user's joined/owned rooms (account-aware)
         if (path === "/api/rooms/mine" && req.method === "GET") {
           const user_id = await requireAuth(req, env);
 
-          // Query room_members for this user, join rooms table for metadata
+          // ── Account-aware identity expansion ────────────────────────────────
+          // A user may have joined rooms on an older/sibling device_id (e.g. before
+          // a Teran ID login that issued a new device_id). We must include memberships
+          // from ALL device_ids on the same account, not just the current JWT subject.
+          // Same two-step pattern used in GET /api/rooms?owner_id=me.
+
+          // Step 1: find the account this device belongs to (if any)
+          const { data: callerBinding } = await sb(env)
+            .from("account_devices")
+            .select("account_id")
+            .eq("device_id", user_id)
+            .maybeSingle();
+
+          const callerAccountId = (callerBinding as any)?.account_id ?? null;
+
+          // Step 2: resolve all sibling device IDs on the same account
+          const userIds: string[] = [user_id];
+          if (callerAccountId) {
+            const { data: siblingRows } = await sb(env)
+              .from("account_devices")
+              .select("device_id")
+              .eq("account_id", callerAccountId);
+            if (siblingRows) {
+              for (const row of siblingRows as any[]) {
+                if (row.device_id && row.device_id !== user_id) {
+                  userIds.push(row.device_id);
+                }
+              }
+            }
+          }
+
+          // ── Membership query across all account devices ──────────────────────
           const { data: memberships, error } = await sb(env)
             .from("room_members")
             .select(`
@@ -7309,18 +7340,32 @@ export default {
                 room_bg_color, room_bg_image_key, room_bg_image_opacity
               )
             `)
-            .eq("user_id", user_id);
+            .in("user_id", userIds);
 
           if (error) throw new Error(error.message);
 
-          // Flatten: each row has { role, rooms: { id, name, ... } }
-          // Filter out rows where the room was deleted (rooms == null)
-          const rooms = (memberships || [])
-            .filter((m: any) => m.rooms)
-            .map((m: any) => ({
-              ...m.rooms,
-              my_role: m.role,
-            }));
+          // ── Deduplicate by room_id ───────────────────────────────────────────
+          // The same room may appear via multiple sibling device memberships.
+          // Keep one entry per room, preferring the highest-privilege role
+          // (owner > member) so the client sees the correct canPost/isOwner state.
+          const ROLE_RANK: Record<string, number> = { owner: 2, member: 1 };
+          const bestByRoomId = new Map<string, { room: any; role: string }>();
+
+          for (const m of (memberships || []) as any[]) {
+            if (!m.rooms) continue; // room was deleted
+            const roomId = m.rooms.id;
+            const existing = bestByRoomId.get(roomId);
+            const mRank = ROLE_RANK[m.role] ?? 0;
+            const existingRank = existing ? (ROLE_RANK[existing.role] ?? 0) : -1;
+            if (!existing || mRank > existingRank) {
+              bestByRoomId.set(roomId, { room: m.rooms, role: m.role });
+            }
+          }
+
+          const rooms = Array.from(bestByRoomId.values()).map(({ room, role }) => ({
+            ...room,
+            my_role: role,
+          }));
 
           return ok(req, env, request_id, { rooms });
         }
