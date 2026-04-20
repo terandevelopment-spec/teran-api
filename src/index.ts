@@ -1921,7 +1921,7 @@ export default {
           const roomFallbackFn = (needsRoomCheck && !roomDirectRole) ? async () => {
             // Direct missed — fetch siblings NOW (deferred from Step 1)
             if (!accountId) {
-              throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
+              throw new HttpError(403, "ROOM_MEMBERSHIP_REQUIRED", "You must be a member of this room to post");
             }
 
             const tSib = Date.now();
@@ -1939,7 +1939,7 @@ export default {
 
             if (siblingDeviceIds.length === 0) {
               console.log(`[perf] /api/posts sibling_fetch_ms=${siblingFetchMs} siblings=0 rid=${request_id}`);
-              throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
+              throw new HttpError(403, "ROOM_MEMBERSHIP_REQUIRED", "You must be a member of this room to post");
             }
 
             const { data: siblingHit } = await sb(env)
@@ -1953,7 +1953,7 @@ export default {
             console.log(`[perf] /api/posts sibling_fetch_ms=${siblingFetchMs} siblings=${siblingDeviceIds.length} rid=${request_id}`);
 
             if (!siblingHit?.role) {
-              throw new HttpError(403, "FORBIDDEN", "You must be a member to post in this room");
+              throw new HttpError(403, "ROOM_MEMBERSHIP_REQUIRED", "You must be a member of this room to post");
             }
 
             // Self-heal: replicate membership for future direct hits
