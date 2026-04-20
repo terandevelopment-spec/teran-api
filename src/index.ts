@@ -7600,21 +7600,23 @@ export default {
             throw new Error(error.message);
           }
 
-          // Auto-add owner as member (background — not blocking response)
-          const tBgStart = performance.now();
-          ctx.waitUntil(
-            Promise.resolve(sb(env).from("room_members")
-              .insert({ room_id: (room as any).id, user_id, role: "owner" }))
-              .then(({ error: memErr }) => {
-                if (memErr) console.error("[room_create] membership insert failed", { rid: request_id, room_id: (room as any).id, error: memErr.message });
-                else console.log("[room_create] membership insert ok", { rid: request_id, room_id: (room as any).id, bg_ms: +(performance.now() - tBgStart).toFixed(1) });
-              })
-          );
-          const bgEnqueueMs = performance.now() - tBgStart;
+          // Auto-add owner as member (synchronous — must succeed for room creation to be valid)
+          const tMembership = performance.now();
+          const { error: memErr } = await sb(env)
+            .from("room_members")
+            .insert({ room_id: (room as any).id, user_id, role: "owner" });
+          const dbMembershipMs = performance.now() - tMembership;
+          if (memErr) {
+            // Compensating action: remove the room row so we don't leave orphaned rooms
+            console.error("[room_create] membership insert failed, rolling back room", { rid: request_id, room_id: (room as any).id, error: memErr.message });
+            await sb(env).from("rooms").delete().eq("id", (room as any).id);
+            throw new Error("Room created but owner membership failed: " + memErr.message);
+          }
+          console.log("[room_create] membership insert ok", { rid: request_id, room_id: (room as any).id, membership_ms: +dbMembershipMs.toFixed(1) });
 
           const tResponse = performance.now();
           const totalMs = performance.now() - tCreateTotal;
-          console.log(`[perf] /api/rooms(create) breakdown`, JSON.stringify({ rid: request_id, room_key, visibility, params_ms: +(tValidate - tCreateTotal).toFixed(1), db_insert_room_ms: +dbInsertRoomMs.toFixed(1), membership: "deferred", total_ms: +totalMs.toFixed(1) }));
+          console.log(`[perf] /api/rooms(create) breakdown`, JSON.stringify({ rid: request_id, room_key, visibility, params_ms: +(tValidate - tCreateTotal).toFixed(1), db_insert_room_ms: +dbInsertRoomMs.toFixed(1), db_membership_ms: +dbMembershipMs.toFixed(1), membership: "sync", total_ms: +totalMs.toFixed(1) }));
 
           // Breakdown2: detailed spans (only when slow)
           if (totalMs >= 300) {
@@ -7625,8 +7627,8 @@ export default {
               validate_ms: +(tValidate - tBodyParse).toFixed(1),
               keygen_ms: +(tKeygen - tValidate).toFixed(1),
               db_room_insert_ms: +dbInsertRoomMs.toFixed(1),
-              membership_mode: "deferred",
-              bg_enqueue_ms: +bgEnqueueMs.toFixed(1),
+              db_membership_ms: +dbMembershipMs.toFixed(1),
+              membership_mode: "sync",
               response_ms: +(performance.now() - tResponse).toFixed(1),
               total_ms: +totalMs.toFixed(1),
             }));
