@@ -7162,20 +7162,54 @@ export default {
             .select("id,room_key,name,description,emoji,icon_key,icon_thumb_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled,card_shape");
 
           if (owner_id_param) {
-            // Support "me" alias: resolve to the authenticated caller's user_id
-            let resolvedOwnerId = owner_id_param;
             const callerId = await optionalAuth(req, env);
+
             if (owner_id_param === "me") {
+              // Account-aware "me": include rooms owned by any device on the same account.
+              // A room may have been created on a sibling device (e.g. before a Teran ID
+              // login that issued a new device_id), so we cannot filter by current device
+              // alone. Fetch all device_ids on the same account and expand the filter.
               if (!callerId) throw new HttpError(401, "UNAUTHORIZED", "Auth required for owner_id=me");
-              resolvedOwnerId = callerId;
-            }
 
-            q = q.eq("owner_id", resolvedOwnerId);
+              // Resolve account + all sibling device IDs (same pattern as login migration):
+              // Step 1: find the account this device belongs to
+              const { data: callerBinding } = await sb(env)
+                .from("account_devices")
+                .select("account_id")
+                .eq("device_id", callerId)
+                .maybeSingle();
 
-            // Owner sees all visibility levels; non-owners see only public
-            const isOwner = !!callerId && callerId === resolvedOwnerId;
-            if (!isOwner) {
-              q = q.eq("visibility", "public");
+              const callerAccountId = (callerBinding as any)?.account_id ?? null;
+
+              // Step 2: fetch all devices on the same account (or fall back to caller only)
+              const ownerIds: string[] = [callerId];
+              if (callerAccountId) {
+                const { data: siblingRows } = await sb(env)
+                  .from("account_devices")
+                  .select("device_id")
+                  .eq("account_id", callerAccountId);
+                if (siblingRows) {
+                  for (const row of siblingRows as any[]) {
+                    if (row.device_id && row.device_id !== callerId) {
+                      ownerIds.push(row.device_id);
+                    }
+                  }
+                }
+              }
+
+              // Owner always sees all visibility levels (private + public)
+              q = q.in("owner_id", ownerIds);
+
+            } else {
+              // Explicit non-me owner_id: exact match, unchanged behavior
+              const resolvedOwnerId = owner_id_param;
+              q = q.eq("owner_id", resolvedOwnerId);
+
+              // Non-owner callers see only public rooms
+              const isOwner = !!callerId && callerId === resolvedOwnerId;
+              if (!isOwner) {
+                q = q.eq("visibility", "public");
+              }
             }
           } else {
             // Default: list all public rooms
