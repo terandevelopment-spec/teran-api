@@ -2385,10 +2385,33 @@ export default {
               throw new HttpError(404, "NOT_FOUND", "Post not found");
             }
 
-            // Ownership check — compare device-level IDs (JWT sub ↔ post.user_id)
-            // Use String() coercion: Supabase may return user_id as a number (BIGINT)
-            // while requireAuth returns a string, causing strict !== to always fail.
-            const _ownershipMatch = String((post as any).user_id) === String(user_id);
+            // Ownership check — account-aware (same sibling pattern as /api/rooms?owner_id=me)
+            // posts.user_id = device_id at creation time; JWT.sub = current device_id.
+            // After a Teran ID login these may differ (device_id_A vs device_id_B).
+            // We allow any device on the same account to edit its own posts.
+            const _postUserId = String((post as any).user_id);
+            let _ownershipMatch = _postUserId === String(user_id);
+
+            if (!_ownershipMatch) {
+              // Expand: resolve all sibling device IDs on the same account
+              const { data: _callerBinding } = await sb(env)
+                .from("account_devices")
+                .select("account_id")
+                .eq("device_id", user_id)
+                .maybeSingle();
+              const _callerAccountId = (_callerBinding as any)?.account_id ?? null;
+              if (_callerAccountId) {
+                const { data: _siblingRows } = await sb(env)
+                  .from("account_devices")
+                  .select("device_id")
+                  .eq("account_id", _callerAccountId);
+                if (_siblingRows) {
+                  const _siblingIds = new Set((_siblingRows as any[]).map((r: any) => String(r.device_id)));
+                  _ownershipMatch = _siblingIds.has(_postUserId);
+                }
+              }
+            }
+
             console.log('[Appearance403Debug]', {
               requestId: request_id,
               postId,
@@ -2478,9 +2501,29 @@ export default {
               throw new HttpError(404, "NOT_FOUND", "Post not found");
             }
 
-            // Ownership check — compare device-level IDs (JWT sub ↔ post.user_id)
-            // Use String() coercion for type-safe comparison (BIGINT vs string)
-            const _deleteOwnershipMatch = String((post as any).user_id) === String(user_id);
+            // Ownership check — account-aware (same sibling pattern as PUT handler above)
+            const _delPostUserId = String((post as any).user_id);
+            let _deleteOwnershipMatch = _delPostUserId === String(user_id);
+
+            if (!_deleteOwnershipMatch) {
+              const { data: _delCallerBinding } = await sb(env)
+                .from("account_devices")
+                .select("account_id")
+                .eq("device_id", user_id)
+                .maybeSingle();
+              const _delCallerAccountId = (_delCallerBinding as any)?.account_id ?? null;
+              if (_delCallerAccountId) {
+                const { data: _delSiblingRows } = await sb(env)
+                  .from("account_devices")
+                  .select("device_id")
+                  .eq("account_id", _delCallerAccountId);
+                if (_delSiblingRows) {
+                  const _delSiblingIds = new Set((_delSiblingRows as any[]).map((r: any) => String(r.device_id)));
+                  _deleteOwnershipMatch = _delSiblingIds.has(_delPostUserId);
+                }
+              }
+            }
+
             console.log('[Appearance403Debug][DELETE]', {
               requestId: request_id,
               postId,
