@@ -467,7 +467,28 @@ async function checkRoomMembership(env: Env, roomId: string, userId: string): Pr
     .limit(1)
     .maybeSingle();
 
-  return siblingMembership?.role ?? null;
+  const siblingRole = siblingMembership?.role ?? null;
+
+  // ── Self-heal: copy membership for the current device_id ────────────
+  // The sibling fallback proved this device belongs to a member account.
+  // Insert a direct row so future lookups hit Q1 immediately (~150ms)
+  // instead of repeating the 3-query fallback (~500ms).
+  // Fire-and-forget: don't block the response; use ON CONFLICT (PK) DO NOTHING
+  // so racing requests or pre-existing rows are safe.
+  if (siblingRole) {
+    sb(env)
+      .from("room_members")
+      .upsert(
+        { room_id: roomId, user_id: userId, role: siblingRole },
+        { onConflict: "room_id,user_id", ignoreDuplicates: true }
+      )
+      .then(({ error }) => {
+        if (error) console.warn(`[membership] self-heal upsert failed room=${roomId} user=${userId}:`, error.message);
+        else console.log(`[membership] self-healed room=${roomId} user=${userId} role=${siblingRole}`);
+      });
+  }
+
+  return siblingRole;
 }
 
 function generateInviteToken(): string {
@@ -7498,6 +7519,30 @@ export default {
                 // Private room — bypass cache
                 cacheStatus = "BYPASS";
               }
+            }
+
+            // ── Fast-path: ?fields=design ──────────────────────────────────
+            // PostDetail first-paint only needs the room row for styling.
+            // Skip the expensive my_role enrichment (~500ms worst-case)
+            // and return immediately.  Comment-composer permission is
+            // resolved by a follow-up request without this flag.
+            const fieldsParam = url.searchParams.get("fields");
+            const designOnly = fieldsParam === "design";
+
+            if (designOnly) {
+              // Private rooms still need the access gate even on the fast path
+              if ((room as any).visibility === "private_invite_only") {
+                const privCaller = await optionalAuth(req, env);
+                if (!privCaller) throw new HttpError(404, "NOT_FOUND", "Room not found");
+                const privRole = await checkRoomMembership(env, roomId, privCaller);
+                if (!privRole) throw new HttpError(404, "NOT_FOUND", "Room not found");
+              }
+
+              const payload = { room: { ...(room as any) }, my_role: null };
+              const payloadBytes = JSON.stringify(payload).length;
+              const totalMs = performance.now() - tTotal;
+              console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: 0, total_ms: +totalMs.toFixed(1), rows_room: 1, payload_bytes: payloadBytes, caller, fast: true }));
+              return ok(req, env, request_id, payload);
             }
 
             // Private rooms: only members can see details (must check before enrichment)
