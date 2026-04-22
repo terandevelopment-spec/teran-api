@@ -7545,6 +7545,21 @@ export default {
               return ok(req, env, request_id, payload);
             }
 
+            // ── Fast-path: ?fields=membership ─────────────────────────────
+            // PostDetail deferred query: only needs my_role for the comment
+            // composer gate.  Skip room row serialization entirely.
+            if (fieldsParam === "membership") {
+              const tEnrichM = performance.now();
+              const mUid = await optionalAuth(req, env);
+              const mRole: string | null = mUid ? await checkRoomMembership(env, roomId, mUid) : null;
+              const enrichMemberMs = performance.now() - tEnrichM;
+
+              const payload = { room: null, my_role: mRole };
+              const totalMs = performance.now() - tTotal;
+              console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: +enrichMemberMs.toFixed(1), total_ms: +totalMs.toFixed(1), rows_room: 0, caller, fast: "membership" }));
+              return ok(req, env, request_id, payload);
+            }
+
             // Private rooms: only members can see details (must check before enrichment)
             if ((room as any).visibility === "private_invite_only") {
               const privCaller = await optionalAuth(req, env);
