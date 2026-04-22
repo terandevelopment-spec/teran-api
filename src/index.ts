@@ -676,7 +676,7 @@ export default {
           // user_id is intentionally included here even in light mode:
           // ownership checks (e.g. appearance overrides) require it, and
           // omitting it causes String(undefined) !== jwt_sub → silent 403.
-          const lightSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,show_in_feed,room_category,media(type,key,thumb_key)";
+          const lightSelectFields = "id,user_id,created_at,last_activity_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,show_in_feed,room_category,media(type,key,thumb_key)";
           const selectFields = light ? lightSelectFields : feedSelectFields;
 
           // Step 1: log normalized filter + select cols
@@ -696,8 +696,14 @@ export default {
           let q = sb(env)
             .from("posts")
             .select(selectFields)
-            .is("deleted_at", null)
-            .order("created_at", { ascending: false });
+            .is("deleted_at", null);
+
+          // Wire thread-feed context flag: used to apply activity-based ordering
+          // (resurfacing) instead of strict created_at ordering.
+          // True only for the main Wire feed — not profiles, single-post, or room-scoped.
+          const isWireThreadFeed = post_type_param === "thread"
+            && room_scope_param !== "rooms"
+            && !id_param && !user_id_param && !author_id_param;
 
           // Apply filters - priority: id > user_id > author_id > default
           let lim = 1; // will be set per branch below
@@ -850,7 +856,15 @@ export default {
                 lim = Math.min(200, Math.max(1, parsed));
               }
             }
-            // Add secondary order by id for stable keyset pagination
+            // Wire thread feed: activity-based ordering for resurfacing.
+            // Posts with recent comments/activity rise above older inactive posts.
+            // NULLS LAST ensures posts without activity fall through to created_at.
+            if (isWireThreadFeed) {
+              q = q.order("last_activity_at", { ascending: false, nullsFirst: false });
+            }
+            // All feeds: created_at as primary (or secondary after last_activity_at)
+            q = q.order("created_at", { ascending: false });
+            // Stable tiebreaker for keyset pagination
             q = q.order("id", { ascending: false });
             q = q.limit(lim);
           }
@@ -867,7 +881,8 @@ export default {
           else if (room_scope_param === "global" || room_id_param === "global") queryFilters.push(`room_id=is.null|eq.global`);
           else if (room_scope_param === "rooms") queryFilters.push(`room_id=not.is.null&neq.global`);
           if (cursor) queryFilters.push(`cursor=${cursor.created_at}:${cursor.id}`);
-          const queryEvidence = `table=posts select=${selectFields} filters=[${queryFilters.join(",")}] order=created_at.desc,id.desc limit=${lim}`;
+          const orderEvidence = isWireThreadFeed ? "last_activity_at.desc.nullslast,created_at.desc,id.desc" : "created_at.desc,id.desc";
+          const queryEvidence = `table=posts select=${selectFields} filters=[${queryFilters.join(",")}] order=${orderEvidence} limit=${lim}`;
 
           let t1 = Date.now();
           let posts: any[] | null = null;
@@ -2082,6 +2097,10 @@ export default {
                 moods,
                 show_in_feed,
                 room_category,
+                // Initialize last_activity_at so Wire activity-based ordering
+                // works immediately — new posts sort at the top without needing
+                // a comment to first populate this field.
+                last_activity_at: new Date().toISOString(),
               })
               .select(POST_RETURN_COLS)
               .maybeSingle();
