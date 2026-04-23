@@ -2352,9 +2352,309 @@ export default {
           }
         }
 
+        // ── Canonical Post Edit ──────────────────────────────────────────────
+        // PATCH /api/posts/:id — edit content and/or image media for own
+        // root-level global/status posts.  Canonical data is updated directly.
+        // Room posts, shares, replies, threads, videos, and identity fields
+        // are excluded from this route.
+        {
+          const m = path.match(/^\/api\/posts\/(\d+)$/);
+          if (m && req.method === "PATCH") {
+            const user_id = await requireAuth(req, env);
+            const postId = Number(m[1]);
+
+            // ── Load post with fields needed for ownership + eligibility ──
+            const { data: post, error: postErr } = await sb(env)
+              .from("posts")
+              .select("id,user_id,room_id,post_type,parent_post_id,root_post_id,content,title,author_id,author_name,author_avatar,mode,moods,show_in_feed,room_category,shared_post_id,created_at,edited_at,like_count,comment_count,last_activity_at")
+              .eq("id", postId)
+              .is("deleted_at", null)
+              .maybeSingle();
+
+            if (postErr || !post) {
+              throw new HttpError(404, "NOT_FOUND", "Post not found");
+            }
+
+            // ── Ownership check — account-aware sibling expansion ──
+            // Same pattern as PUT /api/posts/:id/appearance.
+            const _postUserId = String((post as any).user_id);
+            let _ownershipMatch = _postUserId === String(user_id);
+
+            if (!_ownershipMatch) {
+              const { data: _callerBinding } = await sb(env)
+                .from("account_devices")
+                .select("account_id")
+                .eq("device_id", user_id)
+                .maybeSingle();
+              const _callerAccountId = (_callerBinding as any)?.account_id ?? null;
+              if (_callerAccountId) {
+                const { data: _siblingRows } = await sb(env)
+                  .from("account_devices")
+                  .select("device_id")
+                  .eq("account_id", _callerAccountId);
+                if (_siblingRows) {
+                  const _siblingIds = new Set((_siblingRows as any[]).map((r: any) => String(r.device_id)));
+                  _ownershipMatch = _siblingIds.has(_postUserId);
+                }
+              }
+            }
+
+            if (!_ownershipMatch) {
+              throw new HttpError(403, "FORBIDDEN", "You can only edit your own posts");
+            }
+
+            // ── Eligibility guards: main/global root status posts only ──
+            const roomId: string | null = (post as any).room_id ?? null;
+            if (roomId && roomId !== "global") {
+              throw new HttpError(403, "FORBIDDEN", "Editing is only available for main/global posts");
+            }
+
+            const postType: string = (post as any).post_type ?? "status";
+            if (postType === "share") {
+              throw new HttpError(400, "INVALID_POST_TYPE", "Share/repost records cannot be edited");
+            }
+
+            if ((post as any).parent_post_id) {
+              throw new HttpError(400, "INVALID_POST_TYPE", "Replies cannot be edited via this route");
+            }
+
+            // ── Parse + validate body ──
+            const body = (await req.json().catch(() => null)) as any;
+            if (!body || typeof body !== "object") {
+              throw new HttpError(422, "VALIDATION_ERROR", "Request body required");
+            }
+
+            // Content validation — same limits as POST /api/posts for status
+            const LIMIT_STATUS_CONTENT = 360;
+            const MAX_IMAGES_EDIT = 4;
+
+            const hasContentField = body.content !== undefined;
+            const hasMediaField = body.media !== undefined;
+
+            if (!hasContentField && !hasMediaField) {
+              throw new HttpError(422, "VALIDATION_ERROR", "At least one of content or media must be provided");
+            }
+
+            let newContent: string | undefined = undefined;
+            if (hasContentField) {
+              if (typeof body.content !== "string") {
+                throw new HttpError(422, "VALIDATION_ERROR", "content must be a string");
+              }
+              newContent = body.content.trim();
+              if (newContent.length > LIMIT_STATUS_CONTENT) {
+                throw new HttpError(400, "TEXT_TOO_LONG", `Max ${LIMIT_STATUS_CONTENT} characters`);
+              }
+            }
+
+            // ── Media patch parsing ──
+            let keepMediaIds: number[] | null = null;
+            let addMedia: Array<{
+              type: "image";
+              key: string;
+              thumb_key: string;
+              width: number | null;
+              height: number | null;
+              bytes: number | null;
+            }> = [];
+
+            if (hasMediaField) {
+              const mediaBody = body.media;
+              if (typeof mediaBody !== "object" || mediaBody === null) {
+                throw new HttpError(422, "VALIDATION_ERROR", "media must be an object");
+              }
+
+              // Parse keepMediaIds
+              if (mediaBody.keepMediaIds !== undefined) {
+                if (!Array.isArray(mediaBody.keepMediaIds)) {
+                  throw new HttpError(422, "VALIDATION_ERROR", "media.keepMediaIds must be an array");
+                }
+                keepMediaIds = mediaBody.keepMediaIds
+                  .map((v: unknown) => Number(v))
+                  .filter((n: number) => Number.isFinite(n) && n > 0);
+              } else {
+                // If media field is present but keepMediaIds is absent,
+                // treat as "keep nothing" (remove all existing)
+                keepMediaIds = [];
+              }
+
+              // Parse media.add
+              if (mediaBody.add !== undefined) {
+                if (!Array.isArray(mediaBody.add)) {
+                  throw new HttpError(422, "VALIDATION_ERROR", "media.add must be an array");
+                }
+                for (const item of mediaBody.add) {
+                  const mType = item?.type;
+                  if (mType !== "image") {
+                    throw new HttpError(422, "VALIDATION_ERROR", "Only image media can be added in this version");
+                  }
+                  const mKey = item?.key;
+                  const mThumbKey = item?.thumb_key;
+                  if (!mKey || typeof mKey !== "string" || !mKey.trim()) {
+                    throw new HttpError(422, "VALIDATION_ERROR", "Each media item must have a key");
+                  }
+                  if (!mThumbKey || typeof mThumbKey !== "string" || !mThumbKey.trim()) {
+                    throw new HttpError(422, "VALIDATION_ERROR", "thumb_key is required for images");
+                  }
+                  addMedia.push({
+                    type: "image",
+                    key: mKey.trim(),
+                    thumb_key: mThumbKey.trim(),
+                    width: typeof item?.width === "number" ? item.width : null,
+                    height: typeof item?.height === "number" ? item.height : null,
+                    bytes: typeof item?.bytes === "number" ? item.bytes : null,
+                  });
+                }
+              }
+            }
+
+            // ── Fetch existing media for this post ──
+            const { data: existingMedia } = await sb(env)
+              .from("media")
+              .select("id,type,key,thumb_key,width,height,bytes,duration_ms,created_at")
+              .eq("post_id", postId);
+
+            const currentMedia = (existingMedia ?? []) as any[];
+
+            // ── Determine kept vs removed media ──
+            let keptMedia = currentMedia;
+            let removedMedia: any[] = [];
+
+            if (keepMediaIds !== null) {
+              // Verify that keepMediaIds actually belong to this post
+              const validIds = new Set(currentMedia.map((m: any) => m.id));
+              for (const kid of keepMediaIds) {
+                if (!validIds.has(kid)) {
+                  throw new HttpError(422, "VALIDATION_ERROR", `media.keepMediaIds contains invalid id: ${kid}`);
+                }
+              }
+              const keepSet = new Set(keepMediaIds);
+              keptMedia = currentMedia.filter((m: any) => keepSet.has(m.id));
+              removedMedia = currentMedia.filter((m: any) => !keepSet.has(m.id));
+            }
+
+            // ── Enforce total image limit after patch ──
+            const totalImages = keptMedia.filter((m: any) => m.type === "image").length + addMedia.length;
+            if (totalImages > MAX_IMAGES_EDIT) {
+              throw new HttpError(422, "VALIDATION_ERROR", `Maximum ${MAX_IMAGES_EDIT} images allowed`);
+            }
+
+            // ── Determine effective content after patch ──
+            const effectiveContent = newContent !== undefined ? newContent : ((post as any).content ?? "");
+            const effectiveMediaCount = keptMedia.length + addMedia.length;
+
+            // Empty post guard: must have content or at least one image
+            if (!effectiveContent && effectiveMediaCount === 0) {
+              throw new HttpError(422, "VALIDATION_ERROR", "Post must have content or at least one image");
+            }
+
+            // ── Detect whether any real change was made ──
+            const contentChanged = newContent !== undefined && newContent !== ((post as any).content ?? "");
+            const mediaChanged = removedMedia.length > 0 || addMedia.length > 0;
+            const hasRealChange = contentChanged || mediaChanged;
+
+            if (!hasRealChange) {
+              // No-op: return current post + media as-is
+              const noopPost = { ...(post as any) };
+              noopPost.media = currentMedia;
+              return ok(req, env, request_id, { post: noopPost });
+            }
+
+            // ── Apply content update ──
+            const now = new Date().toISOString();
+            if (contentChanged) {
+              const { error: contentErr } = await sb(env)
+                .from("posts")
+                .update({ content: newContent, edited_at: now } as any)
+                .eq("id", postId);
+              if (contentErr) throw contentErr;
+            } else if (mediaChanged) {
+              // Only media changed — still set edited_at
+              const { error: editedErr } = await sb(env)
+                .from("posts")
+                .update({ edited_at: now } as any)
+                .eq("id", postId);
+              if (editedErr) throw editedErr;
+            }
+
+            // ── Remove media rows + R2 objects for dropped media ──
+            if (removedMedia.length > 0) {
+              const removeIds = removedMedia.map((m: any) => m.id);
+              // DB delete — only rows belonging to THIS post
+              const { error: mediaDelErr } = await sb(env)
+                .from("media")
+                .delete()
+                .eq("post_id", postId)
+                .in("id", removeIds);
+              if (mediaDelErr) {
+                console.error(`[PATCH post] media delete error`, { postId, removeIds, error: mediaDelErr.message });
+              }
+
+              // R2 cleanup — fire-and-forget (same pattern as comment deletion)
+              ctx.waitUntil((async () => {
+                for (const row of removedMedia) {
+                  if (row.key) {
+                    try { await env.R2_MEDIA.delete(row.key); }
+                    catch (e: any) { console.warn(`[PATCH post] R2 delete failed for key=`, row.key, e); }
+                  }
+                  if (row.thumb_key) {
+                    try { await env.R2_MEDIA.delete(row.thumb_key); }
+                    catch (e: any) { console.warn(`[PATCH post] R2 delete failed for thumb_key=`, row.thumb_key, e); }
+                  }
+                }
+                console.log(`[PATCH post] R2 cleanup done`, { postId, removed: removedMedia.length });
+              })());
+            }
+
+            // ── Insert new media rows ──
+            let newMediaRows: any[] = [];
+            if (addMedia.length > 0) {
+              const mediaInsert = addMedia.map((m) => ({
+                post_id: postId,
+                type: m.type,
+                key: m.key,
+                thumb_key: m.thumb_key,
+                width: m.width,
+                height: m.height,
+                bytes: m.bytes,
+                duration_ms: null,
+              }));
+              const { data: insertedRows, error: mediaInsErr } = await sb(env)
+                .from("media")
+                .insert(mediaInsert)
+                .select("id,type,key,thumb_key,width,height,bytes,duration_ms,created_at");
+              if (mediaInsErr) {
+                console.error(`[PATCH post] media insert error`, { postId, error: mediaInsErr.message });
+                throw mediaInsErr;
+              }
+              newMediaRows = (insertedRows ?? []) as any[];
+            }
+
+            // ── Build response: updated post + latest media ──
+            const finalMedia = [...keptMedia, ...newMediaRows];
+            const updatedPost: any = {
+              ...(post as any),
+              content: newContent !== undefined ? newContent : (post as any).content,
+              edited_at: now,
+              media: finalMedia,
+            };
+
+            console.log(`[PATCH post] success id=${postId}`, {
+              contentChanged,
+              mediaChanged,
+              removed: removedMedia.length,
+              added: addMedia.length,
+              kept: keptMedia.length,
+              totalMedia: finalMedia.length,
+            });
+
+            return ok(req, env, request_id, { post: updatedPost });
+          }
+        }
+
         // ── Appearance Overrides ─────────────────────────────────────────────
-        // Presentation-layer overrides for room-origin posts.
-        // Canonical posts table is NEVER touched by these routes.
+        // Presentation-layer overrides for eligible posts (room-origin OR
+        // global/main root status posts).  Canonical posts table is NEVER
+        // touched by these routes.
 
         // POST /api/posts/appearance-bulk — bulk fetch overrides by post_id list
         // Note: placed before the /:id pattern to avoid the digit-only regex mis-matching
@@ -2413,10 +2713,10 @@ export default {
             const user_id = await requireAuth(req, env);
             const postId = Number(m[1]);
 
-            // Load the post: need user_id (ownership), room_id, post_type
+            // Load the post: need user_id (ownership), room_id, post_type, parent_post_id
             const { data: post, error: postErr } = await sb(env)
               .from("posts")
-              .select("id,user_id,room_id,post_type")
+              .select("id,user_id,room_id,post_type,parent_post_id")
               .eq("id", postId)
               .is("deleted_at", null)
               .maybeSingle();
@@ -2462,24 +2762,25 @@ export default {
               postType: (post as any).post_type ?? null,
               ownershipMatch: _ownershipMatch,
               rejection: !_ownershipMatch ? 'OWNERSHIP_MISMATCH'
-                : (!(post as any).room_id || (post as any).room_id === 'global') ? 'NOT_ROOM_ORIGIN'
                 : (post as any).post_type === 'share' ? 'SHARE_POST_TYPE'
+                : (post as any).parent_post_id ? 'REPLY_POST'
                 : 'none',
             });
             if (!_ownershipMatch) {
               throw new HttpError(403, "FORBIDDEN", "You can only edit appearance overrides for your own posts");
             }
 
-            // Room-origin check: must have a real room_id (not null, not 'global')
+            // Eligibility: room-origin posts OR global/main root status posts.
+            // Both are allowed.  Only shares and replies are excluded.
             const roomId: string | null = (post as any).room_id ?? null;
-            if (!roomId || roomId === "global") {
-              throw new HttpError(403, "FORBIDDEN", "Appearance overrides are only allowed for room-origin posts");
-            }
-
-            // Post-type check: exclude share/repost records
             const postType: string = (post as any).post_type ?? "status";
+
             if (postType === "share") {
               throw new HttpError(400, "INVALID_POST_TYPE", "Appearance overrides are not supported for repost/share records");
+            }
+
+            if ((post as any).parent_post_id) {
+              throw new HttpError(400, "INVALID_POST_TYPE", "Appearance overrides are not supported for replies");
             }
 
             // Parse and sanitise body — only override fields, never canonical fields
@@ -2529,10 +2830,10 @@ export default {
             const user_id = await requireAuth(req, env);
             const postId = Number(m[1]);
 
-            // Load the post: need user_id (ownership) and room_id
+            // Load the post: need user_id (ownership), room_id, post_type, parent_post_id
             const { data: post, error: postErr } = await sb(env)
               .from("posts")
-              .select("id,user_id,room_id,post_type")
+              .select("id,user_id,room_id,post_type,parent_post_id")
               .eq("id", postId)
               .is("deleted_at", null)
               .maybeSingle();
@@ -2579,16 +2880,16 @@ export default {
               throw new HttpError(403, "FORBIDDEN", "You can only remove appearance overrides for your own posts");
             }
 
-            // Room-origin check
+            // Eligibility: room-origin posts OR global/main root status posts.
             const roomId: string | null = (post as any).room_id ?? null;
-            if (!roomId || roomId === "global") {
-              throw new HttpError(403, "FORBIDDEN", "Appearance overrides are only allowed for room-origin posts");
-            }
-
-            // Post-type check
             const postType: string = (post as any).post_type ?? "status";
+
             if (postType === "share") {
               throw new HttpError(400, "INVALID_POST_TYPE", "Appearance overrides are not supported for repost/share records");
+            }
+
+            if ((post as any).parent_post_id) {
+              throw new HttpError(400, "INVALID_POST_TYPE", "Appearance overrides are not supported for replies");
             }
 
             const { error: deleteErr } = await sb(env)
