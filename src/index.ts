@@ -2366,12 +2366,17 @@ export default {
             // ── Load post with fields needed for ownership + eligibility ──
             const { data: post, error: postErr } = await sb(env)
               .from("posts")
-              .select("id,user_id,room_id,post_type,parent_post_id,root_post_id,content,title,author_id,author_name,author_avatar,mode,moods,show_in_feed,room_category,shared_post_id,created_at,edited_at,like_count,comment_count,last_activity_at")
+              .select("id,user_id,room_id,post_type,parent_post_id,root_post_id,content,title,author_id,author_name,author_avatar,mode,moods,show_in_feed,room_category,shared_post_id,created_at,edited_at,last_activity_at")
               .eq("id", postId)
               .is("deleted_at", null)
               .maybeSingle();
 
-            if (postErr || !post) {
+
+            if (postErr) {
+              console.error(`[PATCH post] DB lookup error id=${postId}`, { error: postErr.message, code: postErr.code });
+              throw new HttpError(500, "DB_ERROR", "Failed to load post");
+            }
+            if (!post) {
               throw new HttpError(404, "NOT_FOUND", "Post not found");
             }
 
