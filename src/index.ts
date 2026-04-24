@@ -2364,17 +2364,20 @@ export default {
             const postId = Number(m[1]);
 
             // ── Load post with fields needed for ownership + eligibility ──
+            // NOTE: SELECT uses only columns proven to exist in feedSelectFields /
+            // lightSelectFields (both of which work in GET /api/posts). We do NOT
+            // include edited_at here because it may not be migrated yet; its value
+            // is not needed for any PATCH logic decision.
             const { data: post, error: postErr } = await sb(env)
               .from("posts")
-              .select("id,user_id,room_id,post_type,parent_post_id,root_post_id,content,title,author_id,author_name,author_avatar,mode,moods,show_in_feed,room_category,shared_post_id,created_at,edited_at,last_activity_at")
+              .select("id,user_id,room_id,post_type,parent_post_id,root_post_id,content,title,author_id,author_name,author_avatar,mode,moods,shared_post_id,created_at")
               .eq("id", postId)
               .is("deleted_at", null)
               .maybeSingle();
 
-
             if (postErr) {
-              console.error(`[PATCH post] DB lookup error id=${postId}`, { error: postErr.message, code: postErr.code });
-              throw new HttpError(500, "DB_ERROR", "Failed to load post");
+              console.error(`[PATCH post] DB lookup error id=${postId}`, { error: postErr.message, code: postErr.code, details: postErr.details, hint: postErr.hint });
+              throw new HttpError(500, "DB_ERROR", `Failed to load post: ${postErr.message || "unknown"} (code=${postErr.code || "none"})`);
             }
             if (!post) {
               throw new HttpError(404, "NOT_FOUND", "Post not found");
@@ -2569,16 +2572,23 @@ export default {
             if (contentChanged) {
               const { error: contentErr } = await sb(env)
                 .from("posts")
-                .update({ content: newContent, edited_at: now } as any)
+                .update({ content: newContent } as any)
                 .eq("id", postId);
-              if (contentErr) throw contentErr;
-            } else if (mediaChanged) {
-              // Only media changed — still set edited_at
-              const { error: editedErr } = await sb(env)
+              if (contentErr) {
+                console.error(`[PATCH post] content update error id=${postId}`, { error: contentErr.message, code: contentErr.code });
+                throw new HttpError(500, "DB_ERROR", `Content update failed: ${contentErr.message || "unknown"}`);
+              }
+            }
+
+            // Best-effort: set edited_at if the column exists (migration may not be applied yet)
+            if (hasRealChange) {
+              const { error: _editedAtErr } = await sb(env)
                 .from("posts")
                 .update({ edited_at: now } as any)
                 .eq("id", postId);
-              if (editedErr) throw editedErr;
+              if (_editedAtErr) {
+                console.warn(`[PATCH post] edited_at write skipped (column may not exist)`, { postId, error: _editedAtErr.message });
+              }
             }
 
             // ── Remove media rows + R2 objects for dropped media ──
