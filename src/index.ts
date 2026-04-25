@@ -605,7 +605,7 @@ export default {
 
         // /api/posts (GET) - filter by ?id=, ?user_id=, ?author_id=, ?room_id=, ?limit=, ?actor_id=
         if (path === "/api/posts" && req.method === "GET") {
-          const FEED_CACHE_TTL = 8;
+          const FEED_CACHE_TTL = 30;
           const SLOW_MS = 1000;
           const VERY_SLOW_MS = 3000;
           const handlerStart = Date.now();
