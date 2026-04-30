@@ -6036,7 +6036,7 @@ export default {
 
           if (cached) {
             const tTransform = performance.now();
-            const result = { ...cached, persona_tags: cached.persona_tags ?? [] };
+            const result = { ...cached, display_name: getLiveDisplayName(cached), persona_tags: cached.persona_tags ?? [] };
             const transformMs = performance.now() - tTransform;
             const totalMs = performance.now() - tProfile;
             console.log(`[perf] /api/profile`, JSON.stringify({ rid: request_id, user_id, cache: "HIT", kv_ms: +kvGetMs.toFixed(1), total_ms: +totalMs.toFixed(1), caller }));
@@ -6113,6 +6113,7 @@ export default {
           }
           return ok(req, env, request_id, {
             ...data,
+            display_name: getLiveDisplayName(data),
             persona_tags: data.persona_tags ?? [],
           });
         }
