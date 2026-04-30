@@ -87,6 +87,19 @@ class HttpError extends Error {
   }
 }
 
+/**
+ * Returns the live display name from a user_profiles row, or null if the value
+ * is missing, empty, or the DB default placeholder 'Anonymous'.
+ * This prevents the live identity overlay from overwriting a real post/comment
+ * author_name with the schema default.
+ */
+function getLiveDisplayName(profile?: { display_name?: string | null } | null): string | null {
+  const value = typeof profile?.display_name === "string" ? profile.display_name.trim() : "";
+  if (!value) return null;
+  if (value.toLowerCase() === "anonymous") return null;
+  return value;
+}
+
 // --------- base64url ----------
 function b64urlEncode(bytes: ArrayBuffer): string {
   const bin = String.fromCharCode(...new Uint8Array(bytes));
@@ -1136,7 +1149,7 @@ export default {
             const enriched = {
               ...singlePost,
               media: mediaRows,
-              author_name: profile?.display_name || singlePost.author_name,
+              author_name: getLiveDisplayName(profile) || singlePost.author_name,
               author_avatar: profile?.avatar || avatar,
               like_count: likeCount,
               liked_by_me: likedByMe,
@@ -1405,11 +1418,10 @@ export default {
               }
               // Live identity overlay: prefer user_profiles values over post snapshot
               const profile = profileMap[p.author_id];
-              const liveDisplayName = profile?.display_name || null;
               const liveAvatar = profile?.avatar || null;
               return {
                 ...p,
-                author_name: liveDisplayName || p.author_name,
+                author_name: getLiveDisplayName(profile) || p.author_name,
                 author_avatar: liveAvatar || avatar,
                 media: mediaByPost[p.id] || [],
                 like_count: likeCounts[p.id] || 0,
@@ -3400,7 +3412,7 @@ export default {
             const prof = commentProfileMap[c.author_id];
             return {
               ...c,
-              author_name: prof?.display_name || c.author_name,
+              author_name: getLiveDisplayName(prof) || c.author_name,
               author_avatar: prof?.avatar || c.author_avatar,
               like_count: likeCounts[c.id] || 0,
               liked_by_me: likedByMe.has(c.id),
@@ -5886,7 +5898,7 @@ export default {
               const prof = profileMap[p.persona_author_id];
               return {
                 author_id: p.persona_author_id,
-                name: (prof?.display_name || p.persona_name || "User"),
+                name: (getLiveDisplayName(prof) || p.persona_name || "User"),
                 avatar: (prof?.avatar || p.persona_avatar || null),
               };
             }),
@@ -6643,7 +6655,7 @@ export default {
             const prof = newsCommentProfileMap[c.author_id];
             return {
               ...c,
-              author_name: prof?.display_name || c.author_name,
+              author_name: getLiveDisplayName(prof) || c.author_name,
               author_avatar: prof?.avatar || c.author_avatar,
               like_count: likeCounts[c.id] || 0,
               liked_by_me: likedByMe.has(c.id),
