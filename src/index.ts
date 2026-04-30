@@ -1236,10 +1236,11 @@ export default {
           let p4 = performance.now();
           let p5 = p4;
           // Hoisted from else block so perf-logging (after if/else) can reference them
-          let mediaMs = 0, likesMs = 0, commentCountMs = 0;
+          let mediaMs = 0, likesMs = 0, commentCountMs = 0, repostsMs = 0;
           let mediaRows: any[] = [];
           let allLikeRows: any[] = [];
           let commentCountRows: any[] = [];
+          let allRepostRows: any[] = [];
           const mediaSelectCols = "id, post_id, type, key, thumb_key, width, height, duration_ms";
           const mediaWhereShape = "post_id IN";
           const likesSelectCols = "post_id, actor_id";
@@ -1282,7 +1283,7 @@ export default {
               }
               const embeddedMedia = Array.isArray(p.media) ? p.media : [];
               totalMediaRows += embeddedMedia.length;
-              return { ...p, author_avatar: avatar, media: embeddedMedia, like_count: 0, liked_by_me: false, comment_count: 0, teran_id: null };
+              return { ...p, author_avatar: avatar, media: embeddedMedia, like_count: 0, liked_by_me: false, comment_count: 0, repost_count: 0, teran_id: null };
             });
 
             // Manually attach room metadata (icon_key, icon_thumb_key, name) to each post.
@@ -1370,10 +1371,23 @@ export default {
               return data ?? [];
             })();
 
-            [mediaRows, allLikeRows, commentCountRows] = await Promise.all([
+            // Repost counts: aggregate from posts table where shared_post_id matches
+            const repostsQuery = (async () => {
+              const t = Date.now();
+              const { data } = await sb(env)
+                .from("posts")
+                .select("shared_post_id")
+                .in("shared_post_id", postIds)
+                .is("deleted_at", null);
+              repostsMs = Date.now() - t;
+              return data ?? [];
+            })();
+
+            [mediaRows, allLikeRows, commentCountRows, allRepostRows] = await Promise.all([
               mediaQuery,
               likesQuery,
               commentCountsQuery,
+              repostsQuery,
             ]);
             parallelMs = Date.now() - parallelStart;
             p4 = performance.now();
@@ -1382,9 +1396,11 @@ export default {
               media: mediaMs,
               likes: likesMs,
               commentCounts: commentCountMs,
+              reposts: repostsMs,
               mediaCount: mediaRows.length,
               likeRows: (allLikeRows as any[]).length,
               commentCountRows: (commentCountRows as any[]).length,
+              repostRows: (allRepostRows as any[]).length,
             });
 
             // Process results
@@ -1410,6 +1426,14 @@ export default {
               commentCounts[row.parent_post_id] = Number(row.comment_count) || 0;
             }
 
+            // Compute repost_count from merged result
+            const repostCounts: Record<number, number> = {};
+            for (const row of allRepostRows as any[]) {
+              if (row.shared_post_id) {
+                repostCounts[row.shared_post_id] = (repostCounts[row.shared_post_id] || 0) + 1;
+              }
+            }
+
             // Enrich posts with media, like_count, liked_by_me, comment_count
             enrichedPosts = (posts ?? []).map((p: any) => {
               let avatar = p.author_avatar;
@@ -1427,6 +1451,7 @@ export default {
                 like_count: likeCounts[p.id] || 0,
                 liked_by_me: likedByActorSet.has(p.id),
                 comment_count: commentCounts[p.id] || 0,
+                repost_count: repostCounts[p.id] || 0,
                 teran_id: teranIdMap[p.author_id] ?? null,
               };
             });
