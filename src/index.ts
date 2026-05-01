@@ -2353,6 +2353,29 @@ export default {
             total_ms: ms("handler_done"),
           });
 
+          // ── Invalidate edge feed cache so next GET returns the new post ──
+          // The feed cache uses Cloudflare Cache API with a synthetic URL key.
+          // Without this, refreshing within 30s returns stale cached data
+          // that doesn't include the newly created post.
+          {
+            const cache = caches.default;
+            // Build the same cache key(s) that GET /api/posts constructs for the
+            // standard global feed. We purge multiple limit variants since the
+            // frontend may request different limits.
+            const limitsToInvalidate = ["60", "50", "100"];
+            const deletions = limitsToInvalidate.map(lim => {
+              const cacheUrl = new URL("https://cache.internal/posts/feed");
+              cacheUrl.searchParams.set("limit", lim);
+              cacheUrl.searchParams.set("pt", "status");
+              cacheUrl.searchParams.set("ro", "1");
+              cacheUrl.searchParams.set("rs", "global");
+              return cache.delete(new Request(cacheUrl.toString(), { method: "GET" }))
+                .then(ok => console.log(`[cache] feed invalidate rid=${request_id} limit=${lim} deleted=${ok}`))
+                .catch(e => console.warn(`[cache] feed invalidate failed rid=${request_id}`, e));
+            });
+            ctx.waitUntil(Promise.all(deletions));
+          }
+
           return ok(req, env, request_id, { post: { ...data, media: mediaRows } }, 201);
         }
 
