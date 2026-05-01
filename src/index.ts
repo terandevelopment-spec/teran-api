@@ -1940,40 +1940,67 @@ export default {
             // room_direct_ms is logged separately in room_direct_check above
           });
 
-          // ── Teran ID gates ──
-          if (!accountId && needsRoomCheck) {
-            console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post in room ${room_id}`);
-            throw new HttpError(403, "TERAN_ID_REQUIRED", "Create a Teran ID to post in rooms");
-          }
-          if (!accountId && needsPersonaCheck) {
-            console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} tried to post as author_id ${author_id}`);
-            throw new HttpError(403, "TERAN_ID_REQUIRED", "Create a Teran ID to post");
-          }
+          // ── Teran ID gates (bypassed: unclaimed users now have full access) ──
+          // Previously rejected unclaimed devices here. Now we allow them through
+          // and verify persona ownership via user_profiles instead of account_personas.
+          // Room membership checks in roomFallbackFn still reject unclaimed non-members.
 
           // Step 2: Persona DB fallback + room fallback in parallel (only if KV missed)
           const personaCheckFn = (needsPersonaCheck && !personaKvHit) ? async () => {
             const tPersona0 = Date.now();
-            const { data: personaBinding } = await sb(env)
-              .from("account_personas")
-              .select("persona_author_id")
-              .eq("account_id", accountId!)
-              .eq("persona_author_id", author_id!)
-              .maybeSingle();
-            const dbQueryMs = Date.now() - tPersona0;
 
-            if (!personaBinding) {
-              console.warn(`[posts-auth] REJECTED: device ${user_id} account ${accountId} does not own persona ${author_id}`);
-              throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+            if (accountId) {
+              // ── Claimed-user path: verify via account_personas (unchanged) ──
+              const { data: personaBinding } = await sb(env)
+                .from("account_personas")
+                .select("persona_author_id")
+                .eq("account_id", accountId)
+                .eq("persona_author_id", author_id!)
+                .maybeSingle();
+              const dbQueryMs = Date.now() - tPersona0;
+
+              if (!personaBinding) {
+                console.warn(`[posts-auth] REJECTED: device ${user_id} account ${accountId} does not own persona ${author_id}`);
+                throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+              }
+              mark("persona_check");
+
+              console.log(`[perf] /api/posts persona_breakdown rid=${request_id}`, {
+                persona_query_ms: dbQueryMs,
+                persona_total_ms: dbQueryMs,
+                src: 'db',
+                account_id: accountId,
+                author_id,
+              });
+            } else {
+              // ── Unclaimed-user path: verify via user_profiles ──
+              // The persona was synced via PUT /api/profile from this device.
+              // Verify the author_id exists in user_profiles as proof of ownership.
+              const { data: profileRow, error: profileError } = await sb(env)
+                .from("user_profiles")
+                .select("user_id")
+                .eq("user_id", author_id!)
+                .maybeSingle();
+              const dbQueryMs = Date.now() - tPersona0;
+
+              if (profileError) {
+                throw profileError;
+              }
+
+              if (!profileRow) {
+                console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} persona ${author_id} not found in user_profiles`);
+                throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+              }
+              mark("persona_check");
+
+              console.log(`[perf] /api/posts persona_breakdown rid=${request_id}`, {
+                persona_query_ms: dbQueryMs,
+                persona_total_ms: dbQueryMs,
+                src: 'db_user_profiles',
+                account_id: null,
+                author_id,
+              });
             }
-            mark("persona_check");
-
-            console.log(`[perf] /api/posts persona_breakdown rid=${request_id}`, {
-              persona_query_ms: dbQueryMs,
-              persona_total_ms: dbQueryMs,
-              src: 'db',
-              account_id: accountId,
-              author_id,
-            });
 
             // Write-behind: cache confirmed ownership (device-keyed)
             ctx.waitUntil(
