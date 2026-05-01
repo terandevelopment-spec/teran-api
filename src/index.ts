@@ -1150,7 +1150,7 @@ export default {
               ...singlePost,
               media: mediaRows,
               author_name: getLiveDisplayName(profile) || singlePost.author_name,
-              author_avatar: profile?.avatar || avatar,
+              author_avatar: (singlePost.uses_room_avatar ? avatar : (profile?.avatar || avatar)),
               like_count: likeCount,
               liked_by_me: likedByMe,
               comment_count: 0,  // thread UI fetches comments separately
@@ -1446,7 +1446,7 @@ export default {
               return {
                 ...p,
                 author_name: getLiveDisplayName(profile) || p.author_name,
-                author_avatar: liveAvatar || avatar,
+                author_avatar: (p.uses_room_avatar ? avatar : (liveAvatar || avatar)),
                 media: mediaByPost[p.id] || [],
                 like_count: likeCounts[p.id] || 0,
                 liked_by_me: likedByActorSet.has(p.id),
@@ -2170,10 +2170,8 @@ export default {
                 moods,
                 show_in_feed,
                 room_category,
-                // Initialize last_activity_at so Wire activity-based ordering
-                // works immediately — new posts sort at the top without needing
-                // a comment to first populate this field.
                 last_activity_at: new Date().toISOString(),
+                uses_room_avatar: body?.uses_room_avatar === true,
               })
               .select(POST_RETURN_COLS)
               .maybeSingle();
@@ -7967,14 +7965,45 @@ export default {
             const my_role: string | null = uid ? await checkRoomMembership(env, roomId, uid) : null;
             const enrichMs = performance.now() - tEnrich;
 
+            // ── Fetch room avatar options ──
+            const tAvatarOpts = performance.now();
+            const { data: avatarOptions } = await sb(env)
+              .from("room_avatar_options")
+              .select("*")
+              .eq("room_id", roomId)
+              .order("sort_order", { ascending: true });
+            const avatarOptsMs = performance.now() - tAvatarOpts;
+
+            // ── Fetch caller's avatar choice for this room ──
+            let my_avatar_mode: string | null = null;
+            let my_room_avatar_key: string | null = null;
+            let my_room_avatar_option_id: string | null = null;
+            if (uid && my_role) {
+              const { data: memberRow } = await sb(env)
+                .from("room_members")
+                .select("avatar_mode, room_avatar_option_id, room_avatar_key")
+                .eq("room_id", roomId)
+                .eq("user_id", uid)
+                .maybeSingle();
+              if (memberRow) {
+                my_avatar_mode = (memberRow as any).avatar_mode || null;
+                my_room_avatar_key = (memberRow as any).room_avatar_key || null;
+                my_room_avatar_option_id = (memberRow as any).room_avatar_option_id || null;
+              }
+            }
+
             const payload = {
               room: { ...(room as any) },
               my_role,
+              avatar_options: avatarOptions ?? [],
+              my_avatar_mode,
+              my_room_avatar_key,
+              my_room_avatar_option_id,
             };
             const payloadBytes = JSON.stringify(payload).length;
             const totalMs = performance.now() - tTotal;
 
-            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: +enrichMs.toFixed(1), total_ms: +totalMs.toFixed(1), rows_room: 1, payload_bytes: payloadBytes, caller }));
+            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: +enrichMs.toFixed(1), avatar_opts_ms: +avatarOptsMs.toFixed(1), total_ms: +totalMs.toFixed(1), rows_room: 1, avatar_opts_count: (avatarOptions ?? []).length, payload_bytes: payloadBytes, caller }));
 
             return ok(req, env, request_id, payload);
           }
@@ -8207,6 +8236,29 @@ export default {
           }
           console.log("[room_create] membership insert ok", { rid: request_id, room_id: (room as any).id, membership_ms: +dbMembershipMs.toFixed(1) });
 
+          // ── Insert room avatar options (selectable Room icons) ──
+          let avatarOptions: any[] = [];
+          if (Array.isArray(body?.avatar_options) && body.avatar_options.length > 0) {
+            const rows = body.avatar_options.slice(0, 12).map((opt: any, idx: number) => ({
+              room_id: (room as any).id,
+              icon_key: typeof opt.icon_key === "string" ? opt.icon_key.trim() : "",
+              thumb_key: typeof opt.thumb_key === "string" ? opt.thumb_key.trim() : null,
+              label: typeof opt.label === "string" ? opt.label.trim().slice(0, 40) : null,
+              sort_order: idx,
+            })).filter((r: any) => r.icon_key);
+            if (rows.length > 0) {
+              const { data: inserted, error: aoErr } = await sb(env)
+                .from("room_avatar_options")
+                .insert(rows)
+                .select();
+              if (aoErr) {
+                console.warn("[room_create] avatar_options insert failed", { rid: request_id, error: aoErr.message });
+              } else {
+                avatarOptions = inserted ?? [];
+              }
+            }
+          }
+
           const tResponse = performance.now();
           const totalMs = performance.now() - tCreateTotal;
           console.log(`[perf] /api/rooms(create) breakdown`, JSON.stringify({ rid: request_id, room_key, visibility, params_ms: +(tValidate - tCreateTotal).toFixed(1), db_insert_room_ms: +dbInsertRoomMs.toFixed(1), db_membership_ms: +dbMembershipMs.toFixed(1), membership: "sync", total_ms: +totalMs.toFixed(1) }));
@@ -8228,7 +8280,7 @@ export default {
           }
 
           // Enriched response: includes member_count + my_role so client can skip room-detail fetch
-          return ok(req, env, request_id, { room: { ...(room as any), member_count: 1 }, my_role: "owner" }, 201);
+          return ok(req, env, request_id, { room: { ...(room as any), member_count: 1 }, my_role: "owner", avatar_options: avatarOptions }, 201);
         }
 
         // PATCH /api/rooms/:id — owner update
@@ -8544,20 +8596,56 @@ export default {
             else if (body?.social_reply_mode === null)
               updates.social_reply_mode = null;
 
-            if (Object.keys(updates).length === 0) {
+            // ── Replace avatar_options if provided ──
+            const hasAvatarOptions = Array.isArray(body?.avatar_options);
+
+            if (Object.keys(updates).length === 0 && !hasAvatarOptions) {
               throw new HttpError(422, "VALIDATION_ERROR", "No fields to update");
             }
-            updates.updated_at = new Date().toISOString();
+            if (Object.keys(updates).length > 0) {
+              updates.updated_at = new Date().toISOString();
+            }
 
-            const { data: room, error } = await sb(env)
-              .from("rooms")
-              .update(updates)
-              .eq("id", roomId)
-              .select()
-              .single();
+            const { data: room, error } = Object.keys(updates).length > 0
+              ? await sb(env).from("rooms").update(updates).eq("id", roomId).select().single()
+              : await sb(env).from("rooms").select("*").eq("id", roomId).single();
             if (error) throw new Error(error.message);
 
-            return ok(req, env, request_id, { room });
+            // ── Replace room avatar options (delete-all + re-insert) ──
+            let avatarOptions: any[] = [];
+            if (hasAvatarOptions) {
+              // Delete existing
+              await sb(env).from("room_avatar_options").delete().eq("room_id", roomId);
+              // Insert new
+              const rows = body.avatar_options.slice(0, 12).map((opt: any, idx: number) => ({
+                room_id: roomId,
+                icon_key: typeof opt.icon_key === "string" ? opt.icon_key.trim() : "",
+                thumb_key: typeof opt.thumb_key === "string" ? opt.thumb_key.trim() : null,
+                label: typeof opt.label === "string" ? opt.label.trim().slice(0, 40) : null,
+                sort_order: idx,
+              })).filter((r: any) => r.icon_key);
+              if (rows.length > 0) {
+                const { data: inserted, error: aoErr } = await sb(env)
+                  .from("room_avatar_options")
+                  .insert(rows)
+                  .select();
+                if (aoErr) {
+                  console.warn("[room_edit] avatar_options replace failed", { rid: request_id, error: aoErr.message });
+                } else {
+                  avatarOptions = inserted ?? [];
+                }
+              }
+            } else {
+              // Not provided — fetch existing for response
+              const { data: existing } = await sb(env)
+                .from("room_avatar_options")
+                .select("*")
+                .eq("room_id", roomId)
+                .order("sort_order", { ascending: true });
+              avatarOptions = existing ?? [];
+            }
+
+            return ok(req, env, request_id, { room, avatar_options: avatarOptions });
           }
         }
 
@@ -8983,6 +9071,62 @@ export default {
             }
 
             return ok(req, env, request_id, { joined: true });
+          }
+        }
+
+        // POST /api/rooms/:id/avatar-choice — save user's avatar selection for a Room
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)\/avatar-choice$/);
+          if (m && req.method === "POST") {
+            const roomId = m[1];
+            const user_id = await requireAuth(req, env);
+
+            // Verify room exists
+            const { data: roomRow } = await sb(env).from("rooms").select("id").eq("id", roomId).maybeSingle();
+            if (!roomRow) throw new HttpError(404, "NOT_FOUND", "Room not found");
+
+            const body = (await req.json().catch(() => null)) as any;
+            const mode = typeof body?.mode === "string" ? body.mode : "persona";
+
+            let avatar_mode = "persona";
+            let room_avatar_option_id: string | null = null;
+            let room_avatar_key: string | null = null;
+
+            if (mode === "room_icon") {
+              const optionId = typeof body?.option_id === "string" ? body.option_id.trim() : null;
+              if (!optionId) throw new HttpError(422, "VALIDATION_ERROR", "option_id is required for room_icon mode");
+
+              // Verify the option exists for this room
+              const { data: optRow } = await sb(env)
+                .from("room_avatar_options")
+                .select("id, icon_key, thumb_key")
+                .eq("id", optionId)
+                .eq("room_id", roomId)
+                .maybeSingle();
+              if (!optRow) throw new HttpError(404, "NOT_FOUND", "Avatar option not found for this room");
+
+              avatar_mode = "room_icon";
+              room_avatar_option_id = (optRow as any).id;
+              room_avatar_key = (optRow as any).thumb_key || (optRow as any).icon_key;
+            }
+
+            // Upsert room_members row with avatar choice
+            const { error: upsertErr } = await sb(env)
+              .from("room_members")
+              .upsert(
+                {
+                  room_id: roomId,
+                  user_id,
+                  role: "member",
+                  avatar_mode,
+                  room_avatar_option_id,
+                  room_avatar_key,
+                },
+                { onConflict: "room_id,user_id" }
+              );
+            if (upsertErr) throw new Error(upsertErr.message);
+
+            return ok(req, env, request_id, { avatar_mode, room_avatar_option_id, room_avatar_key });
           }
         }
 
