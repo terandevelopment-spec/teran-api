@@ -1973,30 +1973,18 @@ export default {
                 author_id,
               });
             } else {
-              // ── Unclaimed-user path: verify via user_profiles ──
-              // The persona was synced via PUT /api/profile from this device.
-              // Verify the author_id exists in user_profiles as proof of ownership.
-              const { data: profileRow, error: profileError } = await sb(env)
-                .from("user_profiles")
-                .select("user_id")
-                .eq("user_id", author_id!)
-                .maybeSingle();
-              const dbQueryMs = Date.now() - tPersona0;
-
-              if (profileError) {
-                throw profileError;
-              }
-
-              if (!profileRow) {
-                console.warn(`[posts-auth] REJECTED: unclaimed device ${user_id} persona ${author_id} not found in user_profiles`);
-                throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
-              }
+              // ── Unclaimed-user path: allow posting ──
+              // Pre-claim, there is no server-side device→persona binding.
+              // The persona exists only in the client's localStorage/IDB.
+              // PUT /api/profile also rejects unclaimed users when author_id ≠ device_id,
+              // so no user_profiles row exists to verify against.
+              // The JWT authenticates the device; persona attribution is client-trusted pre-claim.
               mark("persona_check");
 
               console.log(`[perf] /api/posts persona_breakdown rid=${request_id}`, {
-                persona_query_ms: dbQueryMs,
-                persona_total_ms: dbQueryMs,
-                src: 'db_user_profiles',
+                persona_query_ms: 0,
+                persona_total_ms: 0,
+                src: 'unclaimed_allow',
                 account_id: null,
                 author_id,
               });
