@@ -2612,13 +2612,29 @@ export default {
                 throw new HttpError(403, "FORBIDDEN", "Editing is only available for main/global posts");
               }
 
-              // Origin user must also own the room
+              // Origin user must also own the room — account-aware sibling expansion
+              // (same pattern as post ownership check above)
               const { data: _patchRoom } = await sb(env)
                 .from("rooms")
                 .select("owner_id")
                 .eq("id", roomId)
                 .maybeSingle();
-              if (!_patchRoom || (_patchRoom as any).owner_id !== user_id) {
+              if (!_patchRoom) {
+                throw new HttpError(403, "FORBIDDEN", "Only room owner can edit room posts");
+              }
+              const _roomOwnerId = String((_patchRoom as any).owner_id);
+              let _roomOwnerMatch = _roomOwnerId === String(user_id);
+              if (!_roomOwnerMatch && (_patchBinding as any)?.account_id) {
+                const { data: _ownerSiblings } = await sb(env)
+                  .from("account_devices")
+                  .select("device_id")
+                  .eq("account_id", (_patchBinding as any).account_id);
+                if (_ownerSiblings) {
+                  const _ownerSiblingIds = new Set((_ownerSiblings as any[]).map((r: any) => String(r.device_id)));
+                  _roomOwnerMatch = _ownerSiblingIds.has(_roomOwnerId);
+                }
+              }
+              if (!_roomOwnerMatch) {
                 throw new HttpError(403, "FORBIDDEN", "Only room owner can edit room posts");
               }
             }
@@ -8074,7 +8090,41 @@ export default {
             if (fieldsParam === "membership") {
               const tEnrichM = performance.now();
               const mUid = await optionalAuth(req, env);
-              const mRole: string | null = mUid ? await checkRoomMembership(env, roomId, mUid) : null;
+              let mRole: string | null = mUid ? await checkRoomMembership(env, roomId, mUid) : null;
+
+              // Origin owner fallback (same pattern as full enrichment path)
+              if (mUid && mRole !== "owner") {
+                const { data: _mBinding } = await sb(env)
+                  .from("account_devices")
+                  .select("account_id")
+                  .eq("device_id", mUid)
+                  .maybeSingle();
+                if ((_mBinding as any)?.account_id) {
+                  const { data: _mAccount } = await sb(env)
+                    .from("accounts")
+                    .select("teran_handle")
+                    .eq("id", (_mBinding as any).account_id)
+                    .maybeSingle();
+                  if ((_mAccount as any)?.teran_handle === "teran.origin") {
+                    const roomOwnerId = String((room as any).owner_id);
+                    let ownerMatch = roomOwnerId === String(mUid);
+                    if (!ownerMatch) {
+                      const { data: _mSiblings } = await sb(env)
+                        .from("account_devices")
+                        .select("device_id")
+                        .eq("account_id", (_mBinding as any).account_id);
+                      if (_mSiblings) {
+                        const sibIds = new Set((_mSiblings as any[]).map((r: any) => String(r.device_id)));
+                        ownerMatch = sibIds.has(roomOwnerId);
+                      }
+                    }
+                    if (ownerMatch) {
+                      mRole = "owner";
+                      console.log(`[rooms] origin owner fallback (membership): elevated my_role to owner`, { room_id: roomId, uid: mUid });
+                    }
+                  }
+                }
+              }
               const enrichMemberMs = performance.now() - tEnrichM;
 
               const payload = { room: null, my_role: mRole };
@@ -8095,7 +8145,46 @@ export default {
             // my_role is needed for canPost (composer) on ALL room types
             const tEnrich = performance.now();
             const uid = await optionalAuth(req, env);
-            const my_role: string | null = uid ? await checkRoomMembership(env, roomId, uid) : null;
+            let my_role: string | null = uid ? await checkRoomMembership(env, roomId, uid) : null;
+
+            // ── Origin owner fallback ────────────────────────────────────
+            // If my_role is not 'owner' but the caller is teran.origin and
+            // the room's owner_id matches any sibling device on their account,
+            // elevate to 'owner'.  Handles device_id mismatch after identity
+            // regeneration (same sibling pattern as PATCH /api/posts/:id).
+            if (uid && my_role !== "owner") {
+              const { data: _roleBinding } = await sb(env)
+                .from("account_devices")
+                .select("account_id")
+                .eq("device_id", uid)
+                .maybeSingle();
+              if ((_roleBinding as any)?.account_id) {
+                const { data: _roleAccount } = await sb(env)
+                  .from("accounts")
+                  .select("teran_handle")
+                  .eq("id", (_roleBinding as any).account_id)
+                  .maybeSingle();
+                if ((_roleAccount as any)?.teran_handle === "teran.origin") {
+                  // Check if any sibling device_id matches rooms.owner_id
+                  const roomOwnerId = String((room as any).owner_id);
+                  let ownerMatch = roomOwnerId === String(uid);
+                  if (!ownerMatch) {
+                    const { data: _roleSiblings } = await sb(env)
+                      .from("account_devices")
+                      .select("device_id")
+                      .eq("account_id", (_roleBinding as any).account_id);
+                    if (_roleSiblings) {
+                      const sibIds = new Set((_roleSiblings as any[]).map((r: any) => String(r.device_id)));
+                      ownerMatch = sibIds.has(roomOwnerId);
+                    }
+                  }
+                  if (ownerMatch) {
+                    my_role = "owner";
+                    console.log(`[rooms] origin owner fallback: elevated my_role to owner`, { room_id: roomId, uid });
+                  }
+                }
+              }
+            }
             const enrichMs = performance.now() - tEnrich;
 
             // ── Fetch room avatar options ──
