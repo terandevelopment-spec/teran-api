@@ -8516,7 +8516,50 @@ export default {
 
             // Verify ownership
             const ownerRole = await checkRoomMembership(env, roomId, user_id);
-            if (ownerRole !== "owner") throw new HttpError(403, "FORBIDDEN", "Only room owner can update");
+            if (ownerRole !== "owner") {
+              // Origin owner fallback: device_id may have changed after identity regeneration
+              let _isOriginOwner = false;
+              const { data: _patchRoomBinding } = await sb(env)
+                .from("account_devices")
+                .select("account_id")
+                .eq("device_id", user_id)
+                .maybeSingle();
+              if ((_patchRoomBinding as any)?.account_id) {
+                const { data: _patchRoomAccount } = await sb(env)
+                  .from("accounts")
+                  .select("teran_handle")
+                  .eq("id", (_patchRoomBinding as any).account_id)
+                  .maybeSingle();
+                if ((_patchRoomAccount as any)?.teran_handle === "teran.origin") {
+                  // Verify this account actually owns the room via sibling device_ids
+                  const { data: _patchRoomRow } = await sb(env)
+                    .from("rooms")
+                    .select("owner_id")
+                    .eq("id", roomId)
+                    .maybeSingle();
+                  if (_patchRoomRow) {
+                    const _roomOwnerId = String((_patchRoomRow as any).owner_id);
+                    _isOriginOwner = _roomOwnerId === String(user_id);
+                    if (!_isOriginOwner) {
+                      const { data: _patchSiblings } = await sb(env)
+                        .from("account_devices")
+                        .select("device_id")
+                        .eq("account_id", (_patchRoomBinding as any).account_id);
+                      if (_patchSiblings) {
+                        const sibIds = new Set((_patchSiblings as any[]).map((r: any) => String(r.device_id)));
+                        _isOriginOwner = sibIds.has(_roomOwnerId);
+                      }
+                    }
+                  }
+                  if (_isOriginOwner) {
+                    console.log(`[rooms] origin owner fallback (PATCH): allowing room update`, { room_id: roomId, user_id });
+                  }
+                }
+              }
+              if (!_isOriginOwner) {
+                throw new HttpError(403, "FORBIDDEN", "Only room owner can update");
+              }
+            }
 
             const body = (await req.json().catch(() => null)) as any;
             const updates: Record<string, any> = {};
