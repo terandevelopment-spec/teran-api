@@ -1075,6 +1075,59 @@ export default {
           }
 
           // Fast path: no posts => return immediately
+          // NOTE: postIds is computed AFTER the privacy filter below.
+          // ── Privacy filter: exclude posts from private rooms in aggregate feeds ──
+          // When fetching a specific room (room_id_param !== null/global), the membership
+          // check above already handles access.  For aggregate feeds (wire, profile, search)
+          // we must strip posts belonging to non-public rooms to prevent data leakage.
+          if (
+            posts && posts.length > 0 &&
+            !(room_id_param && room_id_param !== "global") // skip for specific-room queries (already access-checked)
+          ) {
+            const roomIdsInResult = [...new Set(
+              (posts as any[])
+                .map((p: any) => p.room_id)
+                .filter((rid: any) => rid && rid !== "global")
+            )];
+            if (roomIdsInResult.length > 0) {
+              const tVisCheck = performance.now();
+              const { data: roomVisRows } = await sb(env)
+                .from("rooms")
+                .select("id, visibility")
+                .in("id", roomIdsInResult);
+              const visCheckMs = +(performance.now() - tVisCheck).toFixed(1);
+
+              // Build a set of private room IDs
+              const privateRoomIds = new Set<string>();
+              if (roomVisRows) {
+                for (const r of roomVisRows as any[]) {
+                  if (r.visibility && r.visibility !== "public") {
+                    privateRoomIds.add(String(r.id));
+                  }
+                }
+              }
+
+              if (privateRoomIds.size > 0) {
+                const beforeCount = posts.length;
+                posts = (posts as any[]).filter((p: any) => {
+                  if (!p.room_id || p.room_id === "global") return true;
+                  return !privateRoomIds.has(String(p.room_id));
+                });
+                console.log(`[privacy] filtered private room posts rid=${request_id}`, {
+                  vis_check_ms: visCheckMs,
+                  room_ids_checked: roomIdsInResult.length,
+                  private_rooms: privateRoomIds.size,
+                  posts_before: beforeCount,
+                  posts_after: posts.length,
+                  removed: beforeCount - posts.length,
+                });
+              } else {
+                console.log(`[privacy] no private rooms in result rid=${request_id} vis_check_ms=${visCheckMs} rooms_checked=${roomIdsInResult.length}`);
+              }
+            }
+          }
+
+          // Compute postIds AFTER privacy filter so removed posts don't participate in downstream queries
           const postIds = (posts ?? []).map((p: any) => p.id);
 
           // Step 1 (cont): log ids shape after posts query returns
