@@ -8162,11 +8162,13 @@ export default {
             throw new HttpError(422, "VALIDATION_ERROR", "icon_thumb_key must not be a data URI");
           }
 
-          // Visibility: 'public' (default) | 'private'
-          const ALLOWED_VISIBILITY = new Set(["public", "private"]);
-          const visibility = typeof body?.visibility === "string" && ALLOWED_VISIBILITY.has(body.visibility)
+          // Visibility: 'public' (default) | 'private' | 'private_invite_only'
+          // Normalize 'private' → 'private_invite_only' for DB consistency
+          const ALLOWED_VISIBILITY = new Set(["public", "private", "private_invite_only"]);
+          const rawVisibility = typeof body?.visibility === "string" && ALLOWED_VISIBILITY.has(body.visibility)
             ? body.visibility
             : "public";
+          const visibility = rawVisibility === "private" ? "private_invite_only" : rawVisibility;
 
           // Category: required for public rooms, omitted for private
           const rawCategory = typeof body?.category === "string" ? body.category.trim() : null;
