@@ -1079,7 +1079,8 @@ export default {
           // ── Privacy filter: exclude posts from private rooms in aggregate feeds ──
           // When fetching a specific room (room_id_param !== null/global), the membership
           // check above already handles access.  For aggregate feeds (wire, profile, search)
-          // we must strip posts belonging to non-public rooms to prevent data leakage.
+          // we must strip posts belonging to non-public rooms — UNLESS the caller is the
+          // room owner or a member.
           if (
             posts && posts.length > 0 &&
             !(room_id_param && room_id_param !== "global") // skip for specific-room queries (already access-checked)
@@ -1091,38 +1092,74 @@ export default {
             )];
             if (roomIdsInResult.length > 0) {
               const tVisCheck = performance.now();
+
+              // Resolve caller identity (cheap — cached JWT parse)
+              const privacyCaller = await optionalAuth(req, env);
+
+              // Batch-fetch visibility + owner for all rooms in the result set
               const { data: roomVisRows } = await sb(env)
                 .from("rooms")
-                .select("id, visibility")
+                .select("id, visibility, owner_id")
                 .in("id", roomIdsInResult);
-              const visCheckMs = +(performance.now() - tVisCheck).toFixed(1);
 
-              // Build a set of private room IDs
+              // Build set of private room IDs
               const privateRoomIds = new Set<string>();
+              const callerOwnedRoomIds = new Set<string>();
               if (roomVisRows) {
                 for (const r of roomVisRows as any[]) {
                   if (r.visibility && r.visibility !== "public") {
                     privateRoomIds.add(String(r.id));
+                    // Owner can always see their own private room posts
+                    if (privacyCaller && String(r.owner_id) === privacyCaller) {
+                      callerOwnedRoomIds.add(String(r.id));
+                    }
                   }
                 }
               }
 
-              if (privateRoomIds.size > 0) {
+              // Check membership for private rooms the caller does NOT own
+              const privateNonOwned = [...privateRoomIds].filter(rid => !callerOwnedRoomIds.has(rid));
+              const callerMemberRoomIds = new Set<string>();
+              if (privacyCaller && privateNonOwned.length > 0) {
+                const { data: memberRows } = await sb(env)
+                  .from("room_members")
+                  .select("room_id")
+                  .eq("user_id", privacyCaller)
+                  .in("room_id", privateNonOwned);
+                if (memberRows) {
+                  for (const m of memberRows as any[]) {
+                    callerMemberRoomIds.add(String(m.room_id));
+                  }
+                }
+              }
+
+              // Allowed = owned + member; blocked = private but not allowed
+              const allowedPrivateRoomIds = new Set([...callerOwnedRoomIds, ...callerMemberRoomIds]);
+              const blockedRoomIds = new Set(
+                [...privateRoomIds].filter(rid => !allowedPrivateRoomIds.has(rid))
+              );
+
+              const visCheckMs = +(performance.now() - tVisCheck).toFixed(1);
+
+              if (blockedRoomIds.size > 0) {
                 const beforeCount = posts.length;
                 posts = (posts as any[]).filter((p: any) => {
                   if (!p.room_id || p.room_id === "global") return true;
-                  return !privateRoomIds.has(String(p.room_id));
+                  return !blockedRoomIds.has(String(p.room_id));
                 });
                 console.log(`[privacy] filtered private room posts rid=${request_id}`, {
                   vis_check_ms: visCheckMs,
                   room_ids_checked: roomIdsInResult.length,
                   private_rooms: privateRoomIds.size,
+                  caller_owned: callerOwnedRoomIds.size,
+                  caller_member: callerMemberRoomIds.size,
+                  blocked: blockedRoomIds.size,
                   posts_before: beforeCount,
                   posts_after: posts.length,
                   removed: beforeCount - posts.length,
                 });
               } else {
-                console.log(`[privacy] no private rooms in result rid=${request_id} vis_check_ms=${visCheckMs} rooms_checked=${roomIdsInResult.length}`);
+                console.log(`[privacy] all private rooms allowed for caller rid=${request_id} vis_check_ms=${visCheckMs} private=${privateRoomIds.size} allowed=${allowedPrivateRoomIds.size}`);
               }
             }
           }
