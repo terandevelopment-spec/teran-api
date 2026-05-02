@@ -2485,9 +2485,39 @@ export default {
             }
 
             // ── Eligibility guards: main/global root status posts only ──
+            // Exception: origin user (teran.origin) can edit posts in rooms they own.
             const roomId: string | null = (post as any).room_id ?? null;
             if (roomId && roomId !== "global") {
-              throw new HttpError(403, "FORBIDDEN", "Editing is only available for main/global posts");
+              // Resolve caller's teran_handle via device → account chain
+              const { data: _patchBinding } = await sb(env)
+                .from("account_devices")
+                .select("account_id")
+                .eq("device_id", user_id)
+                .maybeSingle();
+
+              let _isOriginEditor = false;
+              if ((_patchBinding as any)?.account_id) {
+                const { data: _patchAccount } = await sb(env)
+                  .from("accounts")
+                  .select("teran_handle")
+                  .eq("id", (_patchBinding as any).account_id)
+                  .maybeSingle();
+                _isOriginEditor = (_patchAccount as any)?.teran_handle === "teran.origin";
+              }
+
+              if (!_isOriginEditor) {
+                throw new HttpError(403, "FORBIDDEN", "Editing is only available for main/global posts");
+              }
+
+              // Origin user must also own the room
+              const { data: _patchRoom } = await sb(env)
+                .from("rooms")
+                .select("owner_id")
+                .eq("id", roomId)
+                .maybeSingle();
+              if (!_patchRoom || (_patchRoom as any).owner_id !== user_id) {
+                throw new HttpError(403, "FORBIDDEN", "Only room owner can edit room posts");
+              }
             }
 
             const postType: string = (post as any).post_type ?? "status";
