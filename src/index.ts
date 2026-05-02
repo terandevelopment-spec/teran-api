@@ -1076,14 +1076,16 @@ export default {
 
           // Fast path: no posts => return immediately
           // NOTE: postIds is computed AFTER the privacy filter below.
-          // ── Privacy filter: exclude posts from private rooms in aggregate feeds ──
-          // When fetching a specific room (room_id_param !== null/global), the membership
-          // check above already handles access.  For aggregate feeds (wire, profile, search)
-          // we must strip posts belonging to non-public rooms — UNLESS the caller is the
-          // room owner or a member.
+          // ── Privacy filter: exclude posts from private rooms ──
+          // Rules:
+          //   • Specific-room queries (room_id_param set): SKIP — membership already verified upstream.
+          //   • User-scoped queries (user_id or author_id): Allow owner/member private posts
+          //     so personal tab shows the user's own content.
+          //   • Aggregate feeds (wire, home, explore, search): ALWAYS block private room posts.
+          //     No exceptions — not even for the owner. Owner sees them in room view or personal tab only.
           if (
             posts && posts.length > 0 &&
-            !(room_id_param && room_id_param !== "global") // skip for specific-room queries (already access-checked)
+            !(room_id_param && room_id_param !== "global") // skip for specific-room queries
           ) {
             const roomIdsInResult = [...new Set(
               (posts as any[])
@@ -1092,9 +1094,7 @@ export default {
             )];
             if (roomIdsInResult.length > 0) {
               const tVisCheck = performance.now();
-
-              // Resolve caller identity (cheap — cached JWT parse)
-              const privacyCaller = await optionalAuth(req, env);
+              const isUserScopedQuery = !!(user_id_param || author_id_param);
 
               // Batch-fetch visibility + owner for all rooms in the result set
               const { data: roomVisRows } = await sb(env)
@@ -1104,40 +1104,54 @@ export default {
 
               // Build set of private room IDs
               const privateRoomIds = new Set<string>();
-              const callerOwnedRoomIds = new Set<string>();
               if (roomVisRows) {
                 for (const r of roomVisRows as any[]) {
                   if (r.visibility && r.visibility !== "public") {
                     privateRoomIds.add(String(r.id));
-                    // Owner can always see their own private room posts
-                    if (privacyCaller && String(r.owner_id) === privacyCaller) {
-                      callerOwnedRoomIds.add(String(r.id));
+                  }
+                }
+              }
+
+              // Determine which private rooms to block
+              let blockedRoomIds: Set<string>;
+
+              if (privateRoomIds.size === 0) {
+                blockedRoomIds = new Set();
+              } else if (!isUserScopedQuery) {
+                // AGGREGATE FEED (wire/home/explore/search): block ALL private rooms — no exceptions
+                blockedRoomIds = privateRoomIds;
+              } else {
+                // USER-SCOPED (personal tab): allow owner + member posts through
+                const privacyCaller = await optionalAuth(req, env);
+                const allowedRoomIds = new Set<string>();
+
+                if (privacyCaller) {
+                  // Check ownership
+                  for (const r of (roomVisRows as any[]) || []) {
+                    if (privateRoomIds.has(String(r.id)) && String(r.owner_id) === privacyCaller) {
+                      allowedRoomIds.add(String(r.id));
+                    }
+                  }
+                  // Check membership for non-owned private rooms
+                  const nonOwned = [...privateRoomIds].filter(rid => !allowedRoomIds.has(rid));
+                  if (nonOwned.length > 0) {
+                    const { data: memberRows } = await sb(env)
+                      .from("room_members")
+                      .select("room_id")
+                      .eq("user_id", privacyCaller)
+                      .in("room_id", nonOwned);
+                    if (memberRows) {
+                      for (const m of memberRows as any[]) {
+                        allowedRoomIds.add(String(m.room_id));
+                      }
                     }
                   }
                 }
-              }
 
-              // Check membership for private rooms the caller does NOT own
-              const privateNonOwned = [...privateRoomIds].filter(rid => !callerOwnedRoomIds.has(rid));
-              const callerMemberRoomIds = new Set<string>();
-              if (privacyCaller && privateNonOwned.length > 0) {
-                const { data: memberRows } = await sb(env)
-                  .from("room_members")
-                  .select("room_id")
-                  .eq("user_id", privacyCaller)
-                  .in("room_id", privateNonOwned);
-                if (memberRows) {
-                  for (const m of memberRows as any[]) {
-                    callerMemberRoomIds.add(String(m.room_id));
-                  }
-                }
+                blockedRoomIds = new Set(
+                  [...privateRoomIds].filter(rid => !allowedRoomIds.has(rid))
+                );
               }
-
-              // Allowed = owned + member; blocked = private but not allowed
-              const allowedPrivateRoomIds = new Set([...callerOwnedRoomIds, ...callerMemberRoomIds]);
-              const blockedRoomIds = new Set(
-                [...privateRoomIds].filter(rid => !allowedPrivateRoomIds.has(rid))
-              );
 
               const visCheckMs = +(performance.now() - tVisCheck).toFixed(1);
 
@@ -1149,17 +1163,16 @@ export default {
                 });
                 console.log(`[privacy] filtered private room posts rid=${request_id}`, {
                   vis_check_ms: visCheckMs,
+                  query_type: isUserScopedQuery ? "user_scoped" : "aggregate",
                   room_ids_checked: roomIdsInResult.length,
                   private_rooms: privateRoomIds.size,
-                  caller_owned: callerOwnedRoomIds.size,
-                  caller_member: callerMemberRoomIds.size,
                   blocked: blockedRoomIds.size,
                   posts_before: beforeCount,
                   posts_after: posts.length,
                   removed: beforeCount - posts.length,
                 });
-              } else {
-                console.log(`[privacy] all private rooms allowed for caller rid=${request_id} vis_check_ms=${visCheckMs} private=${privateRoomIds.size} allowed=${allowedPrivateRoomIds.size}`);
+              } else if (privateRoomIds.size > 0) {
+                console.log(`[privacy] private rooms allowed (user-scoped) rid=${request_id} vis_check_ms=${visCheckMs} private=${privateRoomIds.size}`);
               }
             }
           }
