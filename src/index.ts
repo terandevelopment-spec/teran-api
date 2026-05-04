@@ -1249,11 +1249,36 @@ export default {
             let avatar = singlePost.author_avatar;
             if (typeof avatar === "string" && avatar.startsWith("data:")) avatar = null;
 
+            // ── Origin identity guard ──
+            // For teran.origin posts, skip profile name/avatar overlay so the
+            // canonical posts.author_name / posts.author_avatar are the API
+            // source of truth (edited identity must not be overwritten).
+            let _singleIsOriginPost = false;
+            if (singlePost.user_id) {
+              const { data: _sBindRow } = await sb(env)
+                .from("account_devices")
+                .select("account_id")
+                .eq("device_id", String(singlePost.user_id))
+                .maybeSingle();
+              if ((_sBindRow as any)?.account_id) {
+                const { data: _sAccRow } = await sb(env)
+                  .from("accounts")
+                  .select("teran_handle")
+                  .eq("id", (_sBindRow as any).account_id)
+                  .maybeSingle();
+                _singleIsOriginPost = (_sAccRow as any)?.teran_handle === "teran.origin";
+              }
+            }
+
             const enriched = {
               ...singlePost,
               media: mediaRows,
-              author_name: getLiveDisplayName(profile) || singlePost.author_name,
-              author_avatar: (singlePost.uses_room_avatar ? avatar : (profile?.avatar || avatar)),
+              author_name: _singleIsOriginPost
+                ? singlePost.author_name
+                : (getLiveDisplayName(profile) || singlePost.author_name),
+              author_avatar: _singleIsOriginPost
+                ? (singlePost.uses_room_avatar ? avatar : (singlePost.author_avatar || avatar))
+                : (singlePost.uses_room_avatar ? avatar : (profile?.avatar || avatar)),
               like_count: likeCount,
               liked_by_me: likedByMe,
               comment_count: 0,  // thread UI fetches comments separately
@@ -1537,19 +1562,55 @@ export default {
               }
             }
 
+            // ── Batch-resolve origin device IDs ──
+            // Collect unique user_ids from posts, look up which belong to
+            // teran.origin via account_devices → accounts.  Same join path
+            // as PATCH /api/posts/:id ownership.  Single batched query.
+            const uniqueUserIds = [...new Set((posts ?? []).map((p: any) => String(p.user_id)).filter(Boolean))];
+            const _originDeviceIdSet: Set<string> = new Set();
+            if (uniqueUserIds.length > 0) {
+              const { data: _bindRows } = await sb(env)
+                .from("account_devices")
+                .select("device_id, account_id")
+                .in("device_id", uniqueUserIds);
+              if (_bindRows && (_bindRows as any[]).length > 0) {
+                const _accountIds = [...new Set((_bindRows as any[]).map((r: any) => r.account_id).filter(Boolean))];
+                const { data: _accRows } = await sb(env)
+                  .from("accounts")
+                  .select("id, teran_handle")
+                  .in("id", _accountIds)
+                  .eq("teran_handle", "teran.origin");
+                if (_accRows && (_accRows as any[]).length > 0) {
+                  const _originAccountIds = new Set((_accRows as any[]).map((r: any) => String(r.id)));
+                  for (const bindRow of (_bindRows as any[])) {
+                    if (_originAccountIds.has(String(bindRow.account_id))) {
+                      _originDeviceIdSet.add(String(bindRow.device_id));
+                    }
+                  }
+                }
+              }
+            }
+
             // Enrich posts with media, like_count, liked_by_me, comment_count
             enrichedPosts = (posts ?? []).map((p: any) => {
               let avatar = p.author_avatar;
               if (typeof avatar === "string" && avatar.startsWith("data:")) {
                 avatar = null;
               }
-              // Live identity overlay: prefer user_profiles values over post snapshot
+              // Live identity overlay: prefer user_profiles values over post snapshot.
+              // Exception: teran.origin posts skip profile overlay — canonical
+              // posts.author_name / posts.author_avatar are the source of truth.
               const profile = profileMap[p.author_id];
               const liveAvatar = profile?.avatar || null;
+              const isOriginPost = _originDeviceIdSet.has(String(p.user_id));
               return {
                 ...p,
-                author_name: getLiveDisplayName(profile) || p.author_name,
-                author_avatar: (p.uses_room_avatar ? avatar : (liveAvatar || avatar)),
+                author_name: isOriginPost
+                  ? p.author_name
+                  : (getLiveDisplayName(profile) || p.author_name),
+                author_avatar: isOriginPost
+                  ? (p.uses_room_avatar ? avatar : (p.author_avatar || avatar))
+                  : (p.uses_room_avatar ? avatar : (liveAvatar || avatar)),
                 media: mediaByPost[p.id] || [],
                 like_count: likeCounts[p.id] || 0,
                 liked_by_me: likedByActorSet.has(p.id),
