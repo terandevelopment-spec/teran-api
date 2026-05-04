@@ -2587,27 +2587,29 @@ export default {
               throw new HttpError(403, "FORBIDDEN", "You can only edit your own posts");
             }
 
+            // ── Resolve caller's origin status (teran.origin) ──
+            // Hoisted above eligibility guards so _isOriginEditor is available
+            // for both room and global code paths.
+            const { data: _patchBinding } = await sb(env)
+              .from("account_devices")
+              .select("account_id")
+              .eq("device_id", user_id)
+              .maybeSingle();
+
+            let _isOriginEditor = false;
+            if ((_patchBinding as any)?.account_id) {
+              const { data: _patchAccount } = await sb(env)
+                .from("accounts")
+                .select("teran_handle")
+                .eq("id", (_patchBinding as any).account_id)
+                .maybeSingle();
+              _isOriginEditor = (_patchAccount as any)?.teran_handle === "teran.origin";
+            }
+
             // ── Eligibility guards: main/global root status posts only ──
             // Exception: origin user (teran.origin) can edit posts in rooms they own.
             const roomId: string | null = (post as any).room_id ?? null;
             if (roomId && roomId !== "global") {
-              // Resolve caller's teran_handle via device → account chain
-              const { data: _patchBinding } = await sb(env)
-                .from("account_devices")
-                .select("account_id")
-                .eq("device_id", user_id)
-                .maybeSingle();
-
-              let _isOriginEditor = false;
-              if ((_patchBinding as any)?.account_id) {
-                const { data: _patchAccount } = await sb(env)
-                  .from("accounts")
-                  .select("teran_handle")
-                  .eq("id", (_patchBinding as any).account_id)
-                  .maybeSingle();
-                _isOriginEditor = (_patchAccount as any)?.teran_handle === "teran.origin";
-              }
-
               if (!_isOriginEditor) {
                 throw new HttpError(403, "FORBIDDEN", "Editing is only available for main/global posts");
               }
@@ -2661,8 +2663,20 @@ export default {
             const hasContentField = body.content !== undefined;
             const hasMediaField = body.media !== undefined;
 
-            if (!hasContentField && !hasMediaField) {
-              throw new HttpError(422, "VALIDATION_ERROR", "At least one of content or media must be provided");
+            // ── Identity fields: author_name, author_avatar, title ──
+            // Only teran.origin can update these canonical identity fields.
+            // Normal users who include them get a 403.
+            const hasAuthorNameField = body.author_name !== undefined;
+            const hasAuthorAvatarField = body.author_avatar !== undefined;
+            const hasTitleField = body.title !== undefined;
+            const hasIdentityFields = hasAuthorNameField || hasAuthorAvatarField || hasTitleField;
+
+            if (hasIdentityFields && !_isOriginEditor) {
+              throw new HttpError(403, "FORBIDDEN", "Identity fields (author_name, author_avatar, title) can only be updated by teran.origin");
+            }
+
+            if (!hasContentField && !hasMediaField && !hasIdentityFields) {
+              throw new HttpError(422, "VALIDATION_ERROR", "At least one of content, media, or identity fields must be provided");
             }
 
             let newContent: string | undefined = undefined;
@@ -2674,6 +2688,31 @@ export default {
               if (newContent.length > LIMIT_STATUS_CONTENT) {
                 throw new HttpError(400, "TEXT_TOO_LONG", `Max ${LIMIT_STATUS_CONTENT} characters`);
               }
+            }
+
+            // Parse identity fields (origin-only, already gated above)
+            let newAuthorName: string | undefined = undefined;
+            if (hasAuthorNameField) {
+              if (typeof body.author_name !== "string") {
+                throw new HttpError(422, "VALIDATION_ERROR", "author_name must be a string");
+              }
+              newAuthorName = body.author_name.trim() || undefined;
+            }
+
+            let newAuthorAvatar: string | undefined = undefined;
+            if (hasAuthorAvatarField) {
+              if (typeof body.author_avatar !== "string") {
+                throw new HttpError(422, "VALIDATION_ERROR", "author_avatar must be a string");
+              }
+              newAuthorAvatar = body.author_avatar.trim() || undefined;
+            }
+
+            let newTitle: string | undefined = undefined;
+            if (hasTitleField) {
+              if (typeof body.title !== "string" && body.title !== null) {
+                throw new HttpError(422, "VALIDATION_ERROR", "title must be a string or null");
+              }
+              newTitle = body.title === null ? "" : (typeof body.title === "string" ? body.title.trim() : undefined);
             }
 
             // ── Media patch parsing ──
@@ -2780,7 +2819,10 @@ export default {
             // ── Detect whether any real change was made ──
             const contentChanged = newContent !== undefined && newContent !== ((post as any).content ?? "");
             const mediaChanged = removedMedia.length > 0 || addMedia.length > 0;
-            const hasRealChange = contentChanged || mediaChanged;
+            const authorNameChanged = newAuthorName !== undefined && newAuthorName !== ((post as any).author_name ?? "");
+            const authorAvatarChanged = newAuthorAvatar !== undefined && newAuthorAvatar !== ((post as any).author_avatar ?? "");
+            const titleChanged = newTitle !== undefined && newTitle !== ((post as any).title ?? "");
+            const hasRealChange = contentChanged || mediaChanged || authorNameChanged || authorAvatarChanged || titleChanged;
 
             if (!hasRealChange) {
               // No-op: return current post + media as-is
@@ -2789,16 +2831,23 @@ export default {
               return ok(req, env, request_id, { post: noopPost });
             }
 
-            // ── Apply content update ──
+            // ── Apply canonical field updates ──
+            // Build a single update payload for all changed fields.
             const now = new Date().toISOString();
-            if (contentChanged) {
-              const { error: contentErr } = await sb(env)
+            const postUpdate: Record<string, unknown> = {};
+            if (contentChanged) postUpdate.content = newContent;
+            if (authorNameChanged) postUpdate.author_name = newAuthorName;
+            if (authorAvatarChanged) postUpdate.author_avatar = newAuthorAvatar;
+            if (titleChanged) postUpdate.title = newTitle;
+
+            if (Object.keys(postUpdate).length > 0) {
+              const { error: updateErr } = await sb(env)
                 .from("posts")
-                .update({ content: newContent } as any)
+                .update(postUpdate as any)
                 .eq("id", postId);
-              if (contentErr) {
-                console.error(`[PATCH post] content update error id=${postId}`, { error: contentErr.message, code: contentErr.code });
-                throw new HttpError(500, "DB_ERROR", `Content update failed: ${contentErr.message || "unknown"}`);
+              if (updateErr) {
+                console.error(`[PATCH post] canonical update error id=${postId}`, { error: updateErr.message, code: updateErr.code, fields: Object.keys(postUpdate) });
+                throw new HttpError(500, "DB_ERROR", `Post update failed: ${updateErr.message || "unknown"}`);
               }
             }
 
@@ -2871,6 +2920,9 @@ export default {
             const updatedPost: any = {
               ...(post as any),
               content: newContent !== undefined ? newContent : (post as any).content,
+              ...(newAuthorName !== undefined ? { author_name: newAuthorName } : {}),
+              ...(newAuthorAvatar !== undefined ? { author_avatar: newAuthorAvatar } : {}),
+              ...(newTitle !== undefined ? { title: newTitle } : {}),
               edited_at: now,
               media: finalMedia,
             };
@@ -2878,6 +2930,9 @@ export default {
             console.log(`[PATCH post] success id=${postId}`, {
               contentChanged,
               mediaChanged,
+              authorNameChanged,
+              authorAvatarChanged,
+              titleChanged,
               removed: removedMedia.length,
               added: addMedia.length,
               kept: keptMedia.length,
