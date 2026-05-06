@@ -2427,6 +2427,9 @@ export default {
               mode,
               moods,
               ...(resolved_room_anon_id ? { room_anon_id: resolved_room_anon_id } : {}),
+              uses_room_avatar: body?.uses_room_avatar === true,
+              uses_room_display_name: body?.uses_room_display_name === true,
+              show_in_feed: show_in_feed ?? false,
             };
           } catch (dbErr: any) {
             // Translate DB constraint / validation errors to 400
