@@ -146,6 +146,29 @@ async function ensureRoomAnonId(env: Env, roomId: string, userId: string): Promi
   }
 }
 
+/**
+ * Check if a room is the special "teran.origin" room.
+ * teran.origin rooms use per-post anonymous IDs instead of stable per-member IDs.
+ * Result is cached per-isolate to avoid repeated DB lookups.
+ */
+const _originRoomCache = new Map<string, boolean>();
+async function isOriginRoom(env: Env, roomId: string): Promise<boolean> {
+  if (_originRoomCache.has(roomId)) return _originRoomCache.get(roomId)!;
+  try {
+    const { data } = await sb(env)
+      .from("rooms")
+      .select("name")
+      .eq("id", roomId)
+      .maybeSingle();
+    const isOrigin = (data as any)?.name === "teran.origin";
+    _originRoomCache.set(roomId, isOrigin);
+    return isOrigin;
+  } catch (e: any) {
+    console.warn("[isOriginRoom] lookup failed (non-fatal)", { roomId, error: e?.message });
+    return false;
+  }
+}
+
 // --------- base64url ----------
 function b64urlEncode(bytes: ArrayBuffer): string {
   const bin = String.fromCharCode(...new Uint8Array(bytes));
@@ -2361,18 +2384,34 @@ export default {
 
           // ── Resolve room_anon_id from backend (source of truth) ──
           // Frontend-provided room_anon_id is intentionally ignored.
+          //
+          // Special rule: teran.origin gets a FRESH per-post anonymous ID every time.
+          // All other rooms use the stable per-member ID from room_members.
           const isRoomIdentityPost = body?.uses_room_avatar === true || body?.uses_room_display_name === true;
           let resolved_room_anon_id: string | null = null;
           if (isRoomIdentityPost && room_id && user_id) {
-            resolved_room_anon_id = await ensureRoomAnonId(env, room_id, user_id);
-            console.log(`[room_anon_id][POST /api/posts] resolved`, {
-              rid: request_id,
-              room_id,
-              user_id,
-              uses_room_avatar: body?.uses_room_avatar,
-              uses_room_display_name: body?.uses_room_display_name,
-              resolved_room_anon_id,
-            });
+            const _isOrigin = await isOriginRoom(env, room_id);
+            if (_isOrigin) {
+              // teran.origin: generate a fresh ID for every post (not stable)
+              resolved_room_anon_id = generateRoomAnonId();
+              console.log(`[room_anon_id][POST /api/posts] teran.origin fresh-per-post`, {
+                rid: request_id,
+                room_id,
+                user_id,
+                resolved_room_anon_id,
+              });
+            } else {
+              // Normal room: stable per-member ID from room_members
+              resolved_room_anon_id = await ensureRoomAnonId(env, room_id, user_id);
+              console.log(`[room_anon_id][POST /api/posts] resolved`, {
+                rid: request_id,
+                room_id,
+                user_id,
+                uses_room_avatar: body?.uses_room_avatar,
+                uses_room_display_name: body?.uses_room_display_name,
+                resolved_room_anon_id,
+              });
+            }
           }
 
           // Narrow select on insert: only return columns needed for response + post-insert logic
