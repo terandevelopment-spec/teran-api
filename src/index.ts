@@ -129,11 +129,16 @@ async function ensureRoomAnonId(env: Env, roomId: string, userId: string): Promi
     if ((memberRow as any).room_anon_id) return (memberRow as any).room_anon_id;
     // Generate and persist
     const newId = generateRoomAnonId();
-    await sb(env)
+    const { error: updateErr } = await sb(env)
       .from("room_members")
       .update({ room_anon_id: newId })
       .eq("room_id", roomId)
       .eq("user_id", userId);
+    if (updateErr) {
+      console.warn("[room_anon_id] UPDATE failed", { roomId, userId, error: updateErr.message });
+      return null;
+    }
+    console.log("[room_anon_id] generated", { roomId, userId, room_anon_id: newId });
     return newId;
   } catch (e: any) {
     console.warn("[room_anon_id] ensureRoomAnonId failed (non-fatal)", { roomId, userId, error: e?.message });
