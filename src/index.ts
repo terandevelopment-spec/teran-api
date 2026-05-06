@@ -2365,6 +2365,14 @@ export default {
           let resolved_room_anon_id: string | null = null;
           if (isRoomIdentityPost && room_id && user_id) {
             resolved_room_anon_id = await ensureRoomAnonId(env, room_id, user_id);
+            console.log(`[room_anon_id][POST /api/posts] resolved`, {
+              rid: request_id,
+              room_id,
+              user_id,
+              uses_room_avatar: body?.uses_room_avatar,
+              uses_room_display_name: body?.uses_room_display_name,
+              resolved_room_anon_id,
+            });
           }
 
           // Narrow select on insert: only return columns needed for response + post-insert logic
@@ -9592,6 +9600,13 @@ export default {
             let room_anon_id: string | null = null;
             if (avatar_mode === "room_icon") {
               room_anon_id = await ensureRoomAnonId(env, roomId, user_id);
+              console.log(`[room_anon_id][avatar-choice] resolved`, {
+                rid: request_id,
+                room_id: roomId,
+                user_id,
+                avatar_mode,
+                room_anon_id,
+              });
             }
 
             return ok(req, env, request_id, { avatar_mode, room_avatar_option_id, room_avatar_key, room_anon_id });
