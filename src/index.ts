@@ -100,6 +100,47 @@ function getLiveDisplayName(profile?: { display_name?: string | null } | null): 
   return value;
 }
 
+/**
+ * Generate a short, readable anonymous ID for room identity posts.
+ * 4 uppercase alphanumeric chars, avoiding confusing glyphs (O/0/I/1/l).
+ */
+function generateRoomAnonId(): string {
+  const SAFE = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  let id = "";
+  for (let i = 0; i < 4; i++) {
+    id += SAFE[Math.floor(Math.random() * SAFE.length)];
+  }
+  return id;
+}
+
+/**
+ * Ensure a room_members row has a room_anon_id. If missing, generate one
+ * and persist it. Returns the resolved anon ID.
+ */
+async function ensureRoomAnonId(env: Env, roomId: string, userId: string): Promise<string | null> {
+  try {
+    const { data: memberRow } = await sb(env)
+      .from("room_members")
+      .select("room_anon_id")
+      .eq("room_id", roomId)
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (!memberRow) return null; // not a member
+    if ((memberRow as any).room_anon_id) return (memberRow as any).room_anon_id;
+    // Generate and persist
+    const newId = generateRoomAnonId();
+    await sb(env)
+      .from("room_members")
+      .update({ room_anon_id: newId })
+      .eq("room_id", roomId)
+      .eq("user_id", userId);
+    return newId;
+  } catch (e: any) {
+    console.warn("[room_anon_id] ensureRoomAnonId failed (non-fatal)", { roomId, userId, error: e?.message });
+    return null;
+  }
+}
+
 // --------- base64url ----------
 function b64urlEncode(bytes: ArrayBuffer): string {
   const bin = String.fromCharCode(...new Uint8Array(bytes));
@@ -2313,6 +2354,14 @@ export default {
           }
           mark("root_resolved");
 
+          // ── Resolve room_anon_id from backend (source of truth) ──
+          // Frontend-provided room_anon_id is intentionally ignored.
+          const isRoomIdentityPost = body?.uses_room_avatar === true || body?.uses_room_display_name === true;
+          let resolved_room_anon_id: string | null = null;
+          if (isRoomIdentityPost && room_id && user_id) {
+            resolved_room_anon_id = await ensureRoomAnonId(env, room_id, user_id);
+          }
+
           // Narrow select on insert: only return columns needed for response + post-insert logic
           // Narrow select: only DB-generated values; reconstruct rest from input
           const POST_RETURN_COLS = "id, created_at";
@@ -2341,6 +2390,7 @@ export default {
                 last_activity_at: new Date().toISOString(),
                 uses_room_avatar: body?.uses_room_avatar === true,
                 ...(body?.uses_room_display_name === true ? { uses_room_display_name: true } : {}),
+                ...(resolved_room_anon_id ? { room_anon_id: resolved_room_anon_id } : {}),
               })
               .select(POST_RETURN_COLS)
               .maybeSingle();
@@ -2363,6 +2413,7 @@ export default {
               shared_post_id,
               mode,
               moods,
+              ...(resolved_room_anon_id ? { room_anon_id: resolved_room_anon_id } : {}),
             };
           } catch (dbErr: any) {
             // Translate DB constraint / validation errors to 400
@@ -8321,10 +8372,11 @@ export default {
             let my_avatar_mode: string | null = null;
             let my_room_avatar_key: string | null = null;
             let my_room_avatar_option_id: string | null = null;
+            let my_room_anon_id: string | null = null;
             if (uid && my_role) {
               const { data: memberRow } = await sb(env)
                 .from("room_members")
-                .select("avatar_mode, room_avatar_option_id, room_avatar_key")
+                .select("avatar_mode, room_avatar_option_id, room_avatar_key, room_anon_id")
                 .eq("room_id", roomId)
                 .eq("user_id", uid)
                 .maybeSingle();
@@ -8332,6 +8384,7 @@ export default {
                 my_avatar_mode = (memberRow as any).avatar_mode || null;
                 my_room_avatar_key = (memberRow as any).room_avatar_key || null;
                 my_room_avatar_option_id = (memberRow as any).room_avatar_option_id || null;
+                my_room_anon_id = (memberRow as any).room_anon_id || null;
               }
             }
 
@@ -8342,6 +8395,7 @@ export default {
               my_avatar_mode,
               my_room_avatar_key,
               my_room_avatar_option_id,
+              my_room_anon_id,
             };
             const payloadBytes = JSON.stringify(payload).length;
             const totalMs = performance.now() - tTotal;
@@ -9529,7 +9583,13 @@ export default {
               );
             if (upsertErr) throw new Error(upsertErr.message);
 
-            return ok(req, env, request_id, { avatar_mode, room_avatar_option_id, room_avatar_key });
+            // Ensure room_anon_id exists when selecting room identity
+            let room_anon_id: string | null = null;
+            if (avatar_mode === "room_icon") {
+              room_anon_id = await ensureRoomAnonId(env, roomId, user_id);
+            }
+
+            return ok(req, env, request_id, { avatar_mode, room_avatar_option_id, room_avatar_key, room_anon_id });
           }
         }
 
