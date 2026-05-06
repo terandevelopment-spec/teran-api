@@ -704,13 +704,13 @@ export default {
           // Build base query with conditional select:
           // - Feed lists: lightweight select (content included for card preview)
           // - Single post by id: include full data for PostDetail
-          const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods";
+          const feedSelectFields = "id,user_id,created_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,shared_post_id,genre,mode,moods,uses_room_avatar,uses_room_display_name";
           // NOTE: posts.room_id has no FK to rooms.id, so PostgREST cannot auto-join.
           //       Room metadata (icon, name) is attached manually in the light-mode transform below.
           // user_id is intentionally included here even in light mode:
           // ownership checks (e.g. appearance overrides) require it, and
           // omitting it causes String(undefined) !== jwt_sub → silent 403.
-          const lightSelectFields = "id,user_id,created_at,last_activity_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,show_in_feed,room_category,media(type,key,thumb_key)";
+          const lightSelectFields = "id,user_id,created_at,last_activity_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,show_in_feed,room_category,uses_room_avatar,uses_room_display_name,media(type,key,thumb_key)";
           const selectFields = light ? lightSelectFields : feedSelectFields;
 
           // Step 1: log normalized filter + select cols
@@ -1275,7 +1275,9 @@ export default {
               media: mediaRows,
               author_name: _singleIsOriginPost
                 ? singlePost.author_name
-                : (getLiveDisplayName(profile) || singlePost.author_name),
+                : singlePost.uses_room_display_name
+                  ? singlePost.author_name
+                  : (getLiveDisplayName(profile) || singlePost.author_name),
               author_avatar: _singleIsOriginPost
                 ? (singlePost.uses_room_avatar ? avatar : (singlePost.author_avatar || avatar))
                 : (singlePost.uses_room_avatar ? avatar : (profile?.avatar || avatar)),
@@ -1607,7 +1609,9 @@ export default {
                 ...p,
                 author_name: isOriginPost
                   ? p.author_name
-                  : (getLiveDisplayName(profile) || p.author_name),
+                  : p.uses_room_display_name
+                    ? p.author_name
+                    : (getLiveDisplayName(profile) || p.author_name),
                 author_avatar: isOriginPost
                   ? (p.uses_room_avatar ? avatar : (p.author_avatar || avatar))
                   : (p.uses_room_avatar ? avatar : (liveAvatar || avatar)),
@@ -2336,6 +2340,7 @@ export default {
                 room_category,
                 last_activity_at: new Date().toISOString(),
                 uses_room_avatar: body?.uses_room_avatar === true,
+                uses_room_display_name: body?.uses_room_display_name === true,
               })
               .select(POST_RETURN_COLS)
               .maybeSingle();
@@ -8397,6 +8402,11 @@ export default {
             }
             category = rawCategory;
           }
+
+          // ── Creator display name (optional, room identity) ──
+          const rawCreatorDisplayName = typeof body?.creator_display_name === "string" ? body.creator_display_name.trim().slice(0, 80) : null;
+          const creator_display_name = rawCreatorDisplayName || null;
+
           // ── Design fields (optional, from Step 2) ──
           const design = (body?.design && typeof body.design === "object") ? body.design : {};
           const header_bg_color = typeof design.headerBgColor === "string" ? design.headerBgColor.slice(0, 20) : null;
@@ -8550,6 +8560,7 @@ export default {
           insertObj.room_type = room_type;
           if (thread_card_style !== null) insertObj.thread_card_style = thread_card_style;
           if (social_reply_mode !== null) insertObj.social_reply_mode = social_reply_mode;
+          if (creator_display_name !== null) insertObj.creator_display_name = creator_display_name;
 
           const { data: room, error } = await sb(env)
             .from("rooms")
@@ -8730,6 +8741,15 @@ export default {
                 throw new HttpError(422, "VALIDATION_ERROR", "Invalid category");
               }
               updates.category = cat;
+            }
+            // ── Creator display name ──
+            if (body?.creator_display_name !== undefined) {
+              if (typeof body.creator_display_name === "string") {
+                const cdn = body.creator_display_name.trim().slice(0, 80);
+                updates.creator_display_name = cdn || null;
+              } else {
+                updates.creator_display_name = null;
+              }
             }
 
             // ── Design fields ──
