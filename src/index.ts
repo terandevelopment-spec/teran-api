@@ -992,7 +992,49 @@ export default {
             }
           }
 
-          if (isReplyQuery) {
+          if (id_param && !isReplyQuery) {
+            // ── Direct PostgREST fetch for single-post by ID ──
+            // Bypasses Supabase JS client overhead (~20-40ms) for the most
+            // latency-sensitive path. Same pattern as the reply query below.
+            const parsedId = Number(id_param);
+            const restUrl = `${env.SUPABASE_URL}/rest/v1/posts?select=${encodeURIComponent(selectFields)}&id=eq.${parsedId}&deleted_at=is.null&limit=1`;
+
+            const tFetchStart = performance.now();
+            const res = await fetch(restUrl, {
+              method: "GET",
+              headers: {
+                "apikey": env.SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                "Accept": "application/json",
+              },
+            });
+            const tFetchEnd = performance.now();
+
+            if (!res.ok) {
+              const errBody = await res.text().catch(() => "");
+              throw new Error(`PostgREST single-post ${res.status}: ${errBody}`);
+            }
+
+            const rawBody = await res.text();
+            const tTextEnd = performance.now();
+            posts = JSON.parse(rawBody);
+            const tParseEnd = performance.now();
+
+            const httpMs = +(tFetchEnd - tFetchStart).toFixed(1);
+            const parseMs = +((tTextEnd - tFetchEnd) + (tParseEnd - tTextEnd)).toFixed(1);
+            postsQueryMs = Math.round(tParseEnd - tFetchStart);
+
+            console.log(`[perf] /api/posts single_post_direct`, JSON.stringify({
+              rid: request_id,
+              id: parsedId,
+              http_ms: httpMs,
+              parse_ms: parseMs,
+              total_ms: postsQueryMs,
+              rows: posts?.length ?? 0,
+              server_timing: res.headers.get("server-timing") ?? "none",
+              cf_cache: res.headers.get("cf-cache-status") ?? "none",
+            }));
+          } else if (isReplyQuery) {
             // ── Direct PostgREST fetch for reply queries: HTTP timing + header capture ──
             const parsedPpid = Number(parent_post_id_param);
             let restUrl = `${env.SUPABASE_URL}/rest/v1/posts?select=${encodeURIComponent(selectFields)}&root_post_id=eq.${parsedPpid}&parent_post_id=not.is.null&deleted_at=is.null&order=created_at.desc,id.desc&limit=${lim}`;
