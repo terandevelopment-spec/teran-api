@@ -3433,42 +3433,101 @@ export default {
         }
 
         // GET /api/comments/counts?post_ids=1,2,3 - Get comment counts for multiple posts (public)
+        // Edge-cached (Cache API, 30s TTL) — mirrors /api/comments/preview pattern.
         if (path === "/api/comments/counts" && req.method === "GET") {
+          const COUNTS_CACHE_TTL = 30; // seconds
           const t0 = Date.now();
-          const postIdsParam = url.searchParams.get("post_ids") || "";
-          const postIds = postIdsParam
-            .split(",")
-            .map(s => parseInt(s.trim(), 10))
-            .filter(n => Number.isFinite(n) && n > 0)
-            .slice(0, 200); // Limit to 200
+          const rid = request_id;
+          let idsCount = 0;
+          try {
+            const postIdsParam = url.searchParams.get("post_ids") || "";
+            const postIds = postIdsParam
+              .split(",")
+              .map(s => parseInt(s.trim(), 10))
+              .filter(n => Number.isFinite(n) && n > 0)
+              .slice(0, 200); // Limit to 200
+            idsCount = postIds.length;
 
-          if (postIds.length === 0) {
-            return ok(req, env, request_id, { counts: {} });
+            if (postIds.length === 0) {
+              return ok(req, env, request_id, { counts: {} });
+            }
+
+            // Stable cache key: sorted IDs → SHA-256 hash (short, deterministic URL)
+            const sortedKey = [...postIds].sort((a, b) => a - b).join(",");
+            const cacheKeyData = `comments_counts:v1:${sortedKey}`;
+            const cacheKeyHash = await sha256Hex(cacheKeyData);
+            const cacheKey = new Request(`https://cache.internal/comments/counts/${cacheKeyHash}`, { method: "GET" });
+            const cache = caches.default;
+            const cached = await cache.match(cacheKey);
+            const tCache = Date.now();
+
+            if (cached) {
+              const hitBody = await cached.text();
+              console.log(`[perf] /api/comments/counts`, JSON.stringify({ rid, cache: "HIT", total_ms: Date.now() - t0, ids_count: idsCount, hash: cacheKeyHash.slice(0, 12), payloadBytes: hitBody.length }));
+              return new Response(hitBody, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Request-Id": request_id,
+                  "X-Cache": "HIT",
+                  "X-Cache-Key": cacheKeyHash.slice(0, 12),
+                  ...corsHeaders(req, env),
+                },
+              });
+            }
+
+            // Cache MISS — query DB
+            const tDb = Date.now();
+            const { data: countRows, error } = await sb(env)
+              .from("comments")
+              .select("post_id")
+              .in("post_id", postIds);
+            const dbMs = Date.now() - tDb;
+            if (error) throw error;
+
+            // Build response — tally rows by post_id
+            const counts: Record<string, number> = {};
+            for (const id of postIds) {
+              counts[String(id)] = 0;
+            }
+            for (const row of countRows ?? []) {
+              const key = String((row as any).post_id);
+              counts[key] = (counts[key] || 0) + 1;
+            }
+
+            const responseBody = { counts, request_id };
+            const body = JSON.stringify(responseBody);
+
+            // Store in edge cache (fire-and-forget via ctx.waitUntil)
+            ctx.waitUntil(
+              cache.put(cacheKey, new Response(body, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Cache-Control": `public, max-age=${COUNTS_CACHE_TTL}`,
+                },
+              }))
+                .then(() => console.log(`[cache] comments/counts put ok rid=${rid} ids=${idsCount} hash=${cacheKeyHash.slice(0, 12)}`))
+                .catch((err) => console.error(`[cache] comments/counts put fail rid=${rid} hash=${cacheKeyHash.slice(0, 12)}`, err))
+            );
+
+            const totalMs = Date.now() - t0;
+            console.log(`[perf] /api/comments/counts`, JSON.stringify({ rid, cache: "MISS", cache_check_ms: tCache - t0, db_ms: dbMs, total_ms: totalMs, ids_count: idsCount, hash: cacheKeyHash.slice(0, 12), payloadBytes: body.length }));
+
+            return new Response(body, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+                "X-Cache": "MISS",
+                "X-Cache-Key": cacheKeyHash.slice(0, 12),
+                ...corsHeaders(req, env),
+              },
+            });
+          } catch (err: any) {
+            console.log(`[perf] /api/comments/counts rid=${rid} total=${Date.now() - t0}ms ids=${idsCount} error=1 msg=${err?.message?.slice(0, 100)}`);
+            throw err;
           }
-
-          // Count actual comments from the comments table (not reply-posts from posts table)
-          const tDb = Date.now();
-          const { data: countRows, error } = await sb(env)
-            .from("comments")
-            .select("post_id")
-            .in("post_id", postIds);
-          const dbMs = Date.now() - tDb;
-          if (error) throw error;
-
-          // Build response — tally rows by post_id
-          const counts: Record<string, number> = {};
-          for (const id of postIds) {
-            counts[String(id)] = 0;
-          }
-          for (const row of countRows ?? []) {
-            const key = String((row as any).post_id);
-            counts[key] = (counts[key] || 0) + 1;
-          }
-
-          const totalMs = Date.now() - t0;
-          console.log(`[perf] /api/comments/counts`, JSON.stringify({ rid: request_id, db_ms: dbMs, total_ms: totalMs, post_ids: postIds.length }));
-
-          return ok(req, env, request_id, { counts });
         }
 
         // GET /api/comments/preview?post_ids=1,2,3&per_post=1 (Cache API, 60s TTL)
