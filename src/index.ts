@@ -1497,23 +1497,53 @@ export default {
             // This eliminates a ~110ms Supabase round-trip for room feeds.
             const singleRoomFeed = room_id_param && roomIds.length <= 1;
             let roomDbMs = 0;
+            let roomCacheStatus = "SKIP";
 
             if (roomIds.length > 0 && !singleRoomFeed) {
               try {
-                const tRoomDb = performance.now();
-                const { data: roomRows } = await sb(env)
-                  .from("rooms")
-                  .select("id, name, icon_key, icon_thumb_key")
-                  .in("id", roomIds);
-                roomDbMs = performance.now() - tRoomDb;
-                const roomMap: Record<string, any> = {};
-                for (const r of (roomRows ?? [])) {
-                  roomMap[(r as any).id] = {
-                    icon_key: (r as any).icon_key ?? null,
-                    icon_thumb_key: (r as any).icon_thumb_key ?? null,
-                    name: (r as any).name ?? null,
-                  };
+                // ── Cache API for room metadata (rarely changes, 5m TTL) ──
+                const ROOM_META_TTL = 300; // 5 minutes
+                const sortedRoomIds = [...roomIds].sort();
+                const roomCacheData = `room_meta:v1:${sortedRoomIds.join(",")}`;
+                const roomCacheHash = await sha256Hex(roomCacheData);
+                const roomCacheReq = new Request(`https://cache.internal/room-meta/${roomCacheHash}`, { method: "GET" });
+                const edgeCache = caches.default;
+                const cachedRoomMeta = await edgeCache.match(roomCacheReq);
+
+                let roomMap: Record<string, any> = {};
+
+                if (cachedRoomMeta) {
+                  roomCacheStatus = "HIT";
+                  roomMap = await cachedRoomMeta.json();
+                } else {
+                  roomCacheStatus = "MISS";
+                  const tRoomDb = performance.now();
+                  const { data: roomRows } = await sb(env)
+                    .from("rooms")
+                    .select("id, name, icon_key, icon_thumb_key")
+                    .in("id", roomIds);
+                  roomDbMs = performance.now() - tRoomDb;
+                  for (const r of (roomRows ?? [])) {
+                    roomMap[(r as any).id] = {
+                      icon_key: (r as any).icon_key ?? null,
+                      icon_thumb_key: (r as any).icon_thumb_key ?? null,
+                      name: (r as any).name ?? null,
+                    };
+                  }
+                  // Fire-and-forget cache put
+                  ctx.waitUntil(
+                    edgeCache.put(roomCacheReq, new Response(JSON.stringify(roomMap), {
+                      status: 200,
+                      headers: {
+                        "Content-Type": "application/json",
+                        "Cache-Control": `public, max-age=${ROOM_META_TTL}`,
+                      },
+                    }))
+                      .then(() => console.log(`[cache] room-meta put ok rid=${request_id} rooms=${roomIds.length} hash=${roomCacheHash.slice(0, 12)}`))
+                      .catch((err) => console.error(`[cache] room-meta put fail rid=${request_id}`, err))
+                  );
                 }
+
                 enrichedPosts = lightPosts.map((p: any) =>
                   p.room_id && roomMap[p.room_id]
                     ? { ...p, room: roomMap[p.room_id] }
@@ -1528,7 +1558,7 @@ export default {
             }
             mediaRows = []; // not used in light mode, but keep variable populated for downstream logging
             p5 = performance.now();
-            console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} media_rows=${totalMediaRows} media_embed=true transform_ms=${(p5 - p4).toFixed(1)} js_ms=${tJsTransform.toFixed(1)} room_db_ms=${roomDbMs.toFixed(1)} room_ids=${roomIds.length} single_room=${singleRoomFeed} skip=likes,commentCounts,teranId,mediaSeparateFetch`);
+            console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} media_rows=${totalMediaRows} media_embed=true transform_ms=${(p5 - p4).toFixed(1)} js_ms=${tJsTransform.toFixed(1)} room_db_ms=${roomDbMs.toFixed(1)} room_cache=${roomCacheStatus} room_ids=${roomIds.length} single_room=${singleRoomFeed} skip=likes,commentCounts,teranId,mediaSeparateFetch`);
           } else {
             // Parallel fetch: media + likes + comment counts
             const parallelStart = Date.now();
