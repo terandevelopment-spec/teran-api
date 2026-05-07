@@ -8376,31 +8376,36 @@ export default {
             let my_role: string | null = uid ? await checkRoomMembership(env, roomId, uid) : null;
             const membershipMs = performance.now() - tMembership;
 
-            // ── Origin owner fallback (edge-cached identity) ────────────
-            // Caches uid → { accountId, isOrigin, siblingIds } so repeated
-            // room opens skip the 3 serial Supabase queries (~245ms).
+            // ── Origin owner fallback (KV-cached identity) ─────────────
+            // Caches uid → { isOrigin, siblingIds } in PROFILE_KV so repeated
+            // room opens skip the 3 serial Supabase queries (~300ms).
             // Normal users are cached as isOrigin=false and skip immediately.
             // TTL 60s — origin status and device bindings are stable.
+            // Previously used caches.default (Cache API) but it was unreliable
+            // with Smart Placement — always MISS despite successful PUT.
             let originFbMs = 0;
             let originFbCache = "SKIP";
             if (uid && my_role !== "owner") {
               const tOriginFb = performance.now();
 
-              const ORIGIN_CACHE_TTL = 60; // seconds
-              const originCacheKeyUrl = `https://cache.internal/origin-identity/${uid}`;
-              const originCacheKey = new Request(originCacheKeyUrl, { method: "GET" });
-              const edgeCache = caches.default;
+              const ORIGIN_KV_TTL = 60; // seconds
+              const originKvKey = `origin_identity:v1:${uid}`;
 
-              let originInfo: { accountId: string | null; isOrigin: boolean; siblingIds: string[] } | null = null;
+              type OriginInfo = { isOrigin: boolean; siblingIds: string[] };
+              let originInfo: OriginInfo | null = null;
 
-              const cachedOriginRes = await edgeCache.match(originCacheKey);
-              if (cachedOriginRes) {
-                originInfo = await cachedOriginRes.json();
-                originFbCache = "HIT";
-                console.log(`[perf] origin-identity cache MATCH HIT uid=${uid} key=${originCacheKeyUrl}`);
-              } else {
+              try {
+                const kvRaw = await env.PROFILE_KV.get(originKvKey, "text");
+                if (kvRaw) {
+                  originInfo = JSON.parse(kvRaw) as OriginInfo;
+                  originFbCache = "HIT";
+                }
+              } catch (_e) {
+                // KV read failed — fall through to DB
+              }
+
+              if (!originInfo) {
                 originFbCache = "MISS";
-                console.log(`[perf] origin-identity cache MATCH MISS uid=${uid} read_key=${originCacheKeyUrl}`);
                 // Q1: account_devices → account_id
                 const { data: _roleBinding } = await sb(env)
                   .from("account_devices")
@@ -8428,33 +8433,17 @@ export default {
                     _siblingIds = (_roleSiblings ?? []).map((r: any) => String(r.device_id));
                   }
 
-                  originInfo = { accountId: _accountId, isOrigin: _isOrigin, siblingIds: _siblingIds };
+                  originInfo = { isOrigin: _isOrigin, siblingIds: _siblingIds };
                 } else {
                   // No account binding — not a logged-in user
-                  originInfo = { accountId: null, isOrigin: false, siblingIds: [] };
+                  originInfo = { isOrigin: false, siblingIds: [] };
                 }
 
-                // Write to edge cache via ctx.waitUntil so the write survives
-                // past the response. Plain fire-and-forget was silently killed
-                // by the Workers runtime because the response was sent shortly
-                // after the put — unlike the room cache put which has ~500ms
-                // of subsequent processing to complete in.
-                const originCacheBody = JSON.stringify(originInfo);
-                const originCacheWriteKey = `https://cache.internal/origin-identity/${uid}`;
+                // Write to KV (fire-and-forget via waitUntil)
                 ctx.waitUntil(
-                  edgeCache.put(
-                    new Request(originCacheWriteKey, { method: "GET" }),
-                    new Response(originCacheBody, {
-                      headers: {
-                        "Content-Type": "application/json",
-                        "Cache-Control": `public, max-age=${ORIGIN_CACHE_TTL}`,
-                      },
-                    })
-                  ).then(() => {
-                    console.log(`[perf] origin-identity cache PUT ok uid=${uid} isOrigin=${originInfo!.isOrigin} key=${originCacheWriteKey}`);
-                  }).catch((err: any) => {
-                    console.warn(`[perf] origin-identity cache PUT failed uid=${uid}`, err);
-                  })
+                  env.PROFILE_KV.put(originKvKey, JSON.stringify(originInfo), { expirationTtl: ORIGIN_KV_TTL })
+                    .then(() => console.log(`[perf] origin-identity KV PUT ok key=${originKvKey} isOrigin=${originInfo!.isOrigin}`))
+                    .catch((err: any) => console.warn(`[perf] origin-identity KV PUT failed key=${originKvKey}`, err))
                 );
               }
 
@@ -8464,7 +8453,7 @@ export default {
                 const ownerMatch = originInfo.siblingIds.some(id => id === roomOwnerId);
                 if (ownerMatch) {
                   my_role = "owner";
-                  console.log(`[rooms] origin owner fallback: elevated my_role to owner (cache=${originFbCache})`, { room_id: roomId, uid });
+                  console.log(`[rooms] origin owner fallback: elevated my_role to owner (kv=${originFbCache})`, { room_id: roomId, uid });
                 }
               }
 
@@ -8529,7 +8518,7 @@ export default {
             const payloadBytes = JSON.stringify(payload).length;
             const totalMs = performance.now() - tTotal;
 
-            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: +enrichMs.toFixed(1), enrich_detail: { auth_ms: +authMs.toFixed(1), membership_ms: +membershipMs.toFixed(1), origin_fb_ms: +originFbMs.toFixed(1), origin_fb_cache: originFbCache }, parallel_ms: +parallelMs.toFixed(1), avatar_opts: wantAvatarOpts, total_ms: +totalMs.toFixed(1), rows_room: 1, avatar_opts_count: (avatarOptions ?? []).length, payload_bytes: payloadBytes, caller }));
+            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: +enrichMs.toFixed(1), enrich_detail: { auth_ms: +authMs.toFixed(1), membership_ms: +membershipMs.toFixed(1), origin_fb_ms: +originFbMs.toFixed(1), origin_fb_kv: originFbCache }, parallel_ms: +parallelMs.toFixed(1), avatar_opts: wantAvatarOpts, total_ms: +totalMs.toFixed(1), rows_room: 1, avatar_opts_count: (avatarOptions ?? []).length, payload_bytes: payloadBytes, caller }));
 
             return ok(req, env, request_id, payload);
           }
