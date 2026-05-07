@@ -14,6 +14,7 @@ export interface Env {
   R2_SECRET_ACCESS_KEY: string;
   R2_ACCOUNT_ID: string;         // CF account id
   DIAG_LOG?: string;             // "1" to enable sampled request-start logs
+  TERAN_ORIGIN_UIDS?: string;    // comma-separated device UIDs for teran.origin owner fast-path
 }
 
 // --------- request_id + response helpers ----------
@@ -8316,37 +8317,12 @@ export default {
               const mUid = await optionalAuth(req, env);
               let mRole: string | null = mUid ? await checkRoomMembership(env, roomId, mUid) : null;
 
-              // Origin owner fallback (same pattern as full enrichment path)
+              // Origin owner fast-path: allowlist check (~0ms vs ~300ms DB chain)
               if (mUid && mRole !== "owner") {
-                const { data: _mBinding } = await sb(env)
-                  .from("account_devices")
-                  .select("account_id")
-                  .eq("device_id", mUid)
-                  .maybeSingle();
-                if ((_mBinding as any)?.account_id) {
-                  const { data: _mAccount } = await sb(env)
-                    .from("accounts")
-                    .select("teran_handle")
-                    .eq("id", (_mBinding as any).account_id)
-                    .maybeSingle();
-                  if ((_mAccount as any)?.teran_handle === "teran.origin") {
-                    const roomOwnerId = String((room as any).owner_id);
-                    let ownerMatch = roomOwnerId === String(mUid);
-                    if (!ownerMatch) {
-                      const { data: _mSiblings } = await sb(env)
-                        .from("account_devices")
-                        .select("device_id")
-                        .eq("account_id", (_mBinding as any).account_id);
-                      if (_mSiblings) {
-                        const sibIds = new Set((_mSiblings as any[]).map((r: any) => String(r.device_id)));
-                        ownerMatch = sibIds.has(roomOwnerId);
-                      }
-                    }
-                    if (ownerMatch) {
-                      mRole = "owner";
-                      console.log(`[rooms] origin owner fallback (membership): elevated my_role to owner`, { room_id: roomId, uid: mUid });
-                    }
-                  }
+                const originUids = (env.TERAN_ORIGIN_UIDS || "").split(",").filter(Boolean);
+                if (originUids.includes(mUid)) {
+                  mRole = "owner";
+                  console.log(`[rooms] origin owner fast-path (membership): uid=${mUid}`, { room_id: roomId });
                 }
               }
               const enrichMemberMs = performance.now() - tEnrichM;
@@ -8376,91 +8352,21 @@ export default {
             let my_role: string | null = uid ? await checkRoomMembership(env, roomId, uid) : null;
             const membershipMs = performance.now() - tMembership;
 
-            // ── Origin owner fallback (KV-cached identity) ─────────────
-            // Caches uid → { isOrigin, siblingIds } in PROFILE_KV so repeated
-            // room opens skip the 3 serial Supabase queries (~300ms).
-            // Normal users are cached as isOrigin=false and skip immediately.
-            // TTL 60s — origin status and device bindings are stable.
-            // Previously used caches.default (Cache API) but it was unreliable
-            // with Smart Placement — always MISS despite successful PUT.
+            // ── Origin owner fast-path (env allowlist) ───────────────────
+            // Deterministic O(1) check: if uid is in TERAN_ORIGIN_UIDS,
+            // immediately elevate to owner. No DB queries, no KV, no cache.
+            // Replaces the previous 3-query DB chain (~300-1200ms) and the
+            // broken Cache API / KV caching attempts.
             let originFbMs = 0;
-            let originFbCache = "SKIP";
+            let originFbFastPath = false;
             if (uid && my_role !== "owner") {
               const tOriginFb = performance.now();
-
-              const ORIGIN_KV_TTL = 60; // seconds
-              const originKvKey = `origin_identity:v1:${uid}`;
-
-              type OriginInfo = { isOrigin: boolean; siblingIds: string[] };
-              let originInfo: OriginInfo | null = null;
-
-              try {
-                const kvRaw = await env.PROFILE_KV.get(originKvKey, "text");
-                console.log(`[perf] origin-identity KV GET key=${originKvKey} raw=${kvRaw ? kvRaw.substring(0, 80) : "null"}`);
-                if (kvRaw) {
-                  originInfo = JSON.parse(kvRaw) as OriginInfo;
-                  originFbCache = "HIT";
-                }
-              } catch (_e) {
-                console.warn(`[perf] origin-identity KV GET failed key=${originKvKey}`, _e);
+              const originUids = (env.TERAN_ORIGIN_UIDS || "").split(",").filter(Boolean);
+              if (originUids.includes(uid)) {
+                my_role = "owner";
+                originFbFastPath = true;
+                console.log(`[rooms] origin owner fast-path: uid=${uid}`, { room_id: roomId });
               }
-
-              if (!originInfo) {
-                originFbCache = "MISS";
-                // Q1: account_devices → account_id
-                const { data: _roleBinding } = await sb(env)
-                  .from("account_devices")
-                  .select("account_id")
-                  .eq("device_id", uid)
-                  .maybeSingle();
-
-                if ((_roleBinding as any)?.account_id) {
-                  const _accountId = (_roleBinding as any).account_id;
-                  // Q2: accounts → teran_handle
-                  const { data: _roleAccount } = await sb(env)
-                    .from("accounts")
-                    .select("teran_handle")
-                    .eq("id", _accountId)
-                    .maybeSingle();
-                  const _isOrigin = (_roleAccount as any)?.teran_handle === "teran.origin";
-
-                  // Q3: siblings (only for origin users — normal users never need this)
-                  let _siblingIds: string[] = [];
-                  if (_isOrigin) {
-                    const { data: _roleSiblings } = await sb(env)
-                      .from("account_devices")
-                      .select("device_id")
-                      .eq("account_id", _accountId);
-                    _siblingIds = (_roleSiblings ?? []).map((r: any) => String(r.device_id));
-                  }
-
-                  originInfo = { isOrigin: _isOrigin, siblingIds: _siblingIds };
-                } else {
-                  // No account binding — not a logged-in user
-                  originInfo = { isOrigin: false, siblingIds: [] };
-                }
-
-                // Write to KV — awaited inline (not deferred) so the next
-                // request is guaranteed to find it. The ~5ms PUT cost is
-                // negligible compared to the ~300ms it saves on the next hit.
-                try {
-                  await env.PROFILE_KV.put(originKvKey, JSON.stringify(originInfo), { expirationTtl: ORIGIN_KV_TTL });
-                  console.log(`[perf] origin-identity KV PUT ok key=${originKvKey} isOrigin=${originInfo.isOrigin}`);
-                } catch (putErr: any) {
-                  console.warn(`[perf] origin-identity KV PUT failed key=${originKvKey}`, putErr);
-                }
-              }
-
-              // Elevate to owner if origin + room owner matches a sibling
-              if (originInfo?.isOrigin) {
-                const roomOwnerId = String((room as any).owner_id);
-                const ownerMatch = originInfo.siblingIds.some(id => id === roomOwnerId);
-                if (ownerMatch) {
-                  my_role = "owner";
-                  console.log(`[rooms] origin owner fallback: elevated my_role to owner (kv=${originFbCache})`, { room_id: roomId, uid });
-                }
-              }
-
               originFbMs = performance.now() - tOriginFb;
             }
             const enrichMs = performance.now() - tEnrich;
@@ -8522,7 +8428,7 @@ export default {
             const payloadBytes = JSON.stringify(payload).length;
             const totalMs = performance.now() - tTotal;
 
-            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: +enrichMs.toFixed(1), enrich_detail: { auth_ms: +authMs.toFixed(1), membership_ms: +membershipMs.toFixed(1), origin_fb_ms: +originFbMs.toFixed(1), origin_fb_kv: originFbCache }, parallel_ms: +parallelMs.toFixed(1), avatar_opts: wantAvatarOpts, total_ms: +totalMs.toFixed(1), rows_room: 1, avatar_opts_count: (avatarOptions ?? []).length, payload_bytes: payloadBytes, caller }));
+            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: +enrichMs.toFixed(1), enrich_detail: { auth_ms: +authMs.toFixed(1), membership_ms: +membershipMs.toFixed(1), origin_fb_ms: +originFbMs.toFixed(1), origin_fast_path: originFbFastPath }, parallel_ms: +parallelMs.toFixed(1), avatar_opts: wantAvatarOpts, total_ms: +totalMs.toFixed(1), rows_room: 1, avatar_opts_count: (avatarOptions ?? []).length, payload_bytes: payloadBytes, caller }));
 
             return ok(req, env, request_id, payload);
           }
