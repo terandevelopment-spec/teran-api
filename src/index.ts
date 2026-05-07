@@ -699,14 +699,21 @@ export default {
           const p1 = performance.now();
 
           // ── Edge cache: eligible for public, non-personalized feeds ──
-          // Allow the standard scoped main feed (post_type=status, root_only, room_scope=global)
+          // Allow scoped main feeds (status/global, thread/root, rooms/root)
           // as well as the legacy unfiltered feed.
           const hasPersonalizedFilters = !!mode_param || !!mood_param || !!q_param || !!room_category_param || include_global_param === "0";
+          const isRootOnly = root_only_param === "1" || root_only_param === "true";
           const isStandardScopedFeed = (
-            post_type_param === "status" &&
-            (root_only_param === "1" || root_only_param === "true") &&
-            room_scope_param === "global" &&
-            !hasPersonalizedFilters
+            !hasPersonalizedFilters &&
+            isRootOnly &&
+            (
+              // Home global status feed
+              (post_type_param === "status" && room_scope_param === "global") ||
+              // Wire thread feed
+              (post_type_param === "thread" && !room_scope_param) ||
+              // Wire rooms feed
+              (!post_type_param && room_scope_param === "rooms")
+            )
           );
           // Feed cache: non-reply, non-cursored, non-user-specific queries
           const isFeed = !id_param && !user_id_param && !author_id_param && !isReplyQuery && !cursor && !room_id_param && (!hasPersonalizedFilters) && (!parent_post_id_param) && (isStandardScopedFeed || (!post_type_param && !root_only_param && !room_scope_param));
@@ -723,6 +730,7 @@ export default {
             if (room_scope_param) cacheUrl.searchParams.set("rs", room_scope_param);
             if (room_category_param) cacheUrl.searchParams.set("rc", room_category_param);
             if (include_global_param) cacheUrl.searchParams.set("ig", include_global_param);
+            if (light) cacheUrl.searchParams.set("lt", "1");
             feedCacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
             const cacheT0 = performance.now();
@@ -1166,6 +1174,7 @@ export default {
           // Fast path: no posts => return immediately
           // NOTE: postIds is computed AFTER the privacy filter below.
           // ── Privacy filter: exclude posts from private rooms ──
+          const tPrivacy = performance.now();
           // Rules:
           //   • Specific-room queries (room_id_param set): SKIP — membership already verified upstream.
           //   • User-scoped queries (user_id or author_id): Allow owner/member private posts
@@ -1186,10 +1195,37 @@ export default {
               const isUserScopedQuery = !!(user_id_param || author_id_param);
 
               // Batch-fetch visibility + owner for all rooms in the result set
-              const { data: roomVisRows } = await sb(env)
-                .from("rooms")
-                .select("id, visibility, owner_id")
-                .in("id", roomIdsInResult);
+              // ── Cache API for room visibility (120s TTL) ──
+              const ROOM_VIS_TTL = 120;
+              const sortedVisIds = [...roomIdsInResult].sort();
+              const visCacheHash = await sha256Hex(`room_vis:v1:${sortedVisIds.join(",")}`);
+              const visCacheReq = new Request(`https://cache.internal/room-vis/${visCacheHash}`, { method: "GET" });
+              const visCache = caches.default;
+              const cachedVis = await visCache.match(visCacheReq);
+
+              let roomVisRows: any[] | null;
+              if (cachedVis) {
+                roomVisRows = await cachedVis.json();
+                console.log(`[cache] room-vis HIT rid=${request_id} rooms=${roomIdsInResult.length} hash=${visCacheHash.slice(0, 12)}`);
+              } else {
+                const { data } = await sb(env)
+                  .from("rooms")
+                  .select("id, visibility, owner_id")
+                  .in("id", roomIdsInResult);
+                roomVisRows = data;
+                // Fire-and-forget cache put
+                ctx.waitUntil(
+                  visCache.put(visCacheReq, new Response(JSON.stringify(data ?? []), {
+                    status: 200,
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Cache-Control": `public, max-age=${ROOM_VIS_TTL}`,
+                    },
+                  }))
+                    .then(() => console.log(`[cache] room-vis put ok rid=${request_id} rooms=${roomIdsInResult.length} hash=${visCacheHash.slice(0, 12)}`))
+                    .catch(() => {})
+                );
+              }
 
               // Build set of private room IDs
               const privateRoomIds = new Set<string>();
@@ -1265,6 +1301,7 @@ export default {
               }
             }
           }
+          const privacyMs = +(performance.now() - tPrivacy).toFixed(1);
 
           // Compute postIds AFTER privacy filter so removed posts don't participate in downstream queries
           const postIds = (posts ?? []).map((p: any) => p.id);
@@ -1558,7 +1595,7 @@ export default {
             }
             mediaRows = []; // not used in light mode, but keep variable populated for downstream logging
             p5 = performance.now();
-            console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} media_rows=${totalMediaRows} media_embed=true transform_ms=${(p5 - p4).toFixed(1)} js_ms=${tJsTransform.toFixed(1)} room_db_ms=${roomDbMs.toFixed(1)} room_cache=${roomCacheStatus} room_ids=${roomIds.length} single_room=${singleRoomFeed} skip=likes,commentCounts,teranId,mediaSeparateFetch`);
+            console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} media_rows=${totalMediaRows} media_embed=true transform_ms=${(p5 - p4).toFixed(1)} js_ms=${tJsTransform.toFixed(1)} room_db_ms=${roomDbMs.toFixed(1)} room_cache=${roomCacheStatus} room_ids=${roomIds.length} single_room=${singleRoomFeed} privacy_ms=${privacyMs} skip=likes,commentCounts,teranId,mediaSeparateFetch`);
           } else {
             // Parallel fetch: media + likes + comment counts
             const parallelStart = Date.now();
