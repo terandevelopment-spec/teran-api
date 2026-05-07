@@ -5528,7 +5528,7 @@ export default {
 
           if (cachedResponse) {
             // ─── CACHE HIT ───
-            console.log(`[cache] blocks/relations HIT rid=${request_id} url=${cacheUrl.slice(0, 100)} userCount=${userIds.length}`);
+            console.log(`[cache] blocks/relations HIT rid=${request_id} me=${my_user_id.slice(0, 8)} ids_count=${userIds.length} hash=${cacheKeyHash.slice(0, 12)}`);
             const body = await cachedResponse.text();
             return new Response(body, {
               status: 200,
@@ -5543,7 +5543,7 @@ export default {
           }
 
           // ─── CACHE MISS ───
-          console.log(`[cache] blocks/relations MISS rid=${request_id} url=${cacheUrl.slice(0, 100)} userCount=${userIds.length} hash=${cacheKeyHash.slice(0, 12)}`);
+          console.log(`[cache] blocks/relations MISS rid=${request_id} me=${my_user_id.slice(0, 8)} ids_count=${userIds.length} hash=${cacheKeyHash.slice(0, 12)}`);
 
           // Query DB — both directions in parallel
           const t1 = Date.now();
@@ -5571,7 +5571,7 @@ export default {
           const responseBody = JSON.stringify(responseData);
 
           const dbMs = Date.now() - t1;
-          console.log(`[perf] blocks/relations db=${dbMs}ms total=${Date.now() - handlerStart}ms rid=${request_id}`);
+          console.log(`[perf] blocks/relations cache=MISS db=${dbMs}ms total=${Date.now() - handlerStart}ms rid=${request_id} me=${my_user_id.slice(0, 8)} ids_count=${userIds.length} hash=${cacheKeyHash.slice(0, 12)}`);
 
           // Response to client
           const response = new Response(responseBody, {
