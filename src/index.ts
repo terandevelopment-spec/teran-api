@@ -1295,38 +1295,15 @@ export default {
             let avatar = singlePost.author_avatar;
             if (typeof avatar === "string" && avatar.startsWith("data:")) avatar = null;
 
-            // ── Origin identity guard ──
-            // For teran.origin posts, skip profile name/avatar overlay so the
-            // canonical posts.author_name / posts.author_avatar are the API
-            // source of truth (edited identity must not be overwritten).
-            let _singleIsOriginPost = false;
-            if (singlePost.user_id) {
-              const { data: _sBindRow } = await sb(env)
-                .from("account_devices")
-                .select("account_id")
-                .eq("device_id", String(singlePost.user_id))
-                .maybeSingle();
-              if ((_sBindRow as any)?.account_id) {
-                const { data: _sAccRow } = await sb(env)
-                  .from("accounts")
-                  .select("teran_handle")
-                  .eq("id", (_sBindRow as any).account_id)
-                  .maybeSingle();
-                _singleIsOriginPost = (_sAccRow as any)?.teran_handle === "teran.origin";
-              }
-            }
-
             const enriched = {
               ...singlePost,
               media: mediaRows,
-              author_name: _singleIsOriginPost
+              author_name: singlePost.uses_room_display_name
                 ? singlePost.author_name
-                : singlePost.uses_room_display_name
-                  ? singlePost.author_name
-                  : (getLiveDisplayName(profile) || singlePost.author_name),
-              author_avatar: _singleIsOriginPost
-                ? (singlePost.uses_room_avatar ? avatar : (singlePost.author_avatar || avatar))
-                : (singlePost.uses_room_avatar ? avatar : (profile?.avatar || avatar)),
+                : (getLiveDisplayName(profile) || singlePost.author_name),
+              author_avatar: singlePost.uses_room_avatar
+                ? avatar
+                : (profile?.avatar || avatar),
               like_count: likeCount,
               liked_by_me: likedByMe,
               comment_count: 0,  // thread UI fetches comments separately
@@ -1646,21 +1623,16 @@ export default {
                 avatar = null;
               }
               // Live identity overlay: prefer user_profiles values over post snapshot.
-              // Exception: teran.origin posts skip profile overlay — canonical
-              // posts.author_name / posts.author_avatar are the source of truth.
               const profile = profileMap[p.author_id];
               const liveAvatar = profile?.avatar || null;
-              const isOriginPost = _originDeviceIdSet.has(String(p.user_id));
               return {
                 ...p,
-                author_name: isOriginPost
+                author_name: p.uses_room_display_name
                   ? p.author_name
-                  : p.uses_room_display_name
-                    ? p.author_name
-                    : (getLiveDisplayName(profile) || p.author_name),
-                author_avatar: isOriginPost
-                  ? (p.uses_room_avatar ? avatar : (p.author_avatar || avatar))
-                  : (p.uses_room_avatar ? avatar : (liveAvatar || avatar)),
+                  : (getLiveDisplayName(profile) || p.author_name),
+                author_avatar: p.uses_room_avatar
+                  ? avatar
+                  : (liveAvatar || avatar),
                 media: mediaByPost[p.id] || [],
                 like_count: likeCounts[p.id] || 0,
                 liked_by_me: likedByActorSet.has(p.id),
