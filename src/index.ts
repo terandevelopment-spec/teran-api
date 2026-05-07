@@ -1481,6 +1481,7 @@ export default {
               totalMediaRows += embeddedMedia.length;
               return { ...p, author_avatar: avatar, media: embeddedMedia, like_count: 0, liked_by_me: false, comment_count: 0, repost_count: 0, teran_id: null };
             });
+            const tJsTransform = performance.now() - p4;
 
             // Manually attach room metadata (icon_key, icon_thumb_key, name) to each post.
             // posts.room_id is plain text with no FK → PostgREST cannot auto-join.
@@ -1491,12 +1492,20 @@ export default {
                 .filter((rid: any) => rid && rid !== "global")
             )] as string[];
 
-            if (roomIds.length > 0) {
+            // Skip room metadata query when all posts belong to a single room
+            // (the frontend already has this room's icon/name from /api/rooms/:id).
+            // This eliminates a ~110ms Supabase round-trip for room feeds.
+            const singleRoomFeed = room_id_param && roomIds.length <= 1;
+            let roomDbMs = 0;
+
+            if (roomIds.length > 0 && !singleRoomFeed) {
               try {
+                const tRoomDb = performance.now();
                 const { data: roomRows } = await sb(env)
                   .from("rooms")
                   .select("id, name, icon_key, icon_thumb_key")
                   .in("id", roomIds);
+                roomDbMs = performance.now() - tRoomDb;
                 const roomMap: Record<string, any> = {};
                 for (const r of (roomRows ?? [])) {
                   roomMap[(r as any).id] = {
@@ -1519,7 +1528,7 @@ export default {
             }
             mediaRows = []; // not used in light mode, but keep variable populated for downstream logging
             p5 = performance.now();
-            console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} media_rows=${totalMediaRows} media_embed=true transform_ms=${(p5 - p4).toFixed(1)} skip=likes,commentCounts,teranId,mediaSeparateFetch`);
+            console.log(`[perf] /api/posts light_mode rid=${request_id} posts=${enrichedPosts.length} media_rows=${totalMediaRows} media_embed=true transform_ms=${(p5 - p4).toFixed(1)} js_ms=${tJsTransform.toFixed(1)} room_db_ms=${roomDbMs.toFixed(1)} room_ids=${roomIds.length} single_room=${singleRoomFeed} skip=likes,commentCounts,teranId,mediaSeparateFetch`);
           } else {
             // Parallel fetch: media + likes + comment counts
             const parallelStart = Date.now();
