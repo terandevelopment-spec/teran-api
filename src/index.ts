@@ -8396,12 +8396,13 @@ export default {
 
               try {
                 const kvRaw = await env.PROFILE_KV.get(originKvKey, "text");
+                console.log(`[perf] origin-identity KV GET key=${originKvKey} raw=${kvRaw ? kvRaw.substring(0, 80) : "null"}`);
                 if (kvRaw) {
                   originInfo = JSON.parse(kvRaw) as OriginInfo;
                   originFbCache = "HIT";
                 }
               } catch (_e) {
-                // KV read failed — fall through to DB
+                console.warn(`[perf] origin-identity KV GET failed key=${originKvKey}`, _e);
               }
 
               if (!originInfo) {
@@ -8439,12 +8440,15 @@ export default {
                   originInfo = { isOrigin: false, siblingIds: [] };
                 }
 
-                // Write to KV (fire-and-forget via waitUntil)
-                ctx.waitUntil(
-                  env.PROFILE_KV.put(originKvKey, JSON.stringify(originInfo), { expirationTtl: ORIGIN_KV_TTL })
-                    .then(() => console.log(`[perf] origin-identity KV PUT ok key=${originKvKey} isOrigin=${originInfo!.isOrigin}`))
-                    .catch((err: any) => console.warn(`[perf] origin-identity KV PUT failed key=${originKvKey}`, err))
-                );
+                // Write to KV — awaited inline (not deferred) so the next
+                // request is guaranteed to find it. The ~5ms PUT cost is
+                // negligible compared to the ~300ms it saves on the next hit.
+                try {
+                  await env.PROFILE_KV.put(originKvKey, JSON.stringify(originInfo), { expirationTtl: ORIGIN_KV_TTL });
+                  console.log(`[perf] origin-identity KV PUT ok key=${originKvKey} isOrigin=${originInfo.isOrigin}`);
+                } catch (putErr: any) {
+                  console.warn(`[perf] origin-identity KV PUT failed key=${originKvKey}`, putErr);
+                }
               }
 
               // Elevate to owner if origin + room owner matches a sibling
