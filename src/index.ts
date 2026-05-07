@@ -1642,6 +1642,22 @@ export default {
               };
             });
             p5 = performance.now();
+            // ── [AUTHOR_TRACE] Stage 7 backend: feed enrichment result ──
+            if (enrichedPosts.length > 0) {
+              const ep = enrichedPosts[0] as any;
+              const pf = profileMap[ep.author_id];
+              console.log(`[AUTHOR_TRACE] Stage 7 backend: first enriched post`, {
+                rid: request_id,
+                post_id: ep.id,
+                final_author_name: ep.author_name,
+                final_author_avatar: ep.author_avatar?.slice(0, 40),
+                db_author_name: (posts ?? [])[0]?.author_name,
+                profile_display_name: pf?.display_name,
+                profile_avatar: pf?.avatar?.slice(0, 40),
+                getLiveDisplayName_result: getLiveDisplayName(pf),
+                uses_room_display_name: ep.uses_room_display_name,
+              });
+            }
           } // end !light
 
           const responsePayload = isReplyQuery
@@ -1826,6 +1842,8 @@ export default {
           const author_avatar = rawAuthorAvatar;
           const room_id = typeof body?.room_id === "string" ? body.room_id : null;
           const rawShowInFeed = body?.show_in_feed === true || body?.show_in_feed === "true";
+          // ── [AUTHOR_TRACE] Stage 3: backend received body ──
+          console.log(`[AUTHOR_TRACE] Stage 3: backend received`, { rid: request_id, author_name, author_avatar: author_avatar?.slice(0, 40), author_id: raw_author_id, user_id });
           console.log(`[ROOM_FEED_DEBUG][POST_PARSE]`, { rid: request_id, room_id, raw_show_in_feed: body?.show_in_feed, rawShowInFeed, raw_post_type: body?.post_type, resolved_post_type: typeof body?.post_type === "string" && ["status","share","thread"].includes(body.post_type) ? body.post_type : "status" });
 
           // Parse reply/share fields with robust numeric coercion
@@ -2403,6 +2421,8 @@ export default {
               uses_room_display_name: body?.uses_room_display_name === true,
               show_in_feed: show_in_feed ?? false,
             };
+            // ── [AUTHOR_TRACE] Stage 4: backend inserted row ──
+            console.log(`[AUTHOR_TRACE] Stage 4: inserted row`, { rid: request_id, post_id: data.id, author_name: data.author_name, author_avatar: data.author_avatar?.slice(0, 40), author_id: data.author_id });
           } catch (dbErr: any) {
             // Translate DB constraint / validation errors to 400
             const msg = dbErr?.message || String(dbErr);
