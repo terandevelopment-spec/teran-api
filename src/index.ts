@@ -8366,35 +8366,51 @@ export default {
             // 2) Enrichment: fetch my_role only — always fresh, never cached (user-specific)
             // my_role is needed for canPost (composer) on ALL room types
             const tEnrich = performance.now();
+            const tAuth = performance.now();
             const uid = await optionalAuth(req, env);
+            const authMs = performance.now() - tAuth;
+
+            const tMembership = performance.now();
             let my_role: string | null = uid ? await checkRoomMembership(env, roomId, uid) : null;
+            const membershipMs = performance.now() - tMembership;
 
             // ── Origin owner fallback ────────────────────────────────────
             // If my_role is not 'owner' but the caller is teran.origin and
             // the room's owner_id matches any sibling device on their account,
             // elevate to 'owner'.  Handles device_id mismatch after identity
             // regeneration (same sibling pattern as PATCH /api/posts/:id).
+            let originFbMs = 0;
+            let bindingMs = 0;
+            let accountMs = 0;
+            let siblingsMs = 0;
             if (uid && my_role !== "owner") {
+              const tOriginFb = performance.now();
+              const tBinding = performance.now();
               const { data: _roleBinding } = await sb(env)
                 .from("account_devices")
                 .select("account_id")
                 .eq("device_id", uid)
                 .maybeSingle();
+              bindingMs = performance.now() - tBinding;
               if ((_roleBinding as any)?.account_id) {
+                const tAccount = performance.now();
                 const { data: _roleAccount } = await sb(env)
                   .from("accounts")
                   .select("teran_handle")
                   .eq("id", (_roleBinding as any).account_id)
                   .maybeSingle();
+                accountMs = performance.now() - tAccount;
                 if ((_roleAccount as any)?.teran_handle === "teran.origin") {
                   // Check if any sibling device_id matches rooms.owner_id
                   const roomOwnerId = String((room as any).owner_id);
                   let ownerMatch = roomOwnerId === String(uid);
                   if (!ownerMatch) {
+                    const tSiblings = performance.now();
                     const { data: _roleSiblings } = await sb(env)
                       .from("account_devices")
                       .select("device_id")
                       .eq("account_id", (_roleBinding as any).account_id);
+                    siblingsMs = performance.now() - tSiblings;
                     if (_roleSiblings) {
                       const sibIds = new Set((_roleSiblings as any[]).map((r: any) => String(r.device_id)));
                       ownerMatch = sibIds.has(roomOwnerId);
@@ -8406,36 +8422,53 @@ export default {
                   }
                 }
               }
+              originFbMs = performance.now() - tOriginFb;
             }
             const enrichMs = performance.now() - tEnrich;
 
-            // ── Fetch room avatar options ──
-            const tAvatarOpts = performance.now();
-            const { data: avatarOptions } = await sb(env)
-              .from("room_avatar_options")
-              .select("*")
-              .eq("room_id", roomId)
-              .order("sort_order", { ascending: true });
-            const avatarOptsMs = performance.now() - tAvatarOpts;
+            // ── Lazy avatar options: only when ?include=avatar_opts ──────
+            // Avatar options are only needed when the avatar choice sheet
+            // opens (first post in room). Skip on normal room detail open
+            // to save ~111ms per request.
+            const includeParam = url.searchParams.get("include") || "";
+            const wantAvatarOpts = includeParam.split(",").includes("avatar_opts");
 
-            // ── Fetch caller's avatar choice for this room ──
+            // ── Fire avatar_opts + member_row in parallel ───────────────
+            const tParallel = performance.now();
+
+            const avatarOptsPromise = wantAvatarOpts
+              ? sb(env)
+                  .from("room_avatar_options")
+                  .select("*")
+                  .eq("room_id", roomId)
+                  .order("sort_order", { ascending: true })
+              : Promise.resolve({ data: null });
+
+            const memberRowPromise = (uid && my_role)
+              ? sb(env)
+                  .from("room_members")
+                  .select("avatar_mode, room_avatar_option_id, room_avatar_key, room_anon_id")
+                  .eq("room_id", roomId)
+                  .eq("user_id", uid)
+                  .maybeSingle()
+              : Promise.resolve({ data: null });
+
+            const [{ data: avatarOptions }, { data: memberRow }] = await Promise.all([
+              avatarOptsPromise,
+              memberRowPromise,
+            ]);
+            const parallelMs = performance.now() - tParallel;
+
+            // ── Extract caller's avatar choice ──
             let my_avatar_mode: string | null = null;
             let my_room_avatar_key: string | null = null;
             let my_room_avatar_option_id: string | null = null;
             let my_room_anon_id: string | null = null;
-            if (uid && my_role) {
-              const { data: memberRow } = await sb(env)
-                .from("room_members")
-                .select("avatar_mode, room_avatar_option_id, room_avatar_key, room_anon_id")
-                .eq("room_id", roomId)
-                .eq("user_id", uid)
-                .maybeSingle();
-              if (memberRow) {
-                my_avatar_mode = (memberRow as any).avatar_mode || null;
-                my_room_avatar_key = (memberRow as any).room_avatar_key || null;
-                my_room_avatar_option_id = (memberRow as any).room_avatar_option_id || null;
-                my_room_anon_id = (memberRow as any).room_anon_id || null;
-              }
+            if (memberRow) {
+              my_avatar_mode = (memberRow as any).avatar_mode || null;
+              my_room_avatar_key = (memberRow as any).room_avatar_key || null;
+              my_room_avatar_option_id = (memberRow as any).room_avatar_option_id || null;
+              my_room_anon_id = (memberRow as any).room_anon_id || null;
             }
 
             const payload = {
@@ -8450,7 +8483,7 @@ export default {
             const payloadBytes = JSON.stringify(payload).length;
             const totalMs = performance.now() - tTotal;
 
-            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: +enrichMs.toFixed(1), avatar_opts_ms: +avatarOptsMs.toFixed(1), total_ms: +totalMs.toFixed(1), rows_room: 1, avatar_opts_count: (avatarOptions ?? []).length, payload_bytes: payloadBytes, caller }));
+            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: +enrichMs.toFixed(1), enrich_detail: { auth_ms: +authMs.toFixed(1), membership_ms: +membershipMs.toFixed(1), origin_fb_ms: +originFbMs.toFixed(1), binding_ms: +bindingMs.toFixed(1), account_ms: +accountMs.toFixed(1), siblings_ms: +siblingsMs.toFixed(1) }, parallel_ms: +parallelMs.toFixed(1), avatar_opts: wantAvatarOpts, total_ms: +totalMs.toFixed(1), rows_room: 1, avatar_opts_count: (avatarOptions ?? []).length, payload_bytes: payloadBytes, caller }));
 
             return ok(req, env, request_id, payload);
           }
