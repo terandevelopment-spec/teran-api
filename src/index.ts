@@ -8374,54 +8374,83 @@ export default {
             let my_role: string | null = uid ? await checkRoomMembership(env, roomId, uid) : null;
             const membershipMs = performance.now() - tMembership;
 
-            // ── Origin owner fallback ────────────────────────────────────
-            // If my_role is not 'owner' but the caller is teran.origin and
-            // the room's owner_id matches any sibling device on their account,
-            // elevate to 'owner'.  Handles device_id mismatch after identity
-            // regeneration (same sibling pattern as PATCH /api/posts/:id).
+            // ── Origin owner fallback (edge-cached identity) ────────────
+            // Caches uid → { accountId, isOrigin, siblingIds } so repeated
+            // room opens skip the 3 serial Supabase queries (~245ms).
+            // Normal users are cached as isOrigin=false and skip immediately.
+            // TTL 60s — origin status and device bindings are stable.
             let originFbMs = 0;
-            let bindingMs = 0;
-            let accountMs = 0;
-            let siblingsMs = 0;
+            let originFbCache = "SKIP";
             if (uid && my_role !== "owner") {
               const tOriginFb = performance.now();
-              const tBinding = performance.now();
-              const { data: _roleBinding } = await sb(env)
-                .from("account_devices")
-                .select("account_id")
-                .eq("device_id", uid)
-                .maybeSingle();
-              bindingMs = performance.now() - tBinding;
-              if ((_roleBinding as any)?.account_id) {
-                const tAccount = performance.now();
-                const { data: _roleAccount } = await sb(env)
-                  .from("accounts")
-                  .select("teran_handle")
-                  .eq("id", (_roleBinding as any).account_id)
+
+              const ORIGIN_CACHE_TTL = 60; // seconds
+              const originCacheUrl = new URL(`https://cache.internal/origin-identity/${uid}`);
+              const originCacheKey = new Request(originCacheUrl.toString(), { method: "GET" });
+              const edgeCache = caches.default;
+
+              let originInfo: { accountId: string | null; isOrigin: boolean; siblingIds: string[] } | null = null;
+
+              const cachedOriginRes = await edgeCache.match(originCacheKey);
+              if (cachedOriginRes) {
+                originInfo = await cachedOriginRes.json();
+                originFbCache = "HIT";
+              } else {
+                originFbCache = "MISS";
+                // Q1: account_devices → account_id
+                const { data: _roleBinding } = await sb(env)
+                  .from("account_devices")
+                  .select("account_id")
+                  .eq("device_id", uid)
                   .maybeSingle();
-                accountMs = performance.now() - tAccount;
-                if ((_roleAccount as any)?.teran_handle === "teran.origin") {
-                  // Check if any sibling device_id matches rooms.owner_id
-                  const roomOwnerId = String((room as any).owner_id);
-                  let ownerMatch = roomOwnerId === String(uid);
-                  if (!ownerMatch) {
-                    const tSiblings = performance.now();
+
+                if ((_roleBinding as any)?.account_id) {
+                  const _accountId = (_roleBinding as any).account_id;
+                  // Q2: accounts → teran_handle
+                  const { data: _roleAccount } = await sb(env)
+                    .from("accounts")
+                    .select("teran_handle")
+                    .eq("id", _accountId)
+                    .maybeSingle();
+                  const _isOrigin = (_roleAccount as any)?.teran_handle === "teran.origin";
+
+                  // Q3: siblings (only for origin users — normal users never need this)
+                  let _siblingIds: string[] = [];
+                  if (_isOrigin) {
                     const { data: _roleSiblings } = await sb(env)
                       .from("account_devices")
                       .select("device_id")
-                      .eq("account_id", (_roleBinding as any).account_id);
-                    siblingsMs = performance.now() - tSiblings;
-                    if (_roleSiblings) {
-                      const sibIds = new Set((_roleSiblings as any[]).map((r: any) => String(r.device_id)));
-                      ownerMatch = sibIds.has(roomOwnerId);
-                    }
+                      .eq("account_id", _accountId);
+                    _siblingIds = (_roleSiblings ?? []).map((r: any) => String(r.device_id));
                   }
-                  if (ownerMatch) {
-                    my_role = "owner";
-                    console.log(`[rooms] origin owner fallback: elevated my_role to owner`, { room_id: roomId, uid });
-                  }
+
+                  originInfo = { accountId: _accountId, isOrigin: _isOrigin, siblingIds: _siblingIds };
+                } else {
+                  // No account binding — not a logged-in user
+                  originInfo = { accountId: null, isOrigin: false, siblingIds: [] };
+                }
+
+                // Write to edge cache (fire-and-forget)
+                const cacheBody = JSON.stringify(originInfo);
+                const cacheRes = new Response(cacheBody, {
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Cache-Control": `public, max-age=${ORIGIN_CACHE_TTL}`,
+                  },
+                });
+                edgeCache.put(originCacheKey, cacheRes).catch(() => {});
+              }
+
+              // Elevate to owner if origin + room owner matches a sibling
+              if (originInfo?.isOrigin) {
+                const roomOwnerId = String((room as any).owner_id);
+                const ownerMatch = originInfo.siblingIds.some(id => id === roomOwnerId);
+                if (ownerMatch) {
+                  my_role = "owner";
+                  console.log(`[rooms] origin owner fallback: elevated my_role to owner (cache=${originFbCache})`, { room_id: roomId, uid });
                 }
               }
+
               originFbMs = performance.now() - tOriginFb;
             }
             const enrichMs = performance.now() - tEnrich;
@@ -8483,7 +8512,7 @@ export default {
             const payloadBytes = JSON.stringify(payload).length;
             const totalMs = performance.now() - tTotal;
 
-            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: +enrichMs.toFixed(1), enrich_detail: { auth_ms: +authMs.toFixed(1), membership_ms: +membershipMs.toFixed(1), origin_fb_ms: +originFbMs.toFixed(1), binding_ms: +bindingMs.toFixed(1), account_ms: +accountMs.toFixed(1), siblings_ms: +siblingsMs.toFixed(1) }, parallel_ms: +parallelMs.toFixed(1), avatar_opts: wantAvatarOpts, total_ms: +totalMs.toFixed(1), rows_room: 1, avatar_opts_count: (avatarOptions ?? []).length, payload_bytes: payloadBytes, caller }));
+            console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: +enrichMs.toFixed(1), enrich_detail: { auth_ms: +authMs.toFixed(1), membership_ms: +membershipMs.toFixed(1), origin_fb_ms: +originFbMs.toFixed(1), origin_fb_cache: originFbCache }, parallel_ms: +parallelMs.toFixed(1), avatar_opts: wantAvatarOpts, total_ms: +totalMs.toFixed(1), rows_room: 1, avatar_opts_count: (avatarOptions ?? []).length, payload_bytes: payloadBytes, caller }));
 
             return ok(req, env, request_id, payload);
           }
