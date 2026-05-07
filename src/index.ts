@@ -8272,9 +8272,11 @@ export default {
                     "Cache-Control": `public, max-age=${ROOM_CACHE_TTL}`,
                   },
                 });
-                // fire-and-forget: don't block the response on the cache write
-                roomCache.put(roomCacheKey, cacheRes).catch((err: any) =>
-                  console.warn(`[perf] /api/rooms/:id cache put failed rid=${request_id}`, err)
+                // Ensure cache write survives past the response via ctx.waitUntil
+                ctx.waitUntil(
+                  roomCache.put(roomCacheKey, cacheRes).catch((err: any) =>
+                    console.warn(`[perf] /api/rooms/:id cache put failed rid=${request_id}`, err)
+                  )
                 );
               } else {
                 // Private room — bypass cache
@@ -8385,8 +8387,8 @@ export default {
               const tOriginFb = performance.now();
 
               const ORIGIN_CACHE_TTL = 60; // seconds
-              const originCacheUrl = new URL(`https://cache.internal/origin-identity/${uid}`);
-              const originCacheKey = new Request(originCacheUrl.toString(), { method: "GET" });
+              const originCacheKeyUrl = `https://cache.internal/origin-identity/${uid}`;
+              const originCacheKey = new Request(originCacheKeyUrl, { method: "GET" });
               const edgeCache = caches.default;
 
               let originInfo: { accountId: string | null; isOrigin: boolean; siblingIds: string[] } | null = null;
@@ -8395,6 +8397,7 @@ export default {
               if (cachedOriginRes) {
                 originInfo = await cachedOriginRes.json();
                 originFbCache = "HIT";
+                console.log(`[perf] origin-identity cache MATCH HIT uid=${uid} key=${originCacheKeyUrl}`);
               } else {
                 originFbCache = "MISS";
                 // Q1: account_devices → account_id
@@ -8430,15 +8433,28 @@ export default {
                   originInfo = { accountId: null, isOrigin: false, siblingIds: [] };
                 }
 
-                // Write to edge cache (fire-and-forget)
-                const cacheBody = JSON.stringify(originInfo);
-                const cacheRes = new Response(cacheBody, {
-                  headers: {
-                    "Content-Type": "application/json",
-                    "Cache-Control": `public, max-age=${ORIGIN_CACHE_TTL}`,
-                  },
-                });
-                edgeCache.put(originCacheKey, cacheRes).catch(() => {});
+                // Write to edge cache via ctx.waitUntil so the write survives
+                // past the response. Plain fire-and-forget was silently killed
+                // by the Workers runtime because the response was sent shortly
+                // after the put — unlike the room cache put which has ~500ms
+                // of subsequent processing to complete in.
+                const originCacheBody = JSON.stringify(originInfo);
+                const originCacheWriteKey = `https://cache.internal/origin-identity/${uid}`;
+                ctx.waitUntil(
+                  edgeCache.put(
+                    new Request(originCacheWriteKey, { method: "GET" }),
+                    new Response(originCacheBody, {
+                      headers: {
+                        "Content-Type": "application/json",
+                        "Cache-Control": `public, max-age=${ORIGIN_CACHE_TTL}`,
+                      },
+                    })
+                  ).then(() => {
+                    console.log(`[perf] origin-identity cache PUT ok uid=${uid} isOrigin=${originInfo!.isOrigin} key=${originCacheWriteKey}`);
+                  }).catch((err: any) => {
+                    console.warn(`[perf] origin-identity cache PUT failed uid=${uid}`, err);
+                  })
+                );
               }
 
               // Elevate to owner if origin + room owner matches a sibling
