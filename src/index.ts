@@ -3546,11 +3546,12 @@ export default {
             const perPost = Math.min(3, Math.max(1, parseInt(perPostParam || "1", 10) || 1));
             perPostUsed = perPost;
 
-            const postIds = postIdsParam
-              .split(",")
-              .map(s => parseInt(s.trim(), 10))
-              .filter(n => Number.isFinite(n) && n > 0)
-              .slice(0, 100);
+            const postIds = [...new Set(
+              postIdsParam
+                .split(",")
+                .map(s => parseInt(s.trim(), 10))
+                .filter(n => Number.isFinite(n) && n > 0)
+            )].slice(0, 100); // De-dupe + limit to 100
             idsCount = postIds.length;
 
             if (postIds.length === 0) {
@@ -3558,25 +3559,25 @@ export default {
               return ok(req, env, request_id, { previews: {} });
             }
 
-            // Stable cache key: sorted IDs + per_post
+            // Stable cache key: sorted IDs → SHA-256 hash (short, deterministic URL)
             const sortedKey = [...postIds].sort((a, b) => a - b).join(",");
-            const cacheKeyUrl = new URL("https://cache.internal/comments/preview");
-            cacheKeyUrl.searchParams.set("ids", sortedKey);
-            cacheKeyUrl.searchParams.set("per_post", String(perPost));
-            const cacheKey = new Request(cacheKeyUrl.toString(), { method: "GET" });
+            const cacheKeyData = `comments_preview:v1:${sortedKey}:pp${perPost}`;
+            const cacheKeyHash = await sha256Hex(cacheKeyData);
+            const cacheKey = new Request(`https://cache.internal/comments/preview/${cacheKeyHash}`, { method: "GET" });
             const cache = caches.default;
             const cached = await cache.match(cacheKey);
             const tCache = Date.now();
 
             if (cached) {
               const hitBody = await cached.text();
-              console.log(`[perf] comments/preview rid=${rid} cache=HIT total=${Date.now() - t0}ms ids=${idsCount} per_post=${perPostUsed} payloadBytes=${hitBody.length}`);
+              console.log(`[perf] comments/preview rid=${rid} cache=HIT total=${Date.now() - t0}ms ids=${idsCount} per_post=${perPostUsed} hash=${cacheKeyHash.slice(0, 12)} payloadBytes=${hitBody.length}`);
               return new Response(hitBody, {
                 status: 200,
                 headers: {
                   "Content-Type": "application/json",
                   "X-Request-Id": request_id,
                   "X-Cache": "HIT",
+                  "X-Cache-Key": cacheKeyHash.slice(0, 12),
                   ...corsHeaders(req, env),
                 },
               });
@@ -3631,17 +3632,18 @@ export default {
                   "Cache-Control": `public, max-age=${PREVIEW_CACHE_TTL}`,
                 },
               }))
-                .then(() => console.log(`[cache] comments/preview put ok rid=${rid} ids=${idsCount}`))
-                .catch((err) => console.error(`[cache] comments/preview put fail rid=${rid}`, err))
+                .then(() => console.log(`[cache] comments/preview put ok rid=${rid} ids=${idsCount} hash=${cacheKeyHash.slice(0, 12)}`))
+                .catch((err) => console.error(`[cache] comments/preview put fail rid=${rid} hash=${cacheKeyHash.slice(0, 12)}`, err))
             );
 
-            console.log(`[perf] comments/preview rid=${rid} cache=MISS cacheCheck=${tCache - t0}ms db=${tDb1 - tDb0}ms transform=${tEnd - tDb1}ms total=${tEnd - t0}ms payloadBytes=${body.length} ids=${idsCount} per_post=${perPostUsed} rows=${(rows ?? []).length} error=0`);
+            console.log(`[perf] comments/preview rid=${rid} cache=MISS cacheCheck=${tCache - t0}ms db=${tDb1 - tDb0}ms transform=${tEnd - tDb1}ms total=${tEnd - t0}ms payloadBytes=${body.length} ids=${idsCount} per_post=${perPostUsed} hash=${cacheKeyHash.slice(0, 12)} rows=${(rows ?? []).length} error=0`);
             return new Response(body, {
               status: 200,
               headers: {
                 "Content-Type": "application/json",
                 "X-Request-Id": request_id,
                 "X-Cache": "MISS",
+                "X-Cache-Key": cacheKeyHash.slice(0, 12),
                 ...corsHeaders(req, env),
               },
             });
@@ -3664,34 +3666,35 @@ export default {
           const perPostParam = url.searchParams.get("per_post");
           const perPost = Math.min(3, Math.max(1, parseInt(perPostParam || "2", 10) || 2));
 
-          const parentIds = parentIdsParam
-            .split(",")
-            .map(s => parseInt(s.trim(), 10))
-            .filter(n => Number.isFinite(n) && n > 0)
-            .slice(0, 100);
+          const parentIds = [...new Set(
+            parentIdsParam
+              .split(",")
+              .map(s => parseInt(s.trim(), 10))
+              .filter(n => Number.isFinite(n) && n > 0)
+          )].slice(0, 100); // De-dupe + limit to 100
 
           if (parentIds.length === 0) {
             return ok(req, env, request_id, { previews: {} });
           }
 
-          // Stable cache key
+          // Stable cache key: sorted IDs → SHA-256 hash (short, deterministic URL)
           const sortedKey = [...parentIds].sort((a, b) => a - b).join(",");
-          const cacheKeyUrl = new URL("https://cache.internal/posts/reply-previews");
-          cacheKeyUrl.searchParams.set("ids", sortedKey);
-          cacheKeyUrl.searchParams.set("per_post", String(perPost));
-          const cacheKey = new Request(cacheKeyUrl.toString(), { method: "GET" });
+          const cacheKeyData = `reply_previews:v1:${sortedKey}:pp${perPost}`;
+          const cacheKeyHash = await sha256Hex(cacheKeyData);
+          const cacheKey = new Request(`https://cache.internal/posts/reply-previews/${cacheKeyHash}`, { method: "GET" });
           const cache = caches.default;
           const cached = await cache.match(cacheKey);
 
           if (cached) {
             const hitBody = await cached.text();
-            console.log(`[perf] posts/reply-previews rid=${rid} cache=HIT total=${Date.now() - t0}ms ids=${parentIds.length}`);
+            console.log(`[perf] posts/reply-previews rid=${rid} cache=HIT total=${Date.now() - t0}ms ids=${parentIds.length} hash=${cacheKeyHash.slice(0, 12)}`);
             return new Response(hitBody, {
               status: 200,
               headers: {
                 "Content-Type": "application/json",
                 "X-Request-Id": request_id,
                 "X-Cache": "HIT",
+                "X-Cache-Key": cacheKeyHash.slice(0, 12),
                 ...corsHeaders(req, env),
               },
             });
@@ -3748,17 +3751,18 @@ export default {
                 "Cache-Control": `public, max-age=${PREVIEW_CACHE_TTL}`,
               },
             }))
-              .then(() => console.log(`[cache] posts/reply-previews put ok rid=${rid} ids=${parentIds.length}`))
-              .catch((err) => console.error(`[cache] posts/reply-previews put fail rid=${rid}`, err))
+              .then(() => console.log(`[cache] posts/reply-previews put ok rid=${rid} ids=${parentIds.length} hash=${cacheKeyHash.slice(0, 12)}`))
+              .catch((err) => console.error(`[cache] posts/reply-previews put fail rid=${rid} hash=${cacheKeyHash.slice(0, 12)}`, err))
           );
 
-          console.log(`[perf] posts/reply-previews rid=${rid} cache=MISS db=${tDb1 - tDb0}ms total=${Date.now() - t0}ms ids=${parentIds.length} per_post=${perPost} rows=${(rows ?? []).length}`);
+          console.log(`[perf] posts/reply-previews rid=${rid} cache=MISS db=${tDb1 - tDb0}ms total=${Date.now() - t0}ms ids=${parentIds.length} per_post=${perPost} hash=${cacheKeyHash.slice(0, 12)} rows=${(rows ?? []).length}`);
           return new Response(body, {
             status: 200,
             headers: {
               "Content-Type": "application/json",
               "X-Request-Id": request_id,
               "X-Cache": "MISS",
+              "X-Cache-Key": cacheKeyHash.slice(0, 12),
               ...corsHeaders(req, env),
             },
           });
@@ -5298,35 +5302,37 @@ export default {
           let idsCount = 0;
           try {
             const postIdsParam = url.searchParams.get("post_ids") || "";
-            const postIds = postIdsParam
-              .split(",")
-              .map(s => parseInt(s.trim(), 10))
-              .filter(n => Number.isFinite(n) && n > 0)
-              .slice(0, 200);
+            const postIds = [...new Set(
+              postIdsParam
+                .split(",")
+                .map(s => parseInt(s.trim(), 10))
+                .filter(n => Number.isFinite(n) && n > 0)
+            )].slice(0, 200); // De-dupe + limit to 200
             idsCount = postIds.length;
 
             if (postIds.length === 0) {
               throw new HttpError(400, "BAD_REQUEST", "post_ids is required (comma-separated integers)");
             }
 
-            // Stable cache key: sorted IDs
+            // Stable cache key: sorted IDs → SHA-256 hash (short, deterministic URL)
             const sortedKey = [...postIds].sort((a, b) => a - b).join(",");
-            const cacheKeyUrl = new URL("https://cache.internal/saves/counts");
-            cacheKeyUrl.searchParams.set("ids", sortedKey);
-            const cacheKey = new Request(cacheKeyUrl.toString(), { method: "GET" });
+            const cacheKeyData = `saves_counts:v1:${sortedKey}`;
+            const cacheKeyHash = await sha256Hex(cacheKeyData);
+            const cacheKey = new Request(`https://cache.internal/saves/counts/${cacheKeyHash}`, { method: "GET" });
             const cache = caches.default;
             const cached = await cache.match(cacheKey);
             const tCache = Date.now();
 
             if (cached) {
               const hitBody = await cached.text();
-              console.log(`[perf] saves/counts rid=${rid} cache=HIT total=${Date.now() - t0}ms ids=${idsCount} payloadBytes=${hitBody.length}`);
+              console.log(`[perf] saves/counts rid=${rid} cache=HIT total=${Date.now() - t0}ms ids=${idsCount} hash=${cacheKeyHash.slice(0, 12)} payloadBytes=${hitBody.length}`);
               return new Response(hitBody, {
                 status: 200,
                 headers: {
                   "Content-Type": "application/json",
                   "X-Request-Id": request_id,
                   "X-Cache": "HIT",
+                  "X-Cache-Key": cacheKeyHash.slice(0, 12),
                   ...corsHeaders(req, env),
                 },
               });
@@ -5366,17 +5372,18 @@ export default {
                   "Cache-Control": `public, max-age=${SAVES_CACHE_TTL}`,
                 },
               }))
-                .then(() => console.log(`[cache] saves/counts put ok rid=${rid} ids=${idsCount}`))
-                .catch((err) => console.error(`[cache] saves/counts put fail rid=${rid}`, err))
+                .then(() => console.log(`[cache] saves/counts put ok rid=${rid} ids=${idsCount} hash=${cacheKeyHash.slice(0, 12)}`))
+                .catch((err) => console.error(`[cache] saves/counts put fail rid=${rid} hash=${cacheKeyHash.slice(0, 12)}`, err))
             );
 
-            console.log(`[perf] saves/counts rid=${rid} cache=MISS cacheCheck=${tCache - t0}ms db=${tDb1 - tDb0}ms transform=${tEnd - tDb1}ms total=${tEnd - t0}ms payloadBytes=${body.length} ids=${idsCount} error=0`);
+            console.log(`[perf] saves/counts rid=${rid} cache=MISS cacheCheck=${tCache - t0}ms db=${tDb1 - tDb0}ms transform=${tEnd - tDb1}ms total=${tEnd - t0}ms payloadBytes=${body.length} ids=${idsCount} hash=${cacheKeyHash.slice(0, 12)} error=0`);
             return new Response(body, {
               status: 200,
               headers: {
                 "Content-Type": "application/json",
                 "X-Request-Id": request_id,
                 "X-Cache": "MISS",
+                "X-Cache-Key": cacheKeyHash.slice(0, 12),
                 ...corsHeaders(req, env),
               },
             });
