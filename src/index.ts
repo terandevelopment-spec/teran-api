@@ -3441,11 +3441,12 @@ export default {
           let idsCount = 0;
           try {
             const postIdsParam = url.searchParams.get("post_ids") || "";
-            const postIds = postIdsParam
-              .split(",")
-              .map(s => parseInt(s.trim(), 10))
-              .filter(n => Number.isFinite(n) && n > 0)
-              .slice(0, 200); // Limit to 200
+            const postIds = [...new Set(
+              postIdsParam
+                .split(",")
+                .map(s => parseInt(s.trim(), 10))
+                .filter(n => Number.isFinite(n) && n > 0)
+            )].slice(0, 200); // De-dupe + limit to 200
             idsCount = postIds.length;
 
             if (postIds.length === 0) {
