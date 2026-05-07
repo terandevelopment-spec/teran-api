@@ -8400,6 +8400,7 @@ export default {
                 console.log(`[perf] origin-identity cache MATCH HIT uid=${uid} key=${originCacheKeyUrl}`);
               } else {
                 originFbCache = "MISS";
+                console.log(`[perf] origin-identity cache MATCH MISS uid=${uid} read_key=${originCacheKeyUrl}`);
                 // Q1: account_devices → account_id
                 const { data: _roleBinding } = await sb(env)
                   .from("account_devices")
