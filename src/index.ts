@@ -665,7 +665,6 @@ export default {
 
         // /api/posts (GET) - filter by ?id=, ?user_id=, ?author_id=, ?room_id=, ?limit=, ?actor_id=
         if (path === "/api/posts" && req.method === "GET") {
-          const FEED_CACHE_TTL = 30;
           const SLOW_MS = 1000;
           const VERY_SLOW_MS = 3000;
           const handlerStart = Date.now();
@@ -696,6 +695,7 @@ export default {
           const isReplyQuery = !!parent_post_id_param;
           const isScopedQuery = !!post_type_param || !!root_only_param || !!mode_param || !!mood_param || !!q_param;
           const cursor = (isReplyQuery || isScopedQuery) ? parseCursor(cursor_param) : null;
+          const FEED_CACHE_TTL = light ? 60 : 30;
           const p1 = performance.now();
 
           // ── Edge cache: eligible for public, non-personalized feeds ──
@@ -723,7 +723,12 @@ export default {
           if (isFeed) {
             const cacheUrl = new URL("https://cache.internal/posts/feed");
             cacheUrl.searchParams.set("limit", limit_param || "50");
-            if (actor_id_param) cacheUrl.searchParams.set("actor", actor_id_param);
+            // actor_id only affects liked_by_me — which is skipped in light mode (hardcoded false).
+            // Including it creates per-user cache slots for identical data, defeating shared caching.
+            if (actor_id_param && !light) cacheUrl.searchParams.set("actor", actor_id_param);
+            if (actor_id_param && light) {
+              console.log(`[cache] /api/posts actor_excluded_from_key rid=${request_id} actor=${actor_id_param.slice(0,8)} reason=light_mode`);
+            }
             // Include scope params in cache key so scoped vs unscoped don't collide
             if (post_type_param) cacheUrl.searchParams.set("pt", post_type_param);
             if (root_only_param) cacheUrl.searchParams.set("ro", root_only_param);
@@ -765,7 +770,9 @@ export default {
           // user_id is intentionally included here even in light mode:
           // ownership checks (e.g. appearance overrides) require it, and
           // omitting it causes String(undefined) !== jwt_sub → silent 403.
-          const lightSelectFields = "id,user_id,created_at,last_activity_at,title,content,author_id,author_name,author_avatar,mode,moods,room_id,parent_post_id,post_type,show_in_feed,room_category,media(type,key,thumb_key),uses_room_avatar,uses_room_display_name,room_anon_id";
+          // Trimmed light select: removed mode, moods, show_in_feed, room_category
+          // (not rendered by feed cards; show_in_feed/room_category only used in WHERE, not SELECT)
+          const lightSelectFields = "id,user_id,created_at,last_activity_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,media(type,key,thumb_key),uses_room_avatar,uses_room_display_name,room_anon_id";
           const selectFields = light ? lightSelectFields : feedSelectFields;
 
           // Step 1: log normalized filter + select cols
@@ -1912,7 +1919,7 @@ export default {
                 status: 200,
                 headers: {
                   "Content-Type": "application/json",
-                  "Cache-Control": `public, max-age=${FEED_CACHE_TTL}`,
+                  "Cache-Control": `public, max-age=${FEED_CACHE_TTL}, stale-while-revalidate=30`,
                 },
               }))
                 .then(() => console.log(`[cache] posts/feed put ok rid=${request_id} limit=${limit_param || 50} actor=${actor_id_param || "none"} ttl=${FEED_CACHE_TTL}s bytes=${responseBody.length}`))
@@ -5562,7 +5569,7 @@ export default {
         //
         // ────────────────────────────────────────────────────────────────────
         if (path === "/api/blocks/relations" && req.method === "GET") {
-          const BLOCKS_CACHE_TTL_SECONDS = 60;
+          const BLOCKS_CACHE_TTL_SECONDS = 120;
           const handlerStart = Date.now();
 
           // Debug: confirm auth header is present on original request
