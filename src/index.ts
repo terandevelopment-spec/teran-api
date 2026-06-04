@@ -3564,34 +3564,56 @@ export default {
               });
             }
 
-            // Cache MISS — query DB using RPC (GROUP BY in Postgres, returns 1 row per post_id)
-            // Falls back to row-fetch if RPC not deployed yet
+            // Cache MISS — query DB
+            // Strategy priority:
+            //   1. RPC get_comments_counts (GROUP BY in Postgres — 13 rows for 13 ids)
+            //   2. Fallback: SELECT post_id only + count in JS (if RPC not deployed)
             const tDb = Date.now();
             let counts: Record<string, number> = {};
             let queryMethod = "rpc";
+            let fallbackReason = "";
+            let rpcErrorCode = "";
+            let rpcErrorMsg = "";
+
+            // Initialize all counts to 0
+            for (const id of postIds) {
+              counts[String(id)] = 0;
+            }
 
             try {
               const { data: rpcRows, error: rpcErr } = await sb(env)
                 .rpc("get_comments_counts", { p_post_ids: postIds });
-              if (rpcErr) throw rpcErr;
-              // RPC returns [{post_id, comment_count}, ...]
-              for (const id of postIds) {
-                counts[String(id)] = 0;
+              if (rpcErr) {
+                rpcErrorCode = rpcErr.code || "unknown";
+                rpcErrorMsg = (rpcErr.message || "").slice(0, 200);
+                throw rpcErr;
               }
+              // RPC returns [{post_id, comment_count}, ...]
               for (const row of rpcRows ?? []) {
                 counts[String((row as any).post_id)] = Number((row as any).comment_count) || 0;
               }
-            } catch {
-              // Fallback: fetch all rows + count in JS (pre-RPC behavior)
+            } catch (rpcCatchErr: any) {
+              // Log the RPC failure reason for diagnostics
+              if (!rpcErrorCode) {
+                rpcErrorCode = rpcCatchErr?.code || "exception";
+                rpcErrorMsg = (rpcCatchErr?.message || String(rpcCatchErr)).slice(0, 200);
+              }
+              fallbackReason = `rpc_failed:${rpcErrorCode}`;
               queryMethod = "select_fallback";
+
+              console.log(`[diag] comments/counts rpc_failed`, JSON.stringify({
+                rid, ids_count: idsCount,
+                rpc_error_code: rpcErrorCode,
+                rpc_error_message: rpcErrorMsg,
+              }));
+
+              // Fallback: SELECT post_id only + count in JS
+              // This is the pre-RPC behavior — works without any SQL migration
               const { data: countRows, error } = await sb(env)
                 .from("comments")
                 .select("post_id")
                 .in("post_id", postIds);
               if (error) throw error;
-              for (const id of postIds) {
-                counts[String(id)] = 0;
-              }
               for (const row of countRows ?? []) {
                 const key = String((row as any).post_id);
                 counts[key] = (counts[key] || 0) + 1;
@@ -3616,7 +3638,7 @@ export default {
             );
 
             const totalMs = Date.now() - t0;
-            console.log(`[perf] /api/comments/counts`, JSON.stringify({ rid, cache: "MISS", query_method: queryMethod, cache_check_ms: tCache - t0, db_ms: dbMs, total_ms: totalMs, ids_count: idsCount, hash: cacheKeyHash.slice(0, 12), payloadBytes: body.length }));
+            console.log(`[perf] /api/comments/counts`, JSON.stringify({ rid, cache: "MISS", query_method: queryMethod, fallback_reason: fallbackReason || "none", cache_check_ms: tCache - t0, db_ms: dbMs, total_ms: totalMs, ids_count: idsCount, hash: cacheKeyHash.slice(0, 12), payloadBytes: body.length }));
 
             return new Response(body, {
               status: 200,
