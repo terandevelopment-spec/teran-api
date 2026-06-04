@@ -1350,9 +1350,10 @@ export default {
 
             const profilePromise = (async () => {
               if (!singlePost.author_id) return;
-              // KV fast path
+              // KV fast path — same key as /api/profile handler: `profile:${user_id}`
               const tKv = Date.now();
               const profKvKey = `profile:${singlePost.author_id}`;
+              let kvMissReason = "";
               try {
                 const kvRaw = await env.PROFILE_KV.get(profKvKey, "text");
                 profKvMs = Date.now() - tKv;
@@ -1361,19 +1362,33 @@ export default {
                   profSrc = "kv";
                   return;
                 }
-              } catch {
+                kvMissReason = "key_not_found";
+              } catch (kvErr) {
                 profKvMs = Date.now() - tKv;
-                /* KV miss — fall through */
+                kvMissReason = "error:" + String(kvErr).slice(0, 60);
               }
-              // DB fallback
+              // DB fallback — select same columns as /api/profile so KV entry is reusable
               profSrc = "db";
               const tDb = Date.now();
               const { data: profRow } = await sb(env).from("user_profiles")
-                .select("user_id, teran_id, display_name, avatar")
+                .select("user_id, display_name, bio, avatar, persona_tags, teran_id")
                 .eq("user_id", singlePost.author_id)
                 .maybeSingle();
               profDbMs = Date.now() - tDb;
               profile = profRow;
+
+              // Write back to KV so next request is HIT (fire-and-forget)
+              if (profRow) {
+                ctx.waitUntil(
+                  env.PROFILE_KV.put(profKvKey, JSON.stringify(profRow), { expirationTtl: 300 })
+                    .catch(() => {})
+                );
+              }
+              console.log(`[diag] single_post_fast profile_db_fallback`, JSON.stringify({
+                rid: request_id, author_id: singlePost.author_id,
+                kv_miss_reason: kvMissReason, kv_ms: profKvMs, db_ms: profDbMs,
+                found: !!profRow, wrote_kv: !!profRow,
+              }));
             })();
 
             // ── Await all in parallel: speculative (media+likes) + profile ──
