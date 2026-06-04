@@ -1335,40 +1335,50 @@ export default {
           // ── Single-post fast path ──
           // Post is already fetched above. media + likes were fired speculatively
           // BEFORE the main SELECT, so they ran in parallel with it.
-          // Awaiting them here is nearly free (~0-10ms wait).
-          // comment_count defaults to 0 (thread UI fetches comments separately)
+          // Profile lookup now also runs in parallel with them.
           if (id_param && postIds.length === 1 && speculativeAux) {
             const singlePost = (posts as any[])[0];
             const fastStart = Date.now();
 
-            // Profile: KV-cached lookup first, DB fallback only on miss
-            const tProf = Date.now();
+            // ── Fire profile lookup immediately (parallel with speculative aux) ──
+            // KV first, DB fallback if miss — but start the DB query eagerly
+            // so it overlaps with the speculative media+likes await.
             let profile: any = null;
             let profSrc = "none";
-            if (singlePost.author_id) {
+            let profKvMs = 0;
+            let profDbMs = 0;
+
+            const profilePromise = (async () => {
+              if (!singlePost.author_id) return;
+              // KV fast path
+              const tKv = Date.now();
               const profKvKey = `profile:${singlePost.author_id}`;
               try {
                 const kvRaw = await env.PROFILE_KV.get(profKvKey, "text");
+                profKvMs = Date.now() - tKv;
                 if (kvRaw) {
                   profile = JSON.parse(kvRaw);
                   profSrc = "kv";
+                  return;
                 }
-              } catch { /* KV miss — fall through */ }
-            }
-            const profKvMs = Date.now() - tProf;
-
-            // Await speculative results (fired before main SELECT — should already be done)
-            const tAux = Date.now();
-            const auxResults = await speculativeAux;
-            // Profile DB fallback if KV missed — fire now (only query that needs post data)
-            if (singlePost.author_id && !profile) {
+              } catch {
+                profKvMs = Date.now() - tKv;
+                /* KV miss — fall through */
+              }
+              // DB fallback
               profSrc = "db";
+              const tDb = Date.now();
               const { data: profRow } = await sb(env).from("user_profiles")
                 .select("user_id, teran_id, display_name, avatar")
                 .eq("user_id", singlePost.author_id)
                 .maybeSingle();
+              profDbMs = Date.now() - tDb;
               profile = profRow;
-            }
+            })();
+
+            // ── Await all in parallel: speculative (media+likes) + profile ──
+            const tAux = Date.now();
+            const [auxResults] = await Promise.all([speculativeAux, profilePromise]);
             const auxWaitMs = Date.now() - tAux;
 
             const mediaResult = auxResults[0];
@@ -1398,7 +1408,7 @@ export default {
             };
 
             const totalFastMs = Date.now() - fastStart;
-            console.log(`[perf] /api/posts single_post_fast`, JSON.stringify({ rid: request_id, path: "single_post_fast", select_ms: postsQueryMs, prof_kv_ms: profKvMs, prof_src: profSrc, aux_wait_ms: auxWaitMs, total_fast_ms: totalFastMs, total_ms: postsQueryMs + totalFastMs, likes: likeCount, media: mediaRows.length }));
+            console.log(`[perf] /api/posts single_post_fast`, JSON.stringify({ rid: request_id, path: "single_post_fast", select_ms: postsQueryMs, prof_kv_ms: profKvMs, prof_db_ms: profDbMs, prof_src: profSrc, aux_wait_ms: auxWaitMs, total_fast_ms: totalFastMs, total_ms: postsQueryMs + totalFastMs, likes: likeCount, media: mediaRows.length }));
 
             return ok(req, env, request_id, { posts: [enriched] });
           }
@@ -3554,24 +3564,40 @@ export default {
               });
             }
 
-            // Cache MISS — query DB
+            // Cache MISS — query DB using RPC (GROUP BY in Postgres, returns 1 row per post_id)
+            // Falls back to row-fetch if RPC not deployed yet
             const tDb = Date.now();
-            const { data: countRows, error } = await sb(env)
-              .from("comments")
-              .select("post_id")
-              .in("post_id", postIds);
-            const dbMs = Date.now() - tDb;
-            if (error) throw error;
+            let counts: Record<string, number> = {};
+            let queryMethod = "rpc";
 
-            // Build response — tally rows by post_id
-            const counts: Record<string, number> = {};
-            for (const id of postIds) {
-              counts[String(id)] = 0;
+            try {
+              const { data: rpcRows, error: rpcErr } = await sb(env)
+                .rpc("get_comments_counts", { p_post_ids: postIds });
+              if (rpcErr) throw rpcErr;
+              // RPC returns [{post_id, comment_count}, ...]
+              for (const id of postIds) {
+                counts[String(id)] = 0;
+              }
+              for (const row of rpcRows ?? []) {
+                counts[String((row as any).post_id)] = Number((row as any).comment_count) || 0;
+              }
+            } catch {
+              // Fallback: fetch all rows + count in JS (pre-RPC behavior)
+              queryMethod = "select_fallback";
+              const { data: countRows, error } = await sb(env)
+                .from("comments")
+                .select("post_id")
+                .in("post_id", postIds);
+              if (error) throw error;
+              for (const id of postIds) {
+                counts[String(id)] = 0;
+              }
+              for (const row of countRows ?? []) {
+                const key = String((row as any).post_id);
+                counts[key] = (counts[key] || 0) + 1;
+              }
             }
-            for (const row of countRows ?? []) {
-              const key = String((row as any).post_id);
-              counts[key] = (counts[key] || 0) + 1;
-            }
+            const dbMs = Date.now() - tDb;
 
             const responseBody = { counts, request_id };
             const body = JSON.stringify(responseBody);
@@ -3590,7 +3616,7 @@ export default {
             );
 
             const totalMs = Date.now() - t0;
-            console.log(`[perf] /api/comments/counts`, JSON.stringify({ rid, cache: "MISS", cache_check_ms: tCache - t0, db_ms: dbMs, total_ms: totalMs, ids_count: idsCount, hash: cacheKeyHash.slice(0, 12), payloadBytes: body.length }));
+            console.log(`[perf] /api/comments/counts`, JSON.stringify({ rid, cache: "MISS", query_method: queryMethod, cache_check_ms: tCache - t0, db_ms: dbMs, total_ms: totalMs, ids_count: idsCount, hash: cacheKeyHash.slice(0, 12), payloadBytes: body.length }));
 
             return new Response(body, {
               status: 200,
