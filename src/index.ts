@@ -696,6 +696,20 @@ export default {
           const isScopedQuery = !!post_type_param || !!root_only_param || !!mode_param || !!mood_param || !!q_param;
           const cursor = (isReplyQuery || isScopedQuery) ? parseCursor(cursor_param) : null;
           const FEED_CACHE_TTL = light ? 60 : 30;
+          const fresh_param = url.searchParams.get("fresh");
+          const after_create_post_id_param = url.searchParams.get("after_create_post_id");
+          const isFreshBypass = fresh_param === "1" || !!after_create_post_id_param;
+          if (isFreshBypass) {
+            console.log(`[ApiPostsMainFeedDbg]`, JSON.stringify({
+              phase: 'fresh_bypass_requested',
+              fresh: fresh_param,
+              afterCreatePostId: after_create_post_id_param,
+              cacheBypassed: true,
+              requestParams: { post_type: post_type_param, root_only: root_only_param, room_scope: room_scope_param, limit: limit_param },
+              rid: request_id,
+              t: Date.now(),
+            }));
+          }
           const p1 = performance.now();
 
           // ── Edge cache: eligible for public, non-personalized feeds ──
@@ -716,7 +730,7 @@ export default {
             )
           );
           // Feed cache: non-reply, non-cursored, non-user-specific queries
-          const isFeed = !id_param && !user_id_param && !author_id_param && !isReplyQuery && !cursor && !room_id_param && (!hasPersonalizedFilters) && (!parent_post_id_param) && (isStandardScopedFeed || (!post_type_param && !root_only_param && !room_scope_param));
+          const isFeed = !isFreshBypass && !id_param && !user_id_param && !author_id_param && !isReplyQuery && !cursor && !room_id_param && (!hasPersonalizedFilters) && (!parent_post_id_param) && (isStandardScopedFeed || (!post_type_param && !root_only_param && !room_scope_param));
           let feedCacheKey: Request | null = null;
           const cache = caches.default;
 
@@ -1957,7 +1971,8 @@ export default {
             headers: {
               "Content-Type": "application/json",
               "X-Request-Id": request_id,
-              "X-Cache": isFeed ? "MISS" : "BYPASS",
+              "X-Cache": isFeed ? "MISS" : (isFreshBypass ? "BYPASS_FRESH" : "BYPASS"),
+              ...(isFreshBypass ? { "Cache-Control": "no-store" } : {}),
               ...corsHeaders(req, env),
             },
           });
