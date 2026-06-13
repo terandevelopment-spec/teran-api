@@ -4358,8 +4358,39 @@ export default {
                   .eq("id", comment_id)
                   .single();
                 if (commentData) {
-                  // Resolve room from liked comment's post
-                  const { data: clPostData } = await sb(env).from("posts").select("room_id").eq("id", (commentData as any).post_id).single();
+                  // Walk up parent_post_id chain to find the root thread post.
+                  // comments.post_id may point to a child post (if the comment was
+                  // created while viewing a non-root post in PostDetail). The
+                  // notification must target the root post so tapping opens the
+                  // full thread, not a standalone child post.
+                  let resolvedRootPostId = (commentData as any).post_id;
+                  let directParentPostId: number | null = null;
+                  const MAX_HOPS = 10;
+                  for (let hop = 0; hop < MAX_HOPS; hop++) {
+                    const { data: postRow } = await sb(env)
+                      .from("posts")
+                      .select("id, parent_post_id")
+                      .eq("id", resolvedRootPostId)
+                      .maybeSingle();
+                    if (!postRow || !(postRow as any).parent_post_id) break;
+                    if (hop === 0) directParentPostId = (postRow as any).parent_post_id;
+                    resolvedRootPostId = (postRow as any).parent_post_id;
+                  }
+
+                  console.log(`[CreateCommentLikeNotification]`, JSON.stringify({
+                    likedCommentPostId: (commentData as any).post_id,
+                    directParentPostId,
+                    resolvedRootPostId,
+                    notificationPostId: resolvedRootPostId,
+                    notificationCommentId: comment_id,
+                    hops: resolvedRootPostId !== (commentData as any).post_id
+                      ? `walked from ${(commentData as any).post_id} to ${resolvedRootPostId}`
+                      : "already root",
+                    request_id,
+                  }));
+
+                  // Resolve room from the root post (not the original comment post)
+                  const { data: clPostData } = await sb(env).from("posts").select("room_id").eq("id", resolvedRootPostId).single();
                   const clRoomMeta = await resolveRoomMeta(env, (clPostData as any)?.room_id);
                   await createNotification(env, {
                     recipient_user_id: commentData.user_id,
@@ -4367,9 +4398,10 @@ export default {
                     actor_name,
                     actor_avatar,
                     type: "comment_like",
-                    post_id: commentData.post_id,
+                    post_id: resolvedRootPostId,
                     comment_id,
                     parent_comment_id: commentData.parent_comment_id,
+                    root_post_id: resolvedRootPostId,
                     ...clRoomMeta,
                     group_key: `cl:${comment_id}`,
                   }, request_id);
