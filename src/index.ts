@@ -378,6 +378,38 @@ async function resolveRoomMeta(
   }
 }
 
+// --------- Root Post Resolution Helper ----------
+/**
+ * Walk up the parent_post_id chain from a given post ID to find the root
+ * thread post. Returns the root post ID (where parent_post_id is null).
+ * If startPostId is already a root post, returns it unchanged.
+ * Max 10 hops to prevent infinite loops.
+ */
+async function resolveRootPostId(
+  env: Env,
+  startPostId: number,
+  requestId?: string
+): Promise<{ rootPostId: number; directParentPostId: number | null; hops: number }> {
+  let currentId = startPostId;
+  let directParentPostId: number | null = null;
+  const MAX_HOPS = 10;
+  let hops = 0;
+
+  for (let hop = 0; hop < MAX_HOPS; hop++) {
+    const { data: postRow } = await sb(env)
+      .from("posts")
+      .select("id, parent_post_id")
+      .eq("id", currentId)
+      .maybeSingle();
+    if (!postRow || !(postRow as any).parent_post_id) break;
+    if (hop === 0) directParentPostId = (postRow as any).parent_post_id;
+    currentId = (postRow as any).parent_post_id;
+    hops++;
+  }
+
+  return { rootPostId: currentId, directParentPostId, hops };
+}
+
 // --------- Notifications Helper ----------
 async function createNotification(
   env: Env,
@@ -2688,14 +2720,22 @@ export default {
 
                 // Use user_id (JWT sub) for notification recipient, NOT author_id (persona)
                 if (parentPost?.user_id && parentPost.user_id !== _notifUserId) {
-                  console.log(`[notif-deferred] creating post_reply`, {
+                  // Resolve the true root post ID — _notifParentPostId may itself be a child post
+                  const prResolvedRootId = _notifRootPostId
+                    ?? (await resolveRootPostId(env, _notifParentPostId, _notifRequestId)).rootPostId;
+
+                  console.log(`[CreateCommentRelatedNotification]`, JSON.stringify({
+                    type: "post_reply",
+                    directTargetPostId: _notifParentPostId,
+                    directParentPostId: null,
+                    resolvedRootPostId: prResolvedRootId,
+                    notificationPostId: prResolvedRootId,
+                    notificationCommentId: _notifReplyPostId,
+                    notificationParentCommentId: _notifParentPostId !== prResolvedRootId ? _notifParentPostId : null,
+                    clientRootPostId: _notifRootPostId,
                     request_id: _notifRequestId,
-                    parent_post_id: _notifParentPostId,
-                    actor_user_id: _notifUserId,
-                    recipient_user_id: parentPost.user_id,
-                    actor_persona_id: _notifAuthorId,
-                    parent_author_id: parentPost.author_id,
-                  });
+                  }));
+
                   const replyRoomId = (parentPost as any).room_id ?? _notifRoomId ?? null;
                   const replyRoomMeta = await resolveRoomMeta(env, replyRoomId);
                   await createNotification(env, {
@@ -2704,11 +2744,12 @@ export default {
                     actor_name: _notifAuthorName,
                     actor_avatar: _notifAuthorAvatar,
                     type: "post_reply",
-                    post_id: _notifParentPostId,
-                    root_post_id: _notifRootPostId ?? _notifParentPostId,
+                    post_id: prResolvedRootId,
+                    root_post_id: prResolvedRootId,
                     comment_id: _notifReplyPostId,  // store reply post ID for content enrichment
+                    parent_comment_id: _notifParentPostId !== prResolvedRootId ? _notifParentPostId : undefined,
                     ...replyRoomMeta,
-                    group_key: `post_reply:${_notifParentPostId}`,
+                    group_key: `post_reply:${prResolvedRootId}`,
                   }, _notifRequestId);
                   console.log(`[notif-deferred][${_notifRequestId}] post_reply notification created OK in ${Date.now() - tNotif}ms`);
                 } else if (!parentPost?.user_id) {
@@ -4259,12 +4300,25 @@ export default {
           // Create notification for comment
           if (parent_comment_id == null) {
             // Top-level comment on a post -> notify post owner
+            // Resolve root post ID in case post_id is a child post
+            const { rootPostId: pcRootPostId, directParentPostId: pcDirectParent, hops: pcHops } = await resolveRootPostId(env, post_id, request_id);
             const { data: postData } = await sb(env)
               .from("posts")
               .select("user_id, room_id")
-              .eq("id", post_id)
+              .eq("id", pcRootPostId)
               .single();
             if (postData) {
+              console.log(`[CreateCommentRelatedNotification]`, JSON.stringify({
+                type: "post_comment",
+                directTargetPostId: post_id,
+                directParentPostId: pcDirectParent,
+                resolvedRootPostId: pcRootPostId,
+                notificationPostId: pcRootPostId,
+                notificationCommentId: data.id,
+                notificationParentCommentId: null,
+                hops: pcHops,
+                request_id,
+              }));
               const pcRoomMeta = await resolveRoomMeta(env, (postData as any).room_id);
               await createNotification(env, {
                 recipient_user_id: postData.user_id,
@@ -4272,10 +4326,11 @@ export default {
                 actor_name: author_name,
                 actor_avatar: author_avatar,
                 type: "post_comment",
-                post_id,
+                post_id: pcRootPostId,
+                root_post_id: pcRootPostId,
                 comment_id: data.id,
                 ...pcRoomMeta,
-                group_key: `pc:${post_id}`,
+                group_key: `pc:${pcRootPostId}`,
               }, request_id);
             }
           } else {
@@ -4285,20 +4340,33 @@ export default {
               .select("user_id, post_id")
               .eq("id", parent_comment_id)
               .single();
-            // Resolve room from parent comment's post
-            let replyCommentRoomMeta = { room_id: null as string | null, room_icon_key: null as string | null, room_emoji: null as string | null };
             if (parentComment) {
-              const { data: replyPostData } = await sb(env).from("posts").select("room_id").eq("id", (parentComment as any).post_id).single();
-              replyCommentRoomMeta = await resolveRoomMeta(env, (replyPostData as any)?.room_id);
-            }
-            if (parentComment) {
+              // Resolve root post ID from the parent comment's post_id
+              const { rootPostId: rpRootPostId, directParentPostId: rpDirectParent, hops: rpHops } = await resolveRootPostId(env, (parentComment as any).post_id, request_id);
+              // Resolve room from the root post
+              const { data: replyPostData } = await sb(env).from("posts").select("room_id").eq("id", rpRootPostId).single();
+              const replyCommentRoomMeta = await resolveRoomMeta(env, (replyPostData as any)?.room_id);
+
+              console.log(`[CreateCommentRelatedNotification]`, JSON.stringify({
+                type: "reply",
+                directTargetPostId: (parentComment as any).post_id,
+                directParentPostId: rpDirectParent,
+                resolvedRootPostId: rpRootPostId,
+                notificationPostId: rpRootPostId,
+                notificationCommentId: data.id,
+                notificationParentCommentId: parent_comment_id,
+                hops: rpHops,
+                request_id,
+              }));
+
               await createNotification(env, {
                 recipient_user_id: parentComment.user_id,
                 actor_user_id: user_id,
                 actor_name: author_name,
                 actor_avatar: author_avatar,
                 type: "reply",
-                post_id: parentComment.post_id,
+                post_id: rpRootPostId,
+                root_post_id: rpRootPostId,
                 comment_id: data.id,
                 parent_comment_id,
                 ...replyCommentRoomMeta,
@@ -4358,39 +4426,23 @@ export default {
                   .eq("id", comment_id)
                   .single();
                 if (commentData) {
-                  // Walk up parent_post_id chain to find the root thread post.
-                  // comments.post_id may point to a child post (if the comment was
-                  // created while viewing a non-root post in PostDetail). The
-                  // notification must target the root post so tapping opens the
-                  // full thread, not a standalone child post.
-                  let resolvedRootPostId = (commentData as any).post_id;
-                  let directParentPostId: number | null = null;
-                  const MAX_HOPS = 10;
-                  for (let hop = 0; hop < MAX_HOPS; hop++) {
-                    const { data: postRow } = await sb(env)
-                      .from("posts")
-                      .select("id, parent_post_id")
-                      .eq("id", resolvedRootPostId)
-                      .maybeSingle();
-                    if (!postRow || !(postRow as any).parent_post_id) break;
-                    if (hop === 0) directParentPostId = (postRow as any).parent_post_id;
-                    resolvedRootPostId = (postRow as any).parent_post_id;
-                  }
+                  // Resolve root post ID from the comment's post_id
+                  const { rootPostId: clRootPostId, directParentPostId: clDirectParent, hops: clHops } = await resolveRootPostId(env, (commentData as any).post_id, request_id);
 
-                  console.log(`[CreateCommentLikeNotification]`, JSON.stringify({
-                    likedCommentPostId: (commentData as any).post_id,
-                    directParentPostId,
-                    resolvedRootPostId,
-                    notificationPostId: resolvedRootPostId,
+                  console.log(`[CreateCommentRelatedNotification]`, JSON.stringify({
+                    type: "comment_like",
+                    directTargetPostId: (commentData as any).post_id,
+                    directParentPostId: clDirectParent,
+                    resolvedRootPostId: clRootPostId,
+                    notificationPostId: clRootPostId,
                     notificationCommentId: comment_id,
-                    hops: resolvedRootPostId !== (commentData as any).post_id
-                      ? `walked from ${(commentData as any).post_id} to ${resolvedRootPostId}`
-                      : "already root",
+                    notificationParentCommentId: (commentData as any).parent_comment_id,
+                    hops: clHops,
                     request_id,
                   }));
 
                   // Resolve room from the root post (not the original comment post)
-                  const { data: clPostData } = await sb(env).from("posts").select("room_id").eq("id", resolvedRootPostId).single();
+                  const { data: clPostData } = await sb(env).from("posts").select("room_id").eq("id", clRootPostId).single();
                   const clRoomMeta = await resolveRoomMeta(env, (clPostData as any)?.room_id);
                   await createNotification(env, {
                     recipient_user_id: commentData.user_id,
@@ -4398,10 +4450,10 @@ export default {
                     actor_name,
                     actor_avatar,
                     type: "comment_like",
-                    post_id: resolvedRootPostId,
+                    post_id: clRootPostId,
                     comment_id,
                     parent_comment_id: commentData.parent_comment_id,
-                    root_post_id: resolvedRootPostId,
+                    root_post_id: clRootPostId,
                     ...clRoomMeta,
                     group_key: `cl:${comment_id}`,
                   }, request_id);
@@ -4552,11 +4604,29 @@ export default {
 
               // Phase 5: Notification (only if new like + not self + owner found)
               if (wasInserted && postData?.user_id && !isSelfLike) {
-                const likedPostRootId = postData.root_post_id ?? post_id;
+                // Resolve root post ID — prefer DB root_post_id, fall back to helper walk
+                let likedPostRootId = postData.root_post_id;
+                if (!likedPostRootId || likedPostRootId === post_id) {
+                  // root_post_id may equal post_id if this IS a root post, or be null
+                  // Verify via parent_post_id lookup
+                  const { rootPostId: plRootId } = await resolveRootPostId(env, post_id, request_id);
+                  likedPostRootId = plRootId;
+                }
                 // Resolve room meta only when actually creating a notification and post has a room
                 const roomMeta = postData.room_id
                   ? await resolveRoomMeta(env, postData.room_id)
                   : { room_id: null, room_icon_key: null, room_emoji: null };
+
+                console.log(`[CreateCommentRelatedNotification]`, JSON.stringify({
+                  type: "post_like",
+                  directTargetPostId: post_id,
+                  directParentPostId: null,
+                  resolvedRootPostId: likedPostRootId,
+                  notificationPostId: likedPostRootId,
+                  notificationCommentId: likedPostRootId !== post_id ? post_id : null,
+                  notificationParentCommentId: null,
+                  request_id,
+                }));
 
                 const t_notif = Date.now();
                 await createNotification(env, {
@@ -4565,8 +4635,11 @@ export default {
                   actor_name,
                   actor_avatar,
                   type: "post_like",
-                  post_id,
+                  post_id: likedPostRootId,
                   root_post_id: likedPostRootId,
+                  // If the liked post is a child post, store the liked post id
+                  // as comment_id so the frontend can focus on it
+                  comment_id: likedPostRootId !== post_id ? post_id : undefined,
                   ...roomMeta,
                   group_key: `post_like:${post_id}`,
                 }, request_id);
