@@ -4556,10 +4556,17 @@ export default {
                 });
 
                 if (!deviceAccountId) {
-                  console.warn(`[like-auth] REJECTED: unclaimed device ${jwt_user_id} tried to like as actor_id ${actor_id}`);
-                  throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
-                }
-                if (!personaAccountId || personaAccountId !== deviceAccountId) {
+                  // ── Unclaimed-user path: pre-claim trust model ──
+                  // Pre-claim, there is no server-side device→persona binding.
+                  // Allow like UNLESS the persona is already claimed by another account.
+                  if (personaAccountId) {
+                    // Persona is claimed — unclaimed device cannot act as it
+                    console.warn(`[like-auth] REJECTED: unclaimed device ${jwt_user_id} tried to like as claimed actor ${actor_id} (owner account: ${personaAccountId})`);
+                    throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
+                  }
+                  // Persona is unclaimed — allow (client-trusted pre-claim)
+                  console.log(`[like-auth] UNCLAIMED_ALLOW device ${jwt_user_id} liking as actor ${actor_id}`);
+                } else if (!personaAccountId || personaAccountId !== deviceAccountId) {
                   console.warn(`[like-auth] REJECTED: device ${jwt_user_id} account ${deviceAccountId} does not own actor ${actor_id} (persona account: ${personaAccountId})`);
                   throw new HttpError(403, "FORBIDDEN", "You do not own this persona");
                 }
@@ -4681,20 +4688,34 @@ export default {
                   .maybeSingle();
 
                 if (!deviceBinding?.account_id) {
-                  console.warn(`[like-auth] REJECTED: unclaimed device ${jwt_device_id} tried to unlike with actor_id ${actor_id}`);
-                  throw new HttpError(403, "FORBIDDEN", "You do not own this like");
-                }
+                  // ── Unclaimed-user path: pre-claim trust model ──
+                  // Allow unlike UNLESS the persona is already claimed by another account.
+                  const { data: claimedBinding } = await sb(env)
+                    .from("account_personas")
+                    .select("account_id")
+                    .eq("persona_author_id", actor_id)
+                    .maybeSingle();
 
-                const { data: personaBinding } = await sb(env)
-                  .from("account_personas")
-                  .select("persona_author_id")
-                  .eq("account_id", deviceBinding.account_id)
-                  .eq("persona_author_id", actor_id)
-                  .maybeSingle();
+                  if (claimedBinding) {
+                    console.warn(`[like-auth] REJECTED: unclaimed device ${jwt_device_id} tried to unlike as claimed actor ${actor_id} (owner account: ${(claimedBinding as any).account_id})`);
+                    throw new HttpError(403, "FORBIDDEN", "You do not own this like");
+                  }
 
-                if (!personaBinding) {
-                  console.warn(`[like-auth] REJECTED: device ${jwt_device_id} account ${deviceBinding.account_id} does not own actor ${actor_id}`);
-                  throw new HttpError(403, "FORBIDDEN", "You do not own this like");
+                  // Persona is unclaimed — allow unlike (client-trusted pre-claim)
+                  console.log(`[like-auth] UNCLAIMED_ALLOW device ${jwt_device_id} unliking as actor ${actor_id}`);
+                } else {
+                  // ── Claimed-user path: verify persona belongs to the same account ──
+                  const { data: personaBinding } = await sb(env)
+                    .from("account_personas")
+                    .select("persona_author_id")
+                    .eq("account_id", deviceBinding.account_id)
+                    .eq("persona_author_id", actor_id)
+                    .maybeSingle();
+
+                  if (!personaBinding) {
+                    console.warn(`[like-auth] REJECTED: device ${jwt_device_id} account ${deviceBinding.account_id} does not own actor ${actor_id}`);
+                    throw new HttpError(403, "FORBIDDEN", "You do not own this like");
+                  }
                 }
               }
 
@@ -6917,22 +6938,37 @@ export default {
               .maybeSingle();
 
             if (!deviceBinding?.account_id) {
-              // Unclaimed device trying to update a persona that isn't its own device_id
-              console.warn(`[profile-auth] REJECTED: unclaimed device ${jwt_device_id} tried to update persona ${trimmedUserId}`);
-              throw new HttpError(403, "FORBIDDEN", "You do not own this profile");
-            }
+              // ── Unclaimed-user path: pre-claim trust model ──
+              // Pre-claim, there is no server-side device→persona binding.
+              // The persona exists only in the client's localStorage/IDB.
+              // Allow profile sync UNLESS the persona is already claimed by another account.
+              const { data: claimedBinding } = await sb(env)
+                .from("account_personas")
+                .select("account_id")
+                .eq("persona_author_id", trimmedUserId)
+                .maybeSingle();
 
-            // Claimed account: verify persona belongs to the same account
-            const { data: personaBinding } = await sb(env)
-              .from("account_personas")
-              .select("persona_author_id")
-              .eq("account_id", deviceBinding.account_id)
-              .eq("persona_author_id", trimmedUserId)
-              .maybeSingle();
+              if (claimedBinding) {
+                // Persona is claimed by an account — unclaimed device cannot update it
+                console.warn(`[profile-auth] REJECTED: unclaimed device ${jwt_device_id} tried to update claimed persona ${trimmedUserId} (owner account: ${(claimedBinding as any).account_id})`);
+                throw new HttpError(403, "FORBIDDEN", "You do not own this profile");
+              }
 
-            if (!personaBinding) {
-              console.warn(`[profile-auth] REJECTED: device ${jwt_device_id} account ${deviceBinding.account_id} does not own persona ${trimmedUserId}`);
-              throw new HttpError(403, "FORBIDDEN", "You do not own this profile");
+              // Persona is unclaimed — allow profile sync (client-trusted pre-claim)
+              console.log(`[profile-auth] UNCLAIMED_ALLOW device ${jwt_device_id} syncing persona ${trimmedUserId}`);
+            } else {
+              // ── Claimed-user path: verify persona belongs to the same account ──
+              const { data: personaBinding } = await sb(env)
+                .from("account_personas")
+                .select("persona_author_id")
+                .eq("account_id", deviceBinding.account_id)
+                .eq("persona_author_id", trimmedUserId)
+                .maybeSingle();
+
+              if (!personaBinding) {
+                console.warn(`[profile-auth] REJECTED: device ${jwt_device_id} account ${deviceBinding.account_id} does not own persona ${trimmedUserId}`);
+                throw new HttpError(403, "FORBIDDEN", "You do not own this profile");
+              }
             }
           }
           const incoming: Record<string, any> = {
