@@ -724,8 +724,9 @@ export default {
           const light = url.searchParams.get("light") === "1";              // lightweight mode: skip enrichment
           const room_category_param = url.searchParams.get("room_category"); // CSV: "games,music"
           const include_global_param = url.searchParams.get("include_global"); // "0" to exclude global threads
+          const feed_param = url.searchParams.get("feed");                     // "wire" → Room root posts only
           const isReplyQuery = !!parent_post_id_param;
-          const isScopedQuery = !!post_type_param || !!root_only_param || !!mode_param || !!mood_param || !!q_param;
+          const isScopedQuery = !!post_type_param || !!root_only_param || !!mode_param || !!mood_param || !!q_param || feed_param === "wire";
           const cursor = (isReplyQuery || isScopedQuery) ? parseCursor(cursor_param) : null;
           const FEED_CACHE_TTL = light ? 60 : 30;
           const fresh_param = url.searchParams.get("fresh");
@@ -751,18 +752,19 @@ export default {
           const isRootOnly = root_only_param === "1" || root_only_param === "true";
           const isStandardScopedFeed = (
             !hasPersonalizedFilters &&
-            isRootOnly &&
             (
               // Home global status feed
-              (post_type_param === "status" && room_scope_param === "global") ||
-              // Wire thread feed
-              (post_type_param === "thread" && !room_scope_param) ||
-              // Wire rooms feed
-              (!post_type_param && room_scope_param === "rooms")
+              (isRootOnly && post_type_param === "status" && room_scope_param === "global") ||
+              // Wire thread feed (legacy post_type=thread path)
+              (isRootOnly && post_type_param === "thread" && !room_scope_param) ||
+              // Wire rooms feed (legacy room_scope=rooms path)
+              (isRootOnly && !post_type_param && room_scope_param === "rooms") ||
+              // Wire feed=wire shorthand (Room root posts)
+              (feed_param === "wire")
             )
           );
           // Feed cache: non-reply, non-cursored, non-user-specific queries
-          const isFeed = !isFreshBypass && !id_param && !user_id_param && !author_id_param && !isReplyQuery && !cursor && !room_id_param && (!hasPersonalizedFilters) && (!parent_post_id_param) && (isStandardScopedFeed || (!post_type_param && !root_only_param && !room_scope_param));
+          const isFeed = !isFreshBypass && !id_param && !user_id_param && !author_id_param && !isReplyQuery && !cursor && !room_id_param && (!hasPersonalizedFilters) && (!parent_post_id_param) && (isStandardScopedFeed || (!post_type_param && !root_only_param && !room_scope_param && !feed_param));
           let feedCacheKey: Request | null = null;
           const cache = caches.default;
 
@@ -840,12 +842,13 @@ export default {
             .select(selectFields)
             .is("deleted_at", null);
 
-          // Wire thread-feed context flag: used to apply activity-based ordering
+          // Wire feed context flag: used to apply activity-based ordering
           // (resurfacing) instead of strict created_at ordering.
           // True only for the main Wire feed — not profiles, single-post, or room-scoped.
-          const isWireThreadFeed = post_type_param === "thread"
-            && room_scope_param !== "rooms"
-            && !id_param && !user_id_param && !author_id_param;
+          const isWireThreadFeed = (
+            feed_param === "wire" ||
+            (post_type_param === "thread" && room_scope_param !== "rooms")
+          ) && !id_param && !user_id_param && !author_id_param;
 
           // Apply filters - priority: id > user_id > author_id > default
           let lim = 1; // will be set per branch below
@@ -857,6 +860,23 @@ export default {
             }
             q = q.eq("id", parsedId).limit(1);
           } else {
+            // ── feed=wire shorthand: Room root posts only ──
+            // When frontend sends ?feed=wire, constrain to posts that:
+            //   - are root posts (parent_post_id IS NULL)
+            //   - belong to a room (room_id IS NOT NULL)
+            //   - are not Main/global (room_id != 'global')
+            if (feed_param === "wire") {
+              q = q.is("parent_post_id", null);
+              q = q.not("room_id", "is", null);
+              q = q.neq("room_id", "global");
+              console.log(`[GET /api/posts feed filter]`, JSON.stringify({
+                rid: request_id,
+                feed: feed_param,
+                appliedWireFilter: true,
+                filters: "parent_post_id.is.null,room_id.not.is.null,room_id.neq.global",
+              }));
+            }
+
             // Apply user_id filter if provided (canonical account id, takes priority)
             if (user_id_param) {
               q = q.eq("user_id", user_id_param);
