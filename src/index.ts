@@ -8115,6 +8115,30 @@ export default {
           }
         }
 
+        // --------- OGP image helper for Yahoo News pickup pages ----------
+        async function fetchOgImage(articleUrl: string, timeoutMs = 4000): Promise<string | null> {
+          try {
+            const controller = new AbortController();
+            const tid = setTimeout(() => controller.abort(), timeoutMs);
+            const res = await fetch(articleUrl, {
+              signal: controller.signal,
+              headers: { "User-Agent": "Teran-News-Aggregator/1.0" },
+            });
+            clearTimeout(tid);
+            if (!res.ok) return null;
+            const html = await res.text();
+            // Priority: og:image > twitter:image
+            const ogMatch = html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i);
+            const twMatch = html.match(/<meta\s+name=["']twitter:image["']\s+content=["']([^"']+)["']/i);
+            const candidate = ogMatch?.[1] || twMatch?.[1] || null;
+            // Validate: must be absolute HTTPS URL
+            if (candidate && /^https:\/\//i.test(candidate)) return candidate;
+            return null;
+          } catch {
+            return null;
+          }
+        }
+
         // --------- Yahoo News Japan RSS Proxy (Cache API, 120s TTL) ----------
         // GET /api/rss?category=<category>
         // Returns news articles in NewsData.io-compatible format from Yahoo News Japan RSS feeds
@@ -8303,11 +8327,35 @@ export default {
             });
             const tParse = Date.now();
 
-            // DEBUG: log first parsed item to verify description extraction
+            // ── OGP thumbnail enrichment (best-effort, batched) ──
+            // Batch in groups of 4 to stay within subrequest concurrency limits
+            const OGP_BATCH_SIZE = 4;
+            let ogpOk = 0;
+            let ogpFail = 0;
+            for (let batchStart = 0; batchStart < items.length; batchStart += OGP_BATCH_SIZE) {
+              const batch = items.slice(batchStart, batchStart + OGP_BATCH_SIZE);
+              const results = await Promise.allSettled(
+                batch.map(item => item.link ? fetchOgImage(item.link) : Promise.resolve(null))
+              );
+              for (let j = 0; j < batch.length; j++) {
+                const r = results[j];
+                if (r.status === "fulfilled" && r.value) {
+                  items[batchStart + j].image_url = r.value;
+                  ogpOk++;
+                } else {
+                  ogpFail++;
+                }
+              }
+            }
+            const tOgp = Date.now();
+            console.log(`[rss:ogp] rid=${request_id} category=${category} ok=${ogpOk} fail=${ogpFail} elapsed=${tOgp - tParse}ms`);
+
+            // DEBUG: log first parsed item to verify enrichment
             if (items.length > 0) {
               console.log(`[rss] PARSED_ITEM_0 rid=${request_id}`, JSON.stringify({
                 title: items[0].title,
                 description: items[0].description?.slice(0, 120),
+                image_url: items[0].image_url,
                 link: items[0].link,
                 pubDate: items[0].pubDate,
               }));
@@ -8336,7 +8384,7 @@ export default {
             }
 
             const tEnd = Date.now();
-            console.log(`[perf] rss rid=${request_id} cache=MISS category=${category} cacheCheck=${tCache - t0}ms fetch=${tFetch - tCache}ms parse=${tParse - tFetch}ms total=${tEnd - t0}ms payloadBytes=${body.length} items=${items.length} colo=${colo} key=${cacheKey.url}`);
+            console.log(`[perf] rss rid=${request_id} cache=MISS category=${category} cacheCheck=${tCache - t0}ms fetch=${tFetch - tCache}ms parse=${tParse - tFetch}ms ogp=${tOgp - tParse}ms total=${tEnd - t0}ms payloadBytes=${body.length} items=${items.length} ogpOk=${ogpOk} ogpFail=${ogpFail} colo=${colo} key=${cacheKey.url}`);
 
             // Build response
             const response = new Response(body, {
