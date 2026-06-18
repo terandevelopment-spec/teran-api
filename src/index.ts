@@ -8115,22 +8115,23 @@ export default {
           }
         }
 
-        // --------- BBC RSS Proxy (Cache API, 120s TTL) ----------
+        // --------- Yahoo News Japan RSS Proxy (Cache API, 120s TTL) ----------
         // GET /api/rss?category=<category>
-        // Returns news articles in NewsData.io-compatible format from BBC RSS feeds
+        // Returns news articles in NewsData.io-compatible format from Yahoo News Japan RSS feeds
         if (path === "/api/rss" && req.method === "GET") {
           const RSS_CACHE_TTL = 120; // seconds
           const t0 = Date.now();
 
-          // Category -> BBC RSS URL mapping (allowlist)
+          // Category -> Yahoo News Japan RSS URL mapping (allowlist)
           const RSS_FEEDS: Record<string, string> = {
-            technology: "http://feeds.bbci.co.uk/news/technology/rss.xml",
-            world: "http://feeds.bbci.co.uk/news/world/rss.xml",
-            business: "http://feeds.bbci.co.uk/news/business/rss.xml",
-            science: "http://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
-            entertainment: "http://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml",
-            sports: "http://feeds.bbci.co.uk/sport/rss.xml",
-            health: "http://feeds.bbci.co.uk/news/health/rss.xml",
+            domestic: "https://news.yahoo.co.jp/rss/topics/domestic.xml",
+            world: "https://news.yahoo.co.jp/rss/topics/world.xml",
+            business: "https://news.yahoo.co.jp/rss/topics/business.xml",
+            entertainment: "https://news.yahoo.co.jp/rss/topics/entertainment.xml",
+            sports: "https://news.yahoo.co.jp/rss/topics/sports.xml",
+            it: "https://news.yahoo.co.jp/rss/topics/it.xml",
+            science: "https://news.yahoo.co.jp/rss/topics/science.xml",
+            local: "https://news.yahoo.co.jp/rss/topics/local.xml",
           };
 
           const category = url.searchParams.get("category")?.toLowerCase()?.trim() || "";
@@ -8288,7 +8289,7 @@ export default {
                 description,
                 image_url,
                 link,
-                source_id: "bbc",
+                source_id: "yahoo_news",
                 pubDate,
               });
             }
