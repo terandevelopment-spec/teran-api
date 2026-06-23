@@ -2129,8 +2129,11 @@ export default {
           // Media validation
           const MAX_IMAGES = 4;
           const MAX_VIDEOS = 1;
+          const MAX_AUDIOS = 1;
+          const MAX_VIDEO_DURATION_MS = 6000; // 6s short-media policy
+          const MAX_AUDIO_DURATION_MS = 9000; // 9s short-media policy
           const validatedMedia: Array<{
-            type: "image" | "video";
+            type: "image" | "video" | "audio";
             key: string;
             thumb_key?: string | null;
             width?: number | null;
@@ -2141,6 +2144,7 @@ export default {
 
           let imageCount = 0;
           let videoCount = 0;
+          let audioCount = 0;
 
           for (const m of mediaInput) {
             const mType = m?.type;
@@ -2172,15 +2176,47 @@ export default {
               if (videoCount > MAX_VIDEOS) {
                 throw new HttpError(422, "VALIDATION_ERROR", `Maximum ${MAX_VIDEOS} video allowed per post`);
               }
+              if (!mKey.trim().startsWith("video/")) {
+                throw new HttpError(422, "VALIDATION_ERROR", "Video key must start with 'video/'");
+              }
+              const vDuration = typeof m?.duration_ms === "number" ? m.duration_ms : null;
+              if (vDuration === null || !Number.isFinite(vDuration) || vDuration <= 0) {
+                throw new HttpError(422, "VALIDATION_ERROR", "duration_ms is required for video");
+              }
+              if (vDuration > MAX_VIDEO_DURATION_MS) {
+                throw new HttpError(422, "VALIDATION_ERROR", "Video exceeds 6s limit");
+              }
               validatedMedia.push({
                 type: "video",
                 key: mKey.trim(),
                 thumb_key: mThumbKey ? mThumbKey.trim() : null,
                 bytes: typeof m?.bytes === "number" ? m.bytes : null,
-                duration_ms: typeof m?.duration_ms === "number" ? m.duration_ms : null,
+                duration_ms: vDuration,
+              });
+            } else if (mType === "audio") {
+              audioCount++;
+              if (audioCount > MAX_AUDIOS) {
+                throw new HttpError(422, "VALIDATION_ERROR", `Maximum ${MAX_AUDIOS} audio allowed per post`);
+              }
+              if (!mKey.trim().startsWith("audio/")) {
+                throw new HttpError(422, "VALIDATION_ERROR", "Audio key must start with 'audio/'");
+              }
+              const aDuration = typeof m?.duration_ms === "number" ? m.duration_ms : null;
+              if (aDuration === null || !Number.isFinite(aDuration) || aDuration <= 0) {
+                throw new HttpError(422, "VALIDATION_ERROR", "duration_ms is required for audio");
+              }
+              if (aDuration > MAX_AUDIO_DURATION_MS) {
+                throw new HttpError(422, "VALIDATION_ERROR", "Audio exceeds 9s limit");
+              }
+              validatedMedia.push({
+                type: "audio",
+                key: mKey.trim(),
+                thumb_key: null,
+                bytes: typeof m?.bytes === "number" ? m.bytes : null,
+                duration_ms: aDuration,
               });
             } else {
-              throw new HttpError(422, "VALIDATION_ERROR", "Media type must be 'image' or 'video'");
+              throw new HttpError(422, "VALIDATION_ERROR", "Media type must be 'image', 'video', or 'audio'");
             }
           }
           mark("validation");
@@ -4190,17 +4226,24 @@ export default {
 
           // Validate media array (same limits as posts for images)
           const MAX_COMMENT_IMAGES = 4;
+          const MAX_COMMENT_VIDEOS = 1;
+          const MAX_COMMENT_AUDIOS = 1;
+          const MAX_VIDEO_DURATION_MS = 6000; // 6s short-media policy
+          const MAX_AUDIO_DURATION_MS = 9000; // 9s short-media policy
 
           const validatedMedia: Array<{
-            type: "image" | "video";
+            type: "image" | "video" | "audio";
             key: string;
             thumb_key?: string | null;
             width?: number | null;
             height?: number | null;
             bytes?: number | null;
+            duration_ms?: number | null;
           }> = [];
 
           let imageCount = 0;
+          let videoCount = 0;
+          let audioCount = 0;
           for (const m of mediaInput) {
             const mType = m?.type;
             const mKey = m?.key;
@@ -4238,9 +4281,21 @@ export default {
                 bytes: typeof m?.bytes === "number" ? m.bytes : null,
               });
             } else if (mType === "video") {
+              videoCount++;
+              if (videoCount > MAX_COMMENT_VIDEOS) {
+                throw new HttpError(422, "VALIDATION_ERROR", `Maximum ${MAX_COMMENT_VIDEOS} video allowed per comment`);
+              }
               // Video support in comments - validate key starts with "video/"
               if (!mKey.startsWith("video/")) {
                 throw new HttpError(422, "VALIDATION_ERROR", "Video key must start with 'video/'");
+              }
+              // Short-media policy: duration_ms required and capped at 6s
+              const vDuration = typeof m?.duration_ms === "number" ? m.duration_ms : null;
+              if (vDuration === null || !Number.isFinite(vDuration) || vDuration <= 0) {
+                throw new HttpError(422, "VALIDATION_ERROR", "duration_ms is required for video");
+              }
+              if (vDuration > MAX_VIDEO_DURATION_MS) {
+                throw new HttpError(422, "VALIDATION_ERROR", "Video exceeds 6s limit");
               }
               // Optional poster_key for video thumbnails
               const posterKey = m?.poster_key;
@@ -4258,9 +4313,34 @@ export default {
                 width: typeof m?.width === "number" ? m.width : null,
                 height: typeof m?.height === "number" ? m.height : null,
                 bytes: typeof m?.bytes === "number" ? m.bytes : null,
+                duration_ms: vDuration,
+              });
+            } else if (mType === "audio") {
+              audioCount++;
+              if (audioCount > MAX_COMMENT_AUDIOS) {
+                throw new HttpError(422, "VALIDATION_ERROR", `Maximum ${MAX_COMMENT_AUDIOS} audio allowed per comment`);
+              }
+              if (!mKey.startsWith("audio/")) {
+                throw new HttpError(422, "VALIDATION_ERROR", "Audio key must start with 'audio/'");
+              }
+              const aDuration = typeof m?.duration_ms === "number" ? m.duration_ms : null;
+              if (aDuration === null || !Number.isFinite(aDuration) || aDuration <= 0) {
+                throw new HttpError(422, "VALIDATION_ERROR", "duration_ms is required for audio");
+              }
+              if (aDuration > MAX_AUDIO_DURATION_MS) {
+                throw new HttpError(422, "VALIDATION_ERROR", "Audio exceeds 9s limit");
+              }
+              validatedMedia.push({
+                type: "audio",
+                key: mKey.trim(),
+                thumb_key: null,
+                width: null,
+                height: null,
+                bytes: typeof m?.bytes === "number" ? m.bytes : null,
+                duration_ms: aDuration,
               });
             } else {
-              throw new HttpError(422, "VALIDATION_ERROR", "Media type must be 'image' or 'video'");
+              throw new HttpError(422, "VALIDATION_ERROR", "Media type must be 'image', 'video', or 'audio'");
             }
           }
 
@@ -4308,6 +4388,7 @@ export default {
               width: m.width ?? null,
               height: m.height ?? null,
               bytes: m.bytes ?? null,
+              duration_ms: m.duration_ms ?? null,
             }));
             const { data: insertedMedia, error: mediaError } = await sb(env)
               .from("media")
@@ -5197,7 +5278,7 @@ export default {
           const content_type = typeof body?.content_type === "string" ? body.content_type : null;
 
           // Validate kind
-          const validKinds = ["image_original", "image_thumb", "video_original", "video_thumb", "video", "thumb", "avatar"] as const;
+          const validKinds = ["image_original", "image_thumb", "video_original", "video_thumb", "video", "thumb", "avatar", "audio"] as const;
           if (!kind || !validKinds.includes(kind as any)) {
             throw new HttpError(422, "VALIDATION_ERROR", `kind must be one of: ${validKinds.join(", ")}`);
           }
@@ -5212,6 +5293,7 @@ export default {
           const isVideo = kind.startsWith("video_") || kind === "video";
           const isThumb = kind === "thumb"; // thumbs are images but go to thumb/ prefix
           const isAvatar = kind === "avatar"; // avatars are images, go to avatar/ prefix
+          const isAudio = kind === "audio"; // short audio fragments go to audio/ prefix
           if (isImage && !content_type.startsWith("image/")) {
             throw new HttpError(422, "VALIDATION_ERROR", "content_type must start with image/ for image kinds");
           }
@@ -5224,12 +5306,30 @@ export default {
           if (isAvatar && !content_type.startsWith("image/")) {
             throw new HttpError(422, "VALIDATION_ERROR", "content_type must start with image/ for avatar kind");
           }
+          if (isAudio) {
+            const ALLOWED_AUDIO_TYPES = new Set([
+              "audio/webm", "audio/mp4", "audio/x-m4a", "audio/aac", "audio/mpeg", "audio/wav",
+            ]);
+            const baseAudioType = content_type.split(";")[0].trim().toLowerCase();
+            if (!ALLOWED_AUDIO_TYPES.has(baseAudioType)) {
+              throw new HttpError(422, "VALIDATION_ERROR", "content_type must be a supported audio type (audio/webm, audio/mp4, audio/x-m4a, audio/aac, audio/mpeg, audio/wav) for audio kind");
+            }
+          }
 
-          // Server-side video size limit (50MB)
-          const MAX_VIDEO_BYTES = 50 * 1024 * 1024;
+          // ── Server-side byte caps (short-media policy) ──
+          // Video: 12MB, Audio: 2MB. bytes is REQUIRED for video/audio uploads so
+          // the cap cannot be bypassed by simply omitting the bytes field.
+          const MAX_VIDEO_BYTES = 12 * 1024 * 1024;
+          const MAX_AUDIO_BYTES = 2 * 1024 * 1024;
           const bytes = typeof body?.bytes === "number" ? body.bytes : null;
-          if (isVideo && bytes !== null && bytes > MAX_VIDEO_BYTES) {
-            throw new HttpError(400, "SIZE_LIMIT_EXCEEDED", "Video exceeds 50MB limit");
+          if (isVideo || isAudio) {
+            if (bytes === null || !Number.isFinite(bytes) || bytes <= 0) {
+              throw new HttpError(422, "VALIDATION_ERROR", "bytes is required and must be a positive number for video/audio uploads");
+            }
+            const cap = isAudio ? MAX_AUDIO_BYTES : MAX_VIDEO_BYTES;
+            if (bytes > cap) {
+              throw new HttpError(400, "SIZE_LIMIT_EXCEEDED", isAudio ? "Audio exceeds 2MB limit" : "Video exceeds 12MB limit");
+            }
           }
 
           // Generate unique object key: {prefix}/{user_id}/{timestamp}_{uuid}.{ext}
@@ -5237,13 +5337,13 @@ export default {
           let keyPrefix = kind;
           if (kind === "thumb") keyPrefix = "thumb";
 
-          const ext = content_type.split("/")[1]?.split(";")[0] || (isImage || isThumb || isAvatar ? "jpg" : "mp4");
+          const ext = content_type.split("/")[1]?.split(";")[0] || (isImage || isThumb || isAvatar ? "jpg" : isAudio ? "m4a" : "mp4");
           const timestamp = Date.now();
           const uniqueId = crypto.randomUUID();
           const key = `${keyPrefix}/${user_id}/${timestamp}_${uniqueId}.${ext}`;
 
           // Validate key prefix (defense-in-depth)
-          const allowedPrefixes = ["image_original/", "image_thumb/", "video_original/", "video_thumb/", "video/", "thumb/", "avatar/"];
+          const allowedPrefixes = ["image_original/", "image_thumb/", "video_original/", "video_thumb/", "video/", "thumb/", "avatar/", "audio/"];
           if (!allowedPrefixes.some(p => key.startsWith(p))) {
             throw new HttpError(422, "VALIDATION_ERROR", "Invalid key prefix");
           }

@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS media (
   post_id bigint NULL REFERENCES posts(id) ON DELETE CASCADE,
   comment_id bigint NULL REFERENCES comments(id) ON DELETE CASCADE,
 
-  type text NOT NULL CHECK (type IN ('image','video')),
+  type text NOT NULL CHECK (type IN ('image','video','audio')),
   key text NOT NULL,
   thumb_key text NULL,
 
