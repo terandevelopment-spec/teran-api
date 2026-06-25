@@ -820,7 +820,7 @@ export default {
           // omitting it causes String(undefined) !== jwt_sub → silent 403.
           // Trimmed light select: removed mode, moods, show_in_feed, room_category
           // (not rendered by feed cards; show_in_feed/room_category only used in WHERE, not SELECT)
-          const lightSelectFields = "id,user_id,created_at,last_activity_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,media(type,key,thumb_key),uses_room_avatar,uses_room_display_name,room_anon_id";
+          const lightSelectFields = "id,user_id,created_at,last_activity_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,media(type,key,thumb_key,duration_ms),uses_room_avatar,uses_room_display_name,room_anon_id";
           const selectFields = light ? lightSelectFields : feedSelectFields;
 
           // Step 1: log normalized filter + select cols
@@ -2712,10 +2712,11 @@ export default {
             post_insert_total_ms: (marks["post_insert_done"] && marks["auth_done"]) ? +((marks["post_insert_done"] - marks["auth_done"]).toFixed(1)) : null,
           });
 
-          // Insert media rows into unified 'media' table (fire-and-forget)
-          // Media data is reconstructed from validated input for the response;
-          // the actual DB insert is deferred to avoid blocking the response with
-          // another ~500ms Supabase round-trip.
+          // Insert media rows into unified 'media' table (synchronous)
+          // Media data is inserted BEFORE the response is returned so that
+          // subsequent GET /api/posts always includes the media rows.
+          // Previously this was deferred via ctx.waitUntil(), which caused a
+          // race: the post could appear in the feed without its media.
           let mediaRows: any[] = [];
           if (validatedMedia.length > 0) {
             const postId = data.id;
@@ -2730,20 +2731,18 @@ export default {
               duration_ms: m.duration_ms ?? null,
             }));
 
-            // Reconstruct response rows from input (no DB id needed by client)
-            mediaRows = mediaInsert;
+            // Synchronous DB write — fail the request if media can't be persisted
+            const { error: mediaInsertError } = await sb(env)
+              .from("media")
+              .insert(mediaInsert);
 
-            // Deferred DB write
-            ctx.waitUntil(
-              Promise.resolve(
-                sb(env)
-                  .from("media")
-                  .insert(mediaInsert)
-              ).then(({ error }) => {
-                if (error) console.error(`[posts][${request_id}] media insert failed (deferred)`, { error: error.message, postId, count: mediaInsert.length });
-                else console.log(`[perf] /api/posts media_deferred_ok rid=${request_id} count=${mediaInsert.length}`);
-              }).catch((e: any) => console.error(`[posts][${request_id}] media insert threw (deferred)`, { error: e?.message }))
-            );
+            if (mediaInsertError) {
+              console.error(`[posts][${request_id}] media insert failed`, { error: mediaInsertError.message, postId, count: mediaInsert.length });
+              throw new HttpError(500, "MEDIA_INSERT_FAILED", `Media insert failed: ${mediaInsertError.message}`);
+            }
+
+            console.log(`[perf] /api/posts media_insert_ok rid=${request_id} count=${mediaInsert.length}`);
+            mediaRows = mediaInsert;
             mark("media_insert_done");
           }
 
