@@ -5390,9 +5390,9 @@ export default {
           }
 
           // ── Server-side byte caps (short-media policy) ──
-          // Video: 12MB, Audio: 2MB. bytes is REQUIRED for video/audio uploads so
+          // Video: 50MB, Audio: 2MB. bytes is REQUIRED for video/audio uploads so
           // the cap cannot be bypassed by simply omitting the bytes field.
-          const MAX_VIDEO_BYTES = 12 * 1024 * 1024;
+          const MAX_VIDEO_BYTES = 50 * 1024 * 1024;
           const MAX_AUDIO_BYTES = 2 * 1024 * 1024;
           const bytes = typeof body?.bytes === "number" ? body.bytes : null;
           if (isVideo || isAudio) {
@@ -5401,7 +5401,7 @@ export default {
             }
             const cap = isAudio ? MAX_AUDIO_BYTES : MAX_VIDEO_BYTES;
             if (bytes > cap) {
-              throw new HttpError(400, "SIZE_LIMIT_EXCEEDED", isAudio ? "Audio exceeds 2MB limit" : "Video exceeds 12MB limit");
+              throw new HttpError(400, "SIZE_LIMIT_EXCEEDED", isAudio ? "Audio exceeds 2MB limit" : "Video exceeds 50MB limit");
             }
           }
 
