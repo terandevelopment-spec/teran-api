@@ -88,6 +88,59 @@ class HttpError extends Error {
   }
 }
 
+// Selected-segment cap for videos (6s + 200ms tolerance), matching the frontend.
+const MAX_VIDEO_SEGMENT_MS = 6200;
+
+/**
+ * Validate optional video trim/crop metadata (Phase 2) and return normalized
+ * snake_case fields. Throws HttpError(422) for invalid values.
+ *
+ * - trim_start_ms / trim_end_ms: if either is present, both must be finite,
+ *   start >= 0, end > start, and (end - start) <= 6200ms. If absent, returns null.
+ * - object_pos_x / object_pos_y: optional; if present must be finite in [0, 1].
+ */
+function validateVideoTrimCrop(m: any): {
+  trim_start_ms: number | null;
+  trim_end_ms: number | null;
+  object_pos_x: number | null;
+  object_pos_y: number | null;
+} {
+  const hasStart = m?.trim_start_ms !== undefined && m?.trim_start_ms !== null;
+  const hasEnd = m?.trim_end_ms !== undefined && m?.trim_end_ms !== null;
+
+  let trim_start_ms: number | null = null;
+  let trim_end_ms: number | null = null;
+
+  if (hasStart || hasEnd) {
+    const start = Number(m.trim_start_ms);
+    const end = Number(m.trim_end_ms);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) {
+      throw new HttpError(422, "VALIDATION_ERROR", "Invalid video trim range.");
+    }
+    if (end - start > MAX_VIDEO_SEGMENT_MS) {
+      throw new HttpError(422, "VALIDATION_ERROR", "Videos must be 6 seconds or shorter.");
+    }
+    trim_start_ms = Math.round(start);
+    trim_end_ms = Math.round(end);
+  }
+
+  const validatePos = (v: any): number | null => {
+    if (v === undefined || v === null) return null;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0 || n > 1) {
+      throw new HttpError(422, "VALIDATION_ERROR", "Invalid video crop position.");
+    }
+    return n;
+  };
+
+  return {
+    trim_start_ms,
+    trim_end_ms,
+    object_pos_x: validatePos(m?.object_pos_x),
+    object_pos_y: validatePos(m?.object_pos_y),
+  };
+}
+
 /**
  * Returns the live display name from a user_profiles row, or null if the value
  * is missing, empty, or the DB default placeholder 'Anonymous'.
@@ -820,7 +873,7 @@ export default {
           // omitting it causes String(undefined) !== jwt_sub → silent 403.
           // Trimmed light select: removed mode, moods, show_in_feed, room_category
           // (not rendered by feed cards; show_in_feed/room_category only used in WHERE, not SELECT)
-          const lightSelectFields = "id,user_id,created_at,last_activity_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,media(type,key,thumb_key,duration_ms),uses_room_avatar,uses_room_display_name,room_anon_id";
+          const lightSelectFields = "id,user_id,created_at,last_activity_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,media(type,key,thumb_key,duration_ms,trim_start_ms,trim_end_ms,object_pos_x,object_pos_y),uses_room_avatar,uses_room_display_name,room_anon_id";
           const selectFields = light ? lightSelectFields : feedSelectFields;
 
           // Step 1: log normalized filter + select cols
@@ -1065,7 +1118,7 @@ export default {
             if (Number.isFinite(postId)) {
               speculativeAux = Promise.all([
                 sb(env).from("media")
-                  .select("id, post_id, type, key, thumb_key, width, height, duration_ms")
+                  .select("id, post_id, type, key, thumb_key, width, height, duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y")
                   .eq("post_id", postId),
                 sb(env).from("post_likes")
                   .select("post_id, actor_id")
@@ -1526,7 +1579,7 @@ export default {
             if (which === "media") {
               const t = Date.now();
               const { data } = await sb(env).from("media")
-                .select("id, post_id, type, key, thumb_key, width, height, duration_ms")
+                .select("id, post_id, type, key, thumb_key, width, height, duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y")
                 .in("post_id", postIds);
               parallelMs = Date.now() - t;
               rowCount = (data ?? []).length;
@@ -1572,7 +1625,7 @@ export default {
           let allLikeRows: any[] = [];
           let commentCountRows: any[] = [];
           let allRepostRows: any[] = [];
-          const mediaSelectCols = "id, post_id, type, key, thumb_key, width, height, duration_ms";
+          const mediaSelectCols = "id, post_id, type, key, thumb_key, width, height, duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y";
           const mediaWhereShape = "post_id IN";
           const likesSelectCols = "post_id, actor_id";
           const likesWhereShape = "post_id IN";
@@ -2140,6 +2193,10 @@ export default {
             height?: number | null;
             bytes?: number | null;
             duration_ms?: number | null;
+            trim_start_ms?: number | null;
+            trim_end_ms?: number | null;
+            object_pos_x?: number | null;
+            object_pos_y?: number | null;
           }> = [];
 
           let imageCount = 0;
@@ -2183,15 +2240,18 @@ export default {
               if (vDuration === null || !Number.isFinite(vDuration) || vDuration <= 0) {
                 throw new HttpError(422, "VALIDATION_ERROR", "duration_ms is required for video");
               }
-              if (vDuration > MAX_VIDEO_DURATION_MS) {
-                throw new HttpError(422, "VALIDATION_ERROR", "Video exceeds 6s limit");
+              // duration_ms is the selected-segment duration; cap at 6.2s.
+              if (vDuration > MAX_VIDEO_SEGMENT_MS) {
+                throw new HttpError(422, "VALIDATION_ERROR", "Videos must be 6 seconds or shorter.");
               }
+              const vTrimCrop = validateVideoTrimCrop(m);
               validatedMedia.push({
                 type: "video",
                 key: mKey.trim(),
                 thumb_key: mThumbKey ? mThumbKey.trim() : null,
                 bytes: typeof m?.bytes === "number" ? m.bytes : null,
                 duration_ms: vDuration,
+                ...vTrimCrop,
               });
             } else if (mType === "audio") {
               audioCount++;
@@ -2729,6 +2789,10 @@ export default {
               height: m.height ?? null,
               bytes: m.bytes ?? null,
               duration_ms: m.duration_ms ?? null,
+              trim_start_ms: m.trim_start_ms ?? null,
+              trim_end_ms: m.trim_end_ms ?? null,
+              object_pos_x: m.object_pos_x ?? null,
+              object_pos_y: m.object_pos_y ?? null,
             }));
 
             // Synchronous DB write — fail the request if media can't be persisted
@@ -3169,7 +3233,7 @@ export default {
             // ── Fetch existing media for this post ──
             const { data: existingMedia } = await sb(env)
               .from("media")
-              .select("id,type,key,thumb_key,width,height,bytes,duration_ms,created_at")
+              .select("id,type,key,thumb_key,width,height,bytes,duration_ms,trim_start_ms,trim_end_ms,object_pos_x,object_pos_y,created_at")
               .eq("post_id", postId);
 
             const currentMedia = (existingMedia ?? []) as any[];
@@ -3297,7 +3361,7 @@ export default {
               const { data: insertedRows, error: mediaInsErr } = await sb(env)
                 .from("media")
                 .insert(mediaInsert)
-                .select("id,type,key,thumb_key,width,height,bytes,duration_ms,created_at");
+                .select("id,type,key,thumb_key,width,height,bytes,duration_ms,trim_start_ms,trim_end_ms,object_pos_x,object_pos_y,created_at");
               if (mediaInsErr) {
                 console.error(`[PATCH post] media insert error`, { postId, error: mediaInsErr.message });
                 throw mediaInsErr;
@@ -4117,7 +4181,7 @@ export default {
             // Query 4: Fetch media for all comments
             sb(env)
               .from("media")
-              .select("id, comment_id, type, key, thumb_key, width, height")
+              .select("id, comment_id, type, key, thumb_key, width, height, duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y")
               .in("comment_id", commentIds),
           ];
           // Query 5 (conditional): profile DB fallback only for KV misses
@@ -4238,6 +4302,10 @@ export default {
             height?: number | null;
             bytes?: number | null;
             duration_ms?: number | null;
+            trim_start_ms?: number | null;
+            trim_end_ms?: number | null;
+            object_pos_x?: number | null;
+            object_pos_y?: number | null;
           }> = [];
 
           let imageCount = 0;
@@ -4288,14 +4356,15 @@ export default {
               if (!mKey.startsWith("video/")) {
                 throw new HttpError(422, "VALIDATION_ERROR", "Video key must start with 'video/'");
               }
-              // Short-media policy: duration_ms required and capped at 6s
+              // Short-media policy: duration_ms required and capped at 6.2s (selected segment)
               const vDuration = typeof m?.duration_ms === "number" ? m.duration_ms : null;
               if (vDuration === null || !Number.isFinite(vDuration) || vDuration <= 0) {
                 throw new HttpError(422, "VALIDATION_ERROR", "duration_ms is required for video");
               }
-              if (vDuration > MAX_VIDEO_DURATION_MS) {
-                throw new HttpError(422, "VALIDATION_ERROR", "Video exceeds 6s limit");
+              if (vDuration > MAX_VIDEO_SEGMENT_MS) {
+                throw new HttpError(422, "VALIDATION_ERROR", "Videos must be 6 seconds or shorter.");
               }
+              const vTrimCrop = validateVideoTrimCrop(m);
               // Optional poster_key for video thumbnails
               const posterKey = m?.poster_key;
               let validatedPosterKey: string | null = null;
@@ -4313,6 +4382,7 @@ export default {
                 height: typeof m?.height === "number" ? m.height : null,
                 bytes: typeof m?.bytes === "number" ? m.bytes : null,
                 duration_ms: vDuration,
+                ...vTrimCrop,
               });
             } else if (mType === "audio") {
               audioCount++;
@@ -4388,6 +4458,10 @@ export default {
               height: m.height ?? null,
               bytes: m.bytes ?? null,
               duration_ms: m.duration_ms ?? null,
+              trim_start_ms: m.trim_start_ms ?? null,
+              trim_end_ms: m.trim_end_ms ?? null,
+              object_pos_x: m.object_pos_x ?? null,
+              object_pos_y: m.object_pos_y ?? null,
             }));
             const { data: insertedMedia, error: mediaError } = await sb(env)
               .from("media")
@@ -7542,7 +7616,7 @@ export default {
               : Promise.resolve({ data: [] }),
             sb(env)
               .from("media")
-              .select("id, news_comment_id, type, key, thumb_key, width, height, bytes, duration_ms")
+              .select("id, news_comment_id, type, key, thumb_key, width, height, bytes, duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y")
               .in("news_comment_id", commentIds),
           ]);
 
@@ -7648,6 +7722,10 @@ export default {
             height?: number | null;
             bytes?: number | null;
             duration_ms?: number | null;
+            trim_start_ms?: number | null;
+            trim_end_ms?: number | null;
+            object_pos_x?: number | null;
+            object_pos_y?: number | null;
           }> = [];
 
           let ncImageCount = 0;
@@ -7680,12 +7758,14 @@ export default {
               if (ncVideoCount > MAX_NC_VIDEOS) {
                 throw new HttpError(422, "VALIDATION_ERROR", `Maximum ${MAX_NC_VIDEOS} video allowed`);
               }
+              const vTrimCrop = validateVideoTrimCrop(m);
               validatedMedia.push({
                 type: "video",
                 key: mKey.trim(),
                 thumb_key: mThumbKey ? mThumbKey.trim() : null,
                 bytes: typeof m?.bytes === "number" ? m.bytes : null,
                 duration_ms: typeof m?.duration_ms === "number" ? m.duration_ms : null,
+                ...vTrimCrop,
               });
             } else {
               throw new HttpError(422, "VALIDATION_ERROR", "Media type must be 'image' or 'video'");
@@ -7740,6 +7820,10 @@ export default {
               height: m.height ?? null,
               bytes: m.bytes ?? null,
               duration_ms: m.duration_ms ?? null,
+              trim_start_ms: m.trim_start_ms ?? null,
+              trim_end_ms: m.trim_end_ms ?? null,
+              object_pos_x: m.object_pos_x ?? null,
+              object_pos_y: m.object_pos_y ?? null,
             }));
             const { data: insertedMedia, error: mediaError } = await sb(env)
               .from("media")
