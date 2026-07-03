@@ -175,14 +175,14 @@ function scheduleVideoProcessingForRows(
 }
 
 // Selected-segment cap for videos (6s + 200ms tolerance), matching the frontend.
-const MAX_VIDEO_SEGMENT_MS = 6200;
+const MAX_VIDEO_SEGMENT_MS = 7000;
 
 /**
  * Validate optional video trim/crop metadata (Phase 2) and return normalized
  * snake_case fields. Throws HttpError(422) for invalid values.
  *
  * - trim_start_ms / trim_end_ms: if either is present, both must be finite,
- *   start >= 0, end > start, and (end - start) <= 6200ms. If absent, returns null.
+ *   start >= 0, end > start, and (end - start) <= 7000ms. If absent, returns null.
  * - object_pos_x / object_pos_y: optional; if present must be finite in [0, 1].
  */
 function validateVideoTrimCrop(m: any): {
