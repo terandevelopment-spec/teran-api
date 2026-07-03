@@ -15,6 +15,8 @@ export interface Env {
   R2_ACCOUNT_ID: string;         // CF account id
   DIAG_LOG?: string;             // "1" to enable sampled request-start logs
   TERAN_ORIGIN_UIDS?: string;    // comma-separated device UIDs for teran.origin owner fast-path
+  PROCESSOR_URL?: string;        // External video processor service URL (e.g. https://teran-video-processor.fly.dev)
+  PROCESSOR_SECRET?: string;     // Shared secret for x-processor-secret header
 }
 
 // --------- request_id + response helpers ----------
@@ -85,6 +87,90 @@ class HttpError extends Error {
     super(message);
     this.status = status;
     this.code = code;
+  }
+}
+
+// ── Video processor orchestration ──────────────────────────────────────────
+// Calls the external teran-video-processor service to transcode newly uploaded
+// videos. Never throws — failures are logged and the original video remains
+// playable via the `key` fallback.
+//
+// TODO(future): rows stuck in 'pending' or 'processing' can be retried via a
+// scheduled cron or admin endpoint. No retry logic is implemented in this task.
+
+async function enqueueVideoProcessing(
+  env: Env,
+  payload: {
+    media_id: number;
+    original_key: string;
+    trim_start_ms?: number | null;
+    trim_end_ms?: number | null;
+  }
+): Promise<void> {
+  if (!env.PROCESSOR_URL || !env.PROCESSOR_SECRET) {
+    console.warn("[VideoProcessing] missing PROCESSOR_URL or PROCESSOR_SECRET — skipping");
+    return;
+  }
+
+  const processorBaseUrl = env.PROCESSOR_URL.replace(/\/+$/, "");
+  const url = `${processorBaseUrl}/process-video`;
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-processor-secret": env.PROCESSOR_SECRET,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.warn("[VideoProcessing] processor returned non-OK", {
+        status: res.status,
+        body: text.slice(0, 500),
+        media_id: payload.media_id,
+      });
+    } else {
+      console.log("[VideoProcessing] processor accepted", { media_id: payload.media_id });
+    }
+  } catch (err) {
+    console.warn("[VideoProcessing] processor request failed", {
+      media_id: payload.media_id,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function scheduleVideoProcessingForRows(
+  ctx: ExecutionContext,
+  env: Env,
+  rows: Array<{
+    id?: number | string | null;
+    type?: string | null;
+    key?: string | null;
+    trim_start_ms?: number | null;
+    trim_end_ms?: number | null;
+  }> | null | undefined
+): void {
+  for (const row of rows ?? []) {
+    if (row?.type !== "video") continue;
+    if (!row.id || !row.key) continue;
+
+    const mediaId =
+      typeof row.id === "number" ? row.id : Number.parseInt(String(row.id), 10);
+
+    if (!Number.isFinite(mediaId) || mediaId <= 0) continue;
+
+    ctx.waitUntil(
+      enqueueVideoProcessing(env, {
+        media_id: mediaId,
+        original_key: row.key as string,
+        trim_start_ms: row.trim_start_ms ?? null,
+        trim_end_ms: row.trim_end_ms ?? null,
+      })
+    );
   }
 }
 
@@ -2793,25 +2879,30 @@ export default {
               trim_end_ms: m.trim_end_ms ?? null,
               object_pos_x: m.object_pos_x ?? null,
               object_pos_y: m.object_pos_y ?? null,
+              // Video processing: set 'pending' for new video uploads
+              processing_status: m.type === "video"
+                ? (m.processing_status ?? "pending")
+                : (m.processing_status ?? null),
               // Optimized video fields (pass-through only; not set automatically)
               ...(m.optimized_key != null ? { optimized_key: m.optimized_key } : {}),
-              ...(m.processing_status != null ? { processing_status: m.processing_status } : {}),
               ...(m.optimized_bytes != null ? { optimized_bytes: m.optimized_bytes } : {}),
               ...(m.optimized_duration_ms != null ? { optimized_duration_ms: m.optimized_duration_ms } : {}),
             }));
 
             // Synchronous DB write — fail the request if media can't be persisted
-            const { error: mediaInsertError } = await sb(env)
+            // .select() returns inserted rows with DB-generated IDs (needed for video processor)
+            const { data: insertedMediaRows, error: mediaInsertError } = await sb(env)
               .from("media")
-              .insert(mediaInsert);
+              .insert(mediaInsert)
+              .select("id,type,key,trim_start_ms,trim_end_ms");
 
             if (mediaInsertError) {
               console.error(`[posts][${request_id}] media insert failed`, { error: mediaInsertError.message, postId, count: mediaInsert.length });
               throw new HttpError(500, "MEDIA_INSERT_FAILED", `Media insert failed: ${mediaInsertError.message}`);
             }
 
-            console.log(`[perf] /api/posts media_insert_ok rid=${request_id} count=${mediaInsert.length}`);
-            mediaRows = mediaInsert;
+            console.log(`[perf] /api/posts media_insert_ok rid=${request_id} count=${(insertedMediaRows ?? []).length}`);
+            mediaRows = insertedMediaRows ?? mediaInsert;
             mark("media_insert_done");
           }
 
@@ -2935,6 +3026,9 @@ export default {
             });
             ctx.waitUntil(Promise.all(deletions));
           }
+
+          // ── Schedule video processing for newly uploaded videos (non-blocking) ──
+          scheduleVideoProcessingForRows(ctx, env, mediaRows);
 
           return ok(req, env, request_id, { post: { ...data, media: mediaRows } }, 201);
         }
@@ -3345,6 +3439,10 @@ export default {
                     try { await env.R2_MEDIA.delete(row.thumb_key); }
                     catch (e: any) { console.warn(`[PATCH post] R2 delete failed for thumb_key=`, row.thumb_key, e); }
                   }
+                  if (row.optimized_key) {
+                    try { await env.R2_MEDIA.delete(row.optimized_key); }
+                    catch (e: any) { console.warn(`[PATCH post] R2 delete failed for optimized_key=`, row.optimized_key, e); }
+                  }
                 }
                 console.log(`[PATCH post] R2 cleanup done`, { postId, removed: removedMedia.length });
               })());
@@ -3362,6 +3460,10 @@ export default {
                 height: m.height,
                 bytes: m.bytes,
                 duration_ms: null,
+                trim_start_ms: m.trim_start_ms ?? null,
+                trim_end_ms: m.trim_end_ms ?? null,
+                // Video processing: set 'pending' for new video uploads during edit
+                processing_status: m.type === "video" ? "pending" : null,
               }));
               const { data: insertedRows, error: mediaInsErr } = await sb(env)
                 .from("media")
@@ -3397,6 +3499,9 @@ export default {
               kept: keptMedia.length,
               totalMedia: finalMedia.length,
             });
+
+            // ── Schedule video processing for newly added videos in edit (non-blocking) ──
+            scheduleVideoProcessingForRows(ctx, env, newMediaRows);
 
             return ok(req, env, request_id, { post: updatedPost });
           }
@@ -3680,12 +3785,12 @@ export default {
             // Fetch related media rows BEFORE deleting the comment
             const { data: mediaRows } = await sb(env)
               .from("media")
-              .select("key, thumb_key")
+              .select("key, thumb_key, optimized_key")
               .eq("comment_id", commentId);
 
             console.log("[DELETE comment] id=", commentId, "mediaCount=", (mediaRows ?? []).length);
 
-            // Delete R2 objects (key + thumb_key) for each media row
+            // Delete R2 objects (key + thumb_key + optimized_key) for each media row
             for (const row of mediaRows ?? []) {
               if (row.key) {
                 try {
@@ -3699,6 +3804,13 @@ export default {
                   await env.R2_MEDIA.delete(row.thumb_key);
                 } catch (e) {
                   console.warn("[DELETE comment] R2 delete failed for thumb_key=", row.thumb_key, e);
+                }
+              }
+              if ((row as any).optimized_key) {
+                try {
+                  await env.R2_MEDIA.delete((row as any).optimized_key);
+                } catch (e) {
+                  console.warn("[DELETE comment] R2 delete failed for optimized_key=", (row as any).optimized_key, e);
                 }
               }
             }
@@ -4467,9 +4579,12 @@ export default {
               trim_end_ms: m.trim_end_ms ?? null,
               object_pos_x: m.object_pos_x ?? null,
               object_pos_y: m.object_pos_y ?? null,
+              // Video processing: set 'pending' for new video uploads
+              processing_status: m.type === "video"
+                ? (m.processing_status ?? "pending")
+                : (m.processing_status ?? null),
               // Optimized video fields (pass-through only; not set automatically)
               ...(m.optimized_key != null ? { optimized_key: m.optimized_key } : {}),
-              ...(m.processing_status != null ? { processing_status: m.processing_status } : {}),
               ...(m.optimized_bytes != null ? { optimized_bytes: m.optimized_bytes } : {}),
               ...(m.optimized_duration_ms != null ? { optimized_duration_ms: m.optimized_duration_ms } : {}),
             }));
@@ -4564,6 +4679,9 @@ export default {
             .from("posts")
             .update({ last_activity_at: new Date().toISOString() })
             .eq("id", post_id);
+
+          // ── Schedule video processing for comment media (non-blocking) ──
+          scheduleVideoProcessingForRows(ctx, env, mediaRows);
 
           return ok(req, env, request_id, { comment: { ...data, media: mediaRows } }, 201);
         }
@@ -7834,9 +7952,12 @@ export default {
               trim_end_ms: m.trim_end_ms ?? null,
               object_pos_x: m.object_pos_x ?? null,
               object_pos_y: m.object_pos_y ?? null,
+              // Video processing: set 'pending' for new video uploads
+              processing_status: m.type === "video"
+                ? (m.processing_status ?? "pending")
+                : (m.processing_status ?? null),
               // Optimized video fields (pass-through only; not set automatically)
               ...(m.optimized_key != null ? { optimized_key: m.optimized_key } : {}),
-              ...(m.processing_status != null ? { processing_status: m.processing_status } : {}),
               ...(m.optimized_bytes != null ? { optimized_bytes: m.optimized_bytes } : {}),
               ...(m.optimized_duration_ms != null ? { optimized_duration_ms: m.optimized_duration_ms } : {}),
             }));
@@ -7920,6 +8041,9 @@ export default {
               });
             }
           }
+
+          // ── Schedule video processing for news comment media (non-blocking) ──
+          scheduleVideoProcessingForRows(ctx, env, mediaRows);
 
           return ok(req, env, request_id, {
             comment: { ...data, like_count: 0, liked_by_me: false, media: mediaRows }
