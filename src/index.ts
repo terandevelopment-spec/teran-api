@@ -873,7 +873,7 @@ export default {
           // omitting it causes String(undefined) !== jwt_sub → silent 403.
           // Trimmed light select: removed mode, moods, show_in_feed, room_category
           // (not rendered by feed cards; show_in_feed/room_category only used in WHERE, not SELECT)
-          const lightSelectFields = "id,user_id,created_at,last_activity_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,media(type,key,thumb_key,duration_ms,trim_start_ms,trim_end_ms,object_pos_x,object_pos_y),uses_room_avatar,uses_room_display_name,room_anon_id";
+          const lightSelectFields = "id,user_id,created_at,last_activity_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,media(type,key,thumb_key,optimized_key,processing_status,duration_ms,trim_start_ms,trim_end_ms,object_pos_x,object_pos_y),uses_room_avatar,uses_room_display_name,room_anon_id";
           const selectFields = light ? lightSelectFields : feedSelectFields;
 
           // Step 1: log normalized filter + select cols
@@ -1118,7 +1118,7 @@ export default {
             if (Number.isFinite(postId)) {
               speculativeAux = Promise.all([
                 sb(env).from("media")
-                  .select("id, post_id, type, key, thumb_key, width, height, duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y")
+                  .select("id, post_id, type, key, thumb_key, optimized_key, processing_status, width, height, duration_ms, optimized_bytes, optimized_duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y")
                   .eq("post_id", postId),
                 sb(env).from("post_likes")
                   .select("post_id, actor_id")
@@ -1579,7 +1579,7 @@ export default {
             if (which === "media") {
               const t = Date.now();
               const { data } = await sb(env).from("media")
-                .select("id, post_id, type, key, thumb_key, width, height, duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y")
+                .select("id, post_id, type, key, thumb_key, optimized_key, processing_status, width, height, duration_ms, optimized_bytes, optimized_duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y")
                 .in("post_id", postIds);
               parallelMs = Date.now() - t;
               rowCount = (data ?? []).length;
@@ -1625,7 +1625,7 @@ export default {
           let allLikeRows: any[] = [];
           let commentCountRows: any[] = [];
           let allRepostRows: any[] = [];
-          const mediaSelectCols = "id, post_id, type, key, thumb_key, width, height, duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y";
+          const mediaSelectCols = "id, post_id, type, key, thumb_key, optimized_key, processing_status, width, height, duration_ms, optimized_bytes, optimized_duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y";
           const mediaWhereShape = "post_id IN";
           const likesSelectCols = "post_id, actor_id";
           const likesWhereShape = "post_id IN";
@@ -2793,6 +2793,11 @@ export default {
               trim_end_ms: m.trim_end_ms ?? null,
               object_pos_x: m.object_pos_x ?? null,
               object_pos_y: m.object_pos_y ?? null,
+              // Optimized video fields (pass-through only; not set automatically)
+              ...(m.optimized_key != null ? { optimized_key: m.optimized_key } : {}),
+              ...(m.processing_status != null ? { processing_status: m.processing_status } : {}),
+              ...(m.optimized_bytes != null ? { optimized_bytes: m.optimized_bytes } : {}),
+              ...(m.optimized_duration_ms != null ? { optimized_duration_ms: m.optimized_duration_ms } : {}),
             }));
 
             // Synchronous DB write — fail the request if media can't be persisted
@@ -3233,7 +3238,7 @@ export default {
             // ── Fetch existing media for this post ──
             const { data: existingMedia } = await sb(env)
               .from("media")
-              .select("id,type,key,thumb_key,width,height,bytes,duration_ms,trim_start_ms,trim_end_ms,object_pos_x,object_pos_y,created_at")
+              .select("id,type,key,thumb_key,optimized_key,processing_status,width,height,bytes,duration_ms,optimized_bytes,optimized_duration_ms,trim_start_ms,trim_end_ms,object_pos_x,object_pos_y,created_at")
               .eq("post_id", postId);
 
             const currentMedia = (existingMedia ?? []) as any[];
@@ -3361,7 +3366,7 @@ export default {
               const { data: insertedRows, error: mediaInsErr } = await sb(env)
                 .from("media")
                 .insert(mediaInsert)
-                .select("id,type,key,thumb_key,width,height,bytes,duration_ms,trim_start_ms,trim_end_ms,object_pos_x,object_pos_y,created_at");
+                .select("id,type,key,thumb_key,optimized_key,processing_status,width,height,bytes,duration_ms,optimized_bytes,optimized_duration_ms,trim_start_ms,trim_end_ms,object_pos_x,object_pos_y,created_at");
               if (mediaInsErr) {
                 console.error(`[PATCH post] media insert error`, { postId, error: mediaInsErr.message });
                 throw mediaInsErr;
@@ -4181,7 +4186,7 @@ export default {
             // Query 4: Fetch media for all comments
             sb(env)
               .from("media")
-              .select("id, comment_id, type, key, thumb_key, width, height, duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y")
+              .select("id, comment_id, type, key, thumb_key, optimized_key, processing_status, width, height, duration_ms, optimized_bytes, optimized_duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y")
               .in("comment_id", commentIds),
           ];
           // Query 5 (conditional): profile DB fallback only for KV misses
@@ -4462,6 +4467,11 @@ export default {
               trim_end_ms: m.trim_end_ms ?? null,
               object_pos_x: m.object_pos_x ?? null,
               object_pos_y: m.object_pos_y ?? null,
+              // Optimized video fields (pass-through only; not set automatically)
+              ...(m.optimized_key != null ? { optimized_key: m.optimized_key } : {}),
+              ...(m.processing_status != null ? { processing_status: m.processing_status } : {}),
+              ...(m.optimized_bytes != null ? { optimized_bytes: m.optimized_bytes } : {}),
+              ...(m.optimized_duration_ms != null ? { optimized_duration_ms: m.optimized_duration_ms } : {}),
             }));
             const { data: insertedMedia, error: mediaError } = await sb(env)
               .from("media")
@@ -7616,7 +7626,7 @@ export default {
               : Promise.resolve({ data: [] }),
             sb(env)
               .from("media")
-              .select("id, news_comment_id, type, key, thumb_key, width, height, bytes, duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y")
+              .select("id, news_comment_id, type, key, thumb_key, optimized_key, processing_status, width, height, bytes, duration_ms, optimized_bytes, optimized_duration_ms, trim_start_ms, trim_end_ms, object_pos_x, object_pos_y")
               .in("news_comment_id", commentIds),
           ]);
 
@@ -7824,6 +7834,11 @@ export default {
               trim_end_ms: m.trim_end_ms ?? null,
               object_pos_x: m.object_pos_x ?? null,
               object_pos_y: m.object_pos_y ?? null,
+              // Optimized video fields (pass-through only; not set automatically)
+              ...(m.optimized_key != null ? { optimized_key: m.optimized_key } : {}),
+              ...(m.processing_status != null ? { processing_status: m.processing_status } : {}),
+              ...(m.optimized_bytes != null ? { optimized_bytes: m.optimized_bytes } : {}),
+              ...(m.optimized_duration_ms != null ? { optimized_duration_ms: m.optimized_duration_ms } : {}),
             }));
             const { data: insertedMedia, error: mediaError } = await sb(env)
               .from("media")
