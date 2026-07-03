@@ -8071,7 +8071,22 @@ export default {
               throw new HttpError(403, "FORBIDDEN", "You can only delete your own comments");
             }
 
-            // Delete
+            // Fetch related media rows BEFORE deleting the comment
+            const { data: mediaRows } = await sb(env)
+              .from("media")
+              .select("key, thumb_key, optimized_key")
+              .eq("news_comment_id", commentId);
+
+            // R2 cleanup — delete media objects (key + thumb_key + optimized_key)
+            for (const row of mediaRows ?? []) {
+              for (const k of [row.key, row.thumb_key, (row as any).optimized_key]) {
+                if (!k) continue;
+                try { await env.R2_MEDIA.delete(k); }
+                catch (e: any) { console.warn("[DELETE news-comment] R2 delete failed", { key: k, message: e?.message }); }
+              }
+            }
+
+            // Delete the comment (cascade deletes media rows in DB)
             const { error } = await sb(env)
               .from("news_comments")
               .delete()
