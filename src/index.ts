@@ -869,8 +869,14 @@ export default {
           const cursor = (isReplyQuery || isScopedQuery) ? parseCursor(cursor_param) : null;
           const FEED_CACHE_TTL = light ? 60 : 30;
           const fresh_param = url.searchParams.get("fresh");
+          const bust_param = url.searchParams.get("bust");
           const after_create_post_id_param = url.searchParams.get("after_create_post_id");
-          const isFreshBypass = fresh_param === "1" || !!after_create_post_id_param;
+          const isFreshBypass = fresh_param === "1" || bust_param != null || !!after_create_post_id_param;
+          const bypassReason = fresh_param === "1"
+            ? "fresh=1"
+            : (bust_param != null
+              ? "bust_present"
+              : (after_create_post_id_param ? "after_create_post_id" : null));
           if (isFreshBypass) {
             console.log(`[ApiPostsMainFeedDbg]`, JSON.stringify({
               phase: 'fresh_bypass_requested',
@@ -947,6 +953,25 @@ export default {
             cacheStatus = "MISS";
             console.log(`[perf] /api/posts cache`, JSON.stringify({ rid: request_id, cache_key: feedCacheKey?.url || "none", ttl_s: FEED_CACHE_TTL, cache: "MISS", cache_lookup_ms: cacheLookupMs }));
           }
+
+          // ── [OptimizedVideoPathDebug] FeedAPI:request (investigation) ──
+          console.log('[OptimizedVideoPathDebug][FeedAPI:request]', JSON.stringify({
+            path,
+            queryParams: {
+              post_type: post_type_param, root_only: root_only_param, room_scope: room_scope_param,
+              limit: limit_param, actor_id: actor_id_param ? 'set' : null, id: id_param || null,
+              light, feed: feed_param || null,
+            },
+            fresh: fresh_param || null,
+            bust: bust_param || null,
+            cacheKey: feedCacheKey?.url || null,
+            cacheHitMiss: cacheStatus,
+            cacheBypassed: isFreshBypass || !isFeed,
+            bypassReason: isFreshBypass ? bypassReason : (!isFeed ? 'not_cacheable_feed' : null),
+            isFeed,
+            rid: request_id,
+            t: Date.now(),
+          }));
 
           // Build base query with conditional select:
           // - Feed lists: lightweight select (content included for card preview)
@@ -1922,6 +1947,25 @@ export default {
               mediaByPost[m.post_id].push(m);
             }
 
+            // ── [OptimizedVideoPathDebug] FeedAPI:liveMediaRow (investigation) ──
+            try {
+              const _targetIncluded = postIds.some((pid: any) => String(pid) === '3667');
+              const _row351 = (mediaRows as any[]).find((m: any) => String(m.id) === '351') || null;
+              console.log('[OptimizedVideoPathDebug][FeedAPI:liveMediaRow]', JSON.stringify({
+                requestedPostIdsCount: postIds.length,
+                post3667Included: _targetIncluded,
+                media351: _row351 ? {
+                  id: _row351.id, post_id: _row351.post_id, key: _row351.key,
+                  optimized_key: _row351.optimized_key, thumb_key: _row351.thumb_key,
+                  processing_status: _row351.processing_status,
+                  duration_ms: _row351.duration_ms, optimized_duration_ms: _row351.optimized_duration_ms,
+                  created_at: _row351.created_at ?? null,
+                } : null,
+                rid: request_id,
+                t: Date.now(),
+              }));
+            } catch { /* ignore */ }
+
             // Compute like_count and liked_by_me from merged result
             const likeCounts: Record<number, number> = {};
             const likedByActorSet = new Set<number>();
@@ -1984,6 +2028,7 @@ export default {
               // Live identity overlay: prefer user_profiles values over post snapshot.
               const profile = profileMap[p.author_id];
               const liveAvatar = profile?.avatar || null;
+              const _liveMedia = mediaByPost[p.id] || [];
               return {
                 ...p,
                 author_name: p.uses_room_display_name
@@ -1992,7 +2037,7 @@ export default {
                 author_avatar: p.uses_room_avatar
                   ? avatar
                   : (liveAvatar || avatar),
-                media: mediaByPost[p.id] || [],
+                media: _liveMedia,
                 like_count: likeCounts[p.id] || 0,
                 liked_by_me: likedByActorSet.has(p.id),
                 comment_count: commentCounts[p.id] || 0,
@@ -2026,6 +2071,62 @@ export default {
           const responseBody = JSON.stringify(responsePayload);
           const serializeMs = performance.now() - tSerialize;
           const postsTotal = performance.now() - p0;
+
+          // ── Cache-skip guard: do NOT cache a feed snapshot that still contains a
+          // processing video, so non-fresh reads never serve pre-optimization media.
+          // A video is "processing" if status is pending/processing, or (unknown/null
+          // status + no optimized_key) on a recent post (bounded to avoid disabling
+          // caching for permanently-stuck old videos).
+          const PROCESSING_CACHE_SKIP_WINDOW_MS = 10 * 60 * 1000;
+          const _nowMsCache = Date.now();
+          const feedHasProcessingVideo = (enrichedPosts ?? []).some((pp: any) => {
+            const ageMs = pp?.created_at ? (_nowMsCache - Date.parse(pp.created_at)) : null;
+            return (Array.isArray(pp?.media) ? pp.media : []).some((m: any) => {
+              if (m?.type !== 'video') return false;
+              const st = m?.processing_status;
+              if (st === 'pending' || st === 'processing') return true;
+              if (st === 'ready' || st === 'failed') return false;
+              if (!m?.optimized_key && ageMs != null && ageMs <= PROCESSING_CACHE_SKIP_WINDOW_MS) return true;
+              return false;
+            });
+          });
+
+          // ── [OptimizedVideoPathDebug] FeedAPI:cacheDecision (investigation) ──
+          try {
+            const _has3667 = (enrichedPosts as any[]).some((pp: any) => String(pp.id) === '3667');
+            const shouldWriteCache = !!(isFeed && feedCacheKey && !feedHasProcessingVideo);
+            console.log('[OptimizedVideoPathDebug][FeedAPI:cacheDecision]', JSON.stringify({
+              path,
+              containsPost3667: _has3667,
+              containsUnstableVideoMedia: feedHasProcessingVideo,
+              shouldReadCache: isFeed,
+              shouldWriteCache,
+              ttl: shouldWriteCache ? FEED_CACHE_TTL : 0,
+              reason: !isFeed
+                ? (isFreshBypass ? `bypass:${bypassReason}` : 'not_cacheable_feed')
+                : (feedHasProcessingVideo ? 'skip_write:unstable_video_media' : 'cacheable'),
+              rid: request_id,
+              t: Date.now(),
+            }));
+          } catch { /* ignore */ }
+
+          // ── [OptimizedVideoPathDebug] FeedAPI:responsePost3667 (investigation) ──
+          try {
+            const _p3667 = (enrichedPosts as any[]).find((pp: any) => String(pp.id) === '3667') || null;
+            const _m351 = _p3667 ? (Array.isArray(_p3667.media) ? _p3667.media : []).find((m: any) => String(m.id) === '351') || null : null;
+            console.log('[OptimizedVideoPathDebug][FeedAPI:responsePost3667]', JSON.stringify({
+              postPresent: !!_p3667,
+              media351: _m351 ? {
+                key: _m351.key, optimized_key: _m351.optimized_key,
+                processing_status: _m351.processing_status, duration_ms: _m351.duration_ms,
+              } : null,
+              feedHasProcessingVideo,
+              willCache: !!(isFeed && feedCacheKey && !feedHasProcessingVideo),
+              cacheStatus,
+              rid: request_id,
+              t: Date.now(),
+            }));
+          } catch { /* ignore */ }
           // Populate reqCtx so [sum] log includes perf breakdown
           // Wrapped in try-catch: perf logging must NEVER crash the endpoint
           try {
@@ -2143,7 +2244,10 @@ export default {
           }
 
           // ── Store in edge cache (feed only, fire-and-forget) ──
-          if (isFeed && feedCacheKey) {
+          // Skip when the feed still contains a processing video: caching a
+          // pre-optimization snapshot would serve stale media (missing
+          // optimized_key/processing_status) to non-fresh reads for up to the TTL.
+          if (isFeed && feedCacheKey && !feedHasProcessingVideo) {
             ctx.waitUntil(
               cache.put(feedCacheKey, new Response(responseBody, {
                 status: 200,
