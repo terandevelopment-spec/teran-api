@@ -2754,6 +2754,10 @@ export default {
             if (!siblingHit?.role) {
               throw new HttpError(403, "ROOM_MEMBERSHIP_REQUIRED", "You must be a member of this room to post");
             }
+            // Surface the resolved sibling role to the outer scope so the
+            // posting-role check below can reject registered-only members
+            // that arrived through the sibling fallback path.
+            roomDirectRole = (siblingHit as any).role;
 
             // Self-heal: replicate membership for future direct hits
             ctx.waitUntil((async () => {
@@ -2786,6 +2790,12 @@ export default {
           }
 
           mark("auth_done");
+
+          // registered-only members may comment but may not create Room root posts.
+          // This check covers every resolution path: direct DB, KV cache, and sibling fallback.
+          if (needsRoomCheck && roomDirectRole === "registered") {
+            throw new HttpError(403, "ROOM_MEMBERSHIP_REQUIRED", "Posting requires member or owner status");
+          }
 
           // ── Duplicate repost prevention ──
           // A user (persona) may only have one repost (normal or quote) per source post.
@@ -10428,14 +10438,16 @@ export default {
               throw new HttpError(403, "FORBIDDEN", "Private room. Join via invite link.");
             }
 
-            // Upsert membership
+            // Normal public registration grants commenting access only (not publishing).
+            // Publishing access requires a valid invite (POST /join_by_invite).
             const existing = await checkRoomMembership(env, roomId, user_id);
             if (!existing) {
               const { error } = await sb(env)
                 .from("room_members")
-                .insert({ room_id: roomId, user_id, role: "member" });
+                .insert({ room_id: roomId, user_id, role: "registered" });
               if (error) throw new Error(error.message);
             }
+            // existing member/owner: leave unchanged — never downgrade
 
             return ok(req, env, request_id, { joined: true });
           }
@@ -10578,6 +10590,10 @@ export default {
               .eq("user_id", targetUserId);
             if (error) throw new Error(error.message);
 
+            // Invalidate the kicked user's cached membership so they cannot post
+            // using a stale KV entry during the remaining 300s TTL window.
+            await env.PROFILE_KV.delete(`room_member:${roomId}:${targetUserId}`).catch(() => {});
+
             return ok(req, env, request_id, { kicked: true });
           }
         }
@@ -10678,14 +10694,27 @@ export default {
             if (!invite) throw new HttpError(403, "FORBIDDEN", "Invalid invite token");
             if ((invite as any).revoked) throw new HttpError(403, "FORBIDDEN", "This invite has been revoked");
 
-            // Insert membership if not already a member
+            // A valid invite always grants full publishing membership.
+            // registered → member upgrade is required so an existing registrant
+            // who scans the owner's QR code immediately gains posting access.
             const existing = await checkRoomMembership(env, roomId, user_id);
             if (!existing) {
               const { error } = await sb(env)
                 .from("room_members")
                 .insert({ room_id: roomId, user_id, role: "member" });
               if (error) throw new Error(error.message);
+            } else if (existing === "registered") {
+              // Upgrade registered → member
+              const { error } = await sb(env)
+                .from("room_members")
+                .update({ role: "member" })
+                .eq("room_id", roomId)
+                .eq("user_id", user_id);
+              if (error) throw new Error(error.message);
+              // Invalidate stale cached role so the user isn't blocked for up to 300s
+              await env.PROFILE_KV.delete(`room_member:${roomId}:${user_id}`).catch(() => {});
             }
+            // existing member/owner: leave unchanged
 
             return ok(req, env, request_id, { joined: true });
           }
