@@ -1351,19 +1351,9 @@ export default {
               postsQueryMs = Date.now() - t1;
               if (qErr) throw qErr;
 
-              // Enforce policy; time auth + membership separately when applicable
+              // read_policy no longer gates Room content reads — all Room posts are public.
               let authMs = 0;
               let membershipMs = 0;
-              if (roomRow && roomRow.read_policy === "members_only") {
-                const tAuth = performance.now();
-                const callerId = await optionalAuth(req, env);
-                authMs = +(performance.now() - tAuth).toFixed(1);
-                if (!callerId) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
-                const tMembership = performance.now();
-                const memberRole = await checkRoomMembership(env, room_id_param!, callerId);
-                membershipMs = +(performance.now() - tMembership).toFixed(1);
-                if (!memberRole) throw new HttpError(403, "FORBIDDEN", "This room requires membership to read");
-              }
 
               // Per-phase breakdown: emitted on every room-scoped posts request.
               // posts_supabase_ms = Supabase HTTP round-trip for posts SELECT (incl. network + PostgREST overhead).
@@ -1408,136 +1398,9 @@ export default {
             console.log(`[perf][replies_http] rid=${request_id} parent_post_id=${parent_post_id_param} http_ms=${replyHttpMs} parse_ms=${replyParseMs} status=${replyStatus} server_timing="${replyHeaders.serverTiming}" x_response_time="${replyHeaders.xResponseTime}" cf_ray="${replyHeaders.cfRay}" cf_cache="${replyHeaders.cfCache}" content_range="${replyHeaders.contentRange}"`);
           }
 
-          // Fast path: no posts => return immediately
-          // NOTE: postIds is computed AFTER the privacy filter below.
-          // ── Privacy filter: exclude posts from private rooms ──
+          // Privacy filter removed: private Room posts are public content.
+          // Room membership is only required for write operations (post, comment).
           const tPrivacy = performance.now();
-          // Rules:
-          //   • Specific-room queries (room_id_param set): SKIP — membership already verified upstream.
-          //   • User-scoped queries (user_id or author_id): Allow owner/member private posts
-          //     so personal tab shows the user's own content.
-          //   • Aggregate feeds (wire, home, explore, search): ALWAYS block private room posts.
-          //     No exceptions — not even for the owner. Owner sees them in room view or personal tab only.
-          if (
-            posts && posts.length > 0 &&
-            !(room_id_param && room_id_param !== "global") // skip for specific-room queries
-          ) {
-            const roomIdsInResult = [...new Set(
-              (posts as any[])
-                .map((p: any) => p.room_id)
-                .filter((rid: any) => rid && rid !== "global")
-            )];
-            if (roomIdsInResult.length > 0) {
-              const tVisCheck = performance.now();
-              const isUserScopedQuery = !!(user_id_param || author_id_param);
-
-              // Batch-fetch visibility + owner for all rooms in the result set
-              // ── Cache API for room visibility (120s TTL) ──
-              const ROOM_VIS_TTL = 120;
-              const sortedVisIds = [...roomIdsInResult].sort();
-              const visCacheHash = await sha256Hex(`room_vis:v1:${sortedVisIds.join(",")}`);
-              const visCacheReq = new Request(`https://cache.internal/room-vis/${visCacheHash}`, { method: "GET" });
-              const visCache = caches.default;
-              const cachedVis = await visCache.match(visCacheReq);
-
-              let roomVisRows: any[] | null;
-              if (cachedVis) {
-                roomVisRows = await cachedVis.json();
-                console.log(`[cache] room-vis HIT rid=${request_id} rooms=${roomIdsInResult.length} hash=${visCacheHash.slice(0, 12)}`);
-              } else {
-                const { data } = await sb(env)
-                  .from("rooms")
-                  .select("id, visibility, owner_id")
-                  .in("id", roomIdsInResult);
-                roomVisRows = data;
-                // Fire-and-forget cache put
-                ctx.waitUntil(
-                  visCache.put(visCacheReq, new Response(JSON.stringify(data ?? []), {
-                    status: 200,
-                    headers: {
-                      "Content-Type": "application/json",
-                      "Cache-Control": `public, max-age=${ROOM_VIS_TTL}`,
-                    },
-                  }))
-                    .then(() => console.log(`[cache] room-vis put ok rid=${request_id} rooms=${roomIdsInResult.length} hash=${visCacheHash.slice(0, 12)}`))
-                    .catch(() => {})
-                );
-              }
-
-              // Build set of private room IDs
-              const privateRoomIds = new Set<string>();
-              if (roomVisRows) {
-                for (const r of roomVisRows as any[]) {
-                  if (r.visibility && r.visibility !== "public") {
-                    privateRoomIds.add(String(r.id));
-                  }
-                }
-              }
-
-              // Determine which private rooms to block
-              let blockedRoomIds: Set<string>;
-
-              if (privateRoomIds.size === 0) {
-                blockedRoomIds = new Set();
-              } else if (!isUserScopedQuery) {
-                // AGGREGATE FEED (wire/home/explore/search): block ALL private rooms — no exceptions
-                blockedRoomIds = privateRoomIds;
-              } else {
-                // USER-SCOPED (personal tab): allow owner + member posts through
-                const privacyCaller = await optionalAuth(req, env);
-                const allowedRoomIds = new Set<string>();
-
-                if (privacyCaller) {
-                  // Check ownership
-                  for (const r of (roomVisRows as any[]) || []) {
-                    if (privateRoomIds.has(String(r.id)) && String(r.owner_id) === privacyCaller) {
-                      allowedRoomIds.add(String(r.id));
-                    }
-                  }
-                  // Check membership for non-owned private rooms
-                  const nonOwned = [...privateRoomIds].filter(rid => !allowedRoomIds.has(rid));
-                  if (nonOwned.length > 0) {
-                    const { data: memberRows } = await sb(env)
-                      .from("room_members")
-                      .select("room_id")
-                      .eq("user_id", privacyCaller)
-                      .in("room_id", nonOwned);
-                    if (memberRows) {
-                      for (const m of memberRows as any[]) {
-                        allowedRoomIds.add(String(m.room_id));
-                      }
-                    }
-                  }
-                }
-
-                blockedRoomIds = new Set(
-                  [...privateRoomIds].filter(rid => !allowedRoomIds.has(rid))
-                );
-              }
-
-              const visCheckMs = +(performance.now() - tVisCheck).toFixed(1);
-
-              if (blockedRoomIds.size > 0) {
-                const beforeCount = posts.length;
-                posts = (posts as any[]).filter((p: any) => {
-                  if (!p.room_id || p.room_id === "global") return true;
-                  return !blockedRoomIds.has(String(p.room_id));
-                });
-                console.log(`[privacy] filtered private room posts rid=${request_id}`, {
-                  vis_check_ms: visCheckMs,
-                  query_type: isUserScopedQuery ? "user_scoped" : "aggregate",
-                  room_ids_checked: roomIdsInResult.length,
-                  private_rooms: privateRoomIds.size,
-                  blocked: blockedRoomIds.size,
-                  posts_before: beforeCount,
-                  posts_after: posts.length,
-                  removed: beforeCount - posts.length,
-                });
-              } else if (privateRoomIds.size > 0) {
-                console.log(`[privacy] private rooms allowed (user-scoped) rid=${request_id} vis_check_ms=${visCheckMs} private=${privateRoomIds.size}`);
-              }
-            }
-          }
           const privacyMs = +(performance.now() - tPrivacy).toFixed(1);
 
           // Compute postIds AFTER privacy filter so removed posts don't participate in downstream queries
@@ -8942,15 +8805,10 @@ export default {
               const resolvedOwnerId = owner_id_param;
               q = q.eq("owner_id", resolvedOwnerId);
 
-              // Non-owner callers see only public rooms
-              const isOwner = !!callerId && callerId === resolvedOwnerId;
-              if (!isOwner) {
-                q = q.eq("visibility", "public");
-              }
+              // All callers see all visibility levels — private rooms are publicly discoverable
             }
           } else {
-            // Default: list all public rooms
-            q = q.eq("visibility", "public");
+            // Default: list all rooms — private rooms are publicly discoverable
           }
 
           // Optional category filter
@@ -9156,8 +9014,8 @@ export default {
 
               room = roomRow;
 
-              // Write to cache only for non-private rooms (safe to share at edge)
-              if ((room as any).visibility !== "private_invite_only") {
+              // All rooms are cached at the edge — private rooms are public content
+              {
                 const roomJson = JSON.stringify(room);
                 const cacheRes = new Response(roomJson, {
                   headers: {
@@ -9171,9 +9029,6 @@ export default {
                     console.warn(`[perf] /api/rooms/:id cache put failed rid=${request_id}`, err)
                   )
                 );
-              } else {
-                // Private room — bypass cache
-                cacheStatus = "BYPASS";
               }
             }
 
@@ -9186,14 +9041,6 @@ export default {
             const designOnly = fieldsParam === "design";
 
             if (designOnly) {
-              // Private rooms still need the access gate even on the fast path
-              if ((room as any).visibility === "private_invite_only") {
-                const privCaller = await optionalAuth(req, env);
-                if (!privCaller) throw new HttpError(404, "NOT_FOUND", "Room not found");
-                const privRole = await checkRoomMembership(env, roomId, privCaller);
-                if (!privRole) throw new HttpError(404, "NOT_FOUND", "Room not found");
-              }
-
               const payload = { room: { ...(room as any) }, my_role: null };
               const payloadBytes = JSON.stringify(payload).length;
               const totalMs = performance.now() - tTotal;
@@ -9223,14 +9070,6 @@ export default {
               const totalMs = performance.now() - tTotal;
               console.log(`[perf] /api/rooms/:id breakdown`, JSON.stringify({ rid: request_id, room_id: roomId, cache: cacheStatus, db_room_ms: +dbRoomMs.toFixed(1), cache_ms: +cacheLookupMs.toFixed(1), enrich_ms: +enrichMemberMs.toFixed(1), total_ms: +totalMs.toFixed(1), rows_room: 0, caller, fast: "membership" }));
               return ok(req, env, request_id, payload);
-            }
-
-            // Private rooms: only members can see details (must check before enrichment)
-            if ((room as any).visibility === "private_invite_only") {
-              const privCaller = await optionalAuth(req, env);
-              if (!privCaller) throw new HttpError(404, "NOT_FOUND", "Room not found");
-              const privRole = await checkRoomMembership(env, roomId, privCaller);
-              if (!privRole) throw new HttpError(404, "NOT_FOUND", "Room not found");
             }
 
             // 2) Enrichment: fetch my_role only — always fresh, never cached (user-specific)
@@ -10425,7 +10264,7 @@ export default {
           }
         }
 
-        // POST /api/rooms/:id/join — join public room
+        // POST /api/rooms/:id/join — open Room join (public or private)
         {
           const m = path.match(/^\/api\/rooms\/([^/]+)\/join$/);
           if (m && req.method === "POST") {
@@ -10434,18 +10273,28 @@ export default {
 
             const { data: room } = await sb(env).from("rooms").select("visibility").eq("id", roomId).maybeSingle();
             if (!room) throw new HttpError(404, "NOT_FOUND", "Room not found");
-            if ((room as any).visibility === "private_invite_only" || (room as any).visibility === "private") {
-              throw new HttpError(403, "FORBIDDEN", "Private room. Join via invite link.");
-            }
 
-            // Normal public registration grants commenting access only (not publishing).
-            // Publishing access requires a valid invite (POST /join_by_invite).
+            // Role granted by normal join depends on Room visibility:
+            //   public              → member      (may comment and publish)
+            //   private_invite_only → registered  (may comment; publishing requires QR/invite)
+            const targetRole = (room as any).visibility === "private_invite_only" ? "registered" : "member";
+
             const existing = await checkRoomMembership(env, roomId, user_id);
             if (!existing) {
               const { error } = await sb(env)
                 .from("room_members")
-                .insert({ room_id: roomId, user_id, role: "registered" });
+                .insert({ room_id: roomId, user_id, role: targetRole });
               if (error) throw new Error(error.message);
+            } else if (existing === "registered" && targetRole === "member") {
+              // Public Room: lazy-repair a registered row that pre-dates this correction.
+              // Upgrade to member and clear any stale KV entry immediately.
+              const { error } = await sb(env)
+                .from("room_members")
+                .update({ role: "member" })
+                .eq("room_id", roomId)
+                .eq("user_id", user_id);
+              if (error) throw new Error(error.message);
+              await env.PROFILE_KV.delete(`room_member:${roomId}:${user_id}`).catch(() => {});
             }
             // existing member/owner: leave unchanged — never downgrade
 

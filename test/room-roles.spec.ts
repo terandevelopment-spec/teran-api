@@ -122,6 +122,8 @@ vi.mock('@supabase/supabase-js', () => {
   return {
     createClient: () => ({
       from: (t: string) => chain({ table: t, eqs: [], neqs: [], inFilter: null }),
+      // rpc() stub: returns empty data so the enrichment path doesn't throw
+      rpc: (_fn: string, _params?: any) => Promise.resolve({ data: [], error: null }),
     }),
   };
 });
@@ -203,10 +205,10 @@ beforeEach(async () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// POST /api/rooms/:id/join — normal public registration
+// POST /api/rooms/:id/join — PUBLIC Room normal join → member
 // ═══════════════════════════════════════════════════════════════════════
-describe('POST /api/rooms/:id/join — normal registration', () => {
-  it('new user gets registered (not member)', async () => {
+describe('POST /api/rooms/:id/join — PUBLIC Room', () => {
+  it('new user gets member role', async () => {
     mockState.setRows('rooms', [publicRoom]);
     mockState.setRows('room_members', []);
     mockState.setRows('account_devices', []);
@@ -217,10 +219,10 @@ describe('POST /api/rooms/:id/join — normal registration', () => {
     expect(body?.joined).toBe(true);
     const row = mockState.getRows('room_members')
       .find(r => r.room_id === ROOM_ID && r.user_id === USER_ID);
-    expect(row?.role).toBe('registered');
+    expect(row?.role).toBe('member');
   });
 
-  it('existing registered stays registered (not upgraded)', async () => {
+  it('existing registered is upgraded to member', async () => {
     mockState.setRows('rooms', [publicRoom]);
     mockState.setRows('room_members', [registeredRow]);
     mockState.setRows('account_devices', []);
@@ -230,10 +232,10 @@ describe('POST /api/rooms/:id/join — normal registration', () => {
     expect(status).toBe(200);
     const row = mockState.getRows('room_members')
       .find(r => r.room_id === ROOM_ID && r.user_id === USER_ID);
-    expect(row?.role).toBe('registered');
+    expect(row?.role).toBe('member');
   });
 
-  it('existing member is NOT downgraded to registered', async () => {
+  it('existing member is NOT downgraded', async () => {
     mockState.setRows('rooms', [publicRoom]);
     mockState.setRows('room_members', [memberRow]);
     mockState.setRows('account_devices', []);
@@ -246,7 +248,7 @@ describe('POST /api/rooms/:id/join — normal registration', () => {
     expect(row?.role).toBe('member');
   });
 
-  it('existing owner is NOT downgraded to registered', async () => {
+  it('existing owner is NOT downgraded', async () => {
     mockState.setRows('rooms', [publicRoom]);
     mockState.setRows('room_members', [ownerRow]);
     mockState.setRows('account_devices', []);
@@ -259,20 +261,70 @@ describe('POST /api/rooms/:id/join — normal registration', () => {
     expect(row?.role).toBe('owner');
   });
 
-  it('private_invite_only room is rejected', async () => {
-    mockState.setRows('rooms', [privateRoom]);
-
-    const { status } = await req('POST', `/api/rooms/${ROOM_ID}/join`, {}, USER_ID);
-
-    expect(status).toBe(403);
-  });
-
   it('unauthenticated request is rejected with 401', async () => {
     mockState.setRows('rooms', [publicRoom]);
 
     const { status } = await req('POST', `/api/rooms/${ROOM_ID}/join`);
 
     expect(status).toBe(401);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// POST /api/rooms/:id/join — PRIVATE Room normal join → registered
+// ═══════════════════════════════════════════════════════════════════════
+describe('POST /api/rooms/:id/join — PRIVATE Room', () => {
+  it('new user gets registered role (join is no longer rejected)', async () => {
+    mockState.setRows('rooms', [privateRoom]);
+    mockState.setRows('room_members', []);
+    mockState.setRows('account_devices', []);
+
+    const { status, body } = await req('POST', `/api/rooms/${ROOM_ID}/join`, {}, USER_ID);
+
+    expect(status).toBe(200);
+    expect(body?.joined).toBe(true);
+    const row = mockState.getRows('room_members')
+      .find(r => r.room_id === ROOM_ID && r.user_id === USER_ID);
+    expect(row?.role).toBe('registered');
+  });
+
+  it('existing registered stays registered (no upgrade on private join)', async () => {
+    mockState.setRows('rooms', [privateRoom]);
+    mockState.setRows('room_members', [registeredRow]);
+    mockState.setRows('account_devices', []);
+
+    const { status } = await req('POST', `/api/rooms/${ROOM_ID}/join`, {}, USER_ID);
+
+    expect(status).toBe(200);
+    const row = mockState.getRows('room_members')
+      .find(r => r.room_id === ROOM_ID && r.user_id === USER_ID);
+    expect(row?.role).toBe('registered');
+  });
+
+  it('existing member is NOT downgraded on private join', async () => {
+    mockState.setRows('rooms', [privateRoom]);
+    mockState.setRows('room_members', [memberRow]);
+    mockState.setRows('account_devices', []);
+
+    const { status } = await req('POST', `/api/rooms/${ROOM_ID}/join`, {}, USER_ID);
+
+    expect(status).toBe(200);
+    const row = mockState.getRows('room_members')
+      .find(r => r.room_id === ROOM_ID && r.user_id === USER_ID);
+    expect(row?.role).toBe('member');
+  });
+
+  it('existing owner is NOT downgraded on private join', async () => {
+    mockState.setRows('rooms', [privateRoom]);
+    mockState.setRows('room_members', [ownerRow]);
+    mockState.setRows('account_devices', []);
+
+    const { status } = await req('POST', `/api/rooms/${ROOM_ID}/join`, {}, USER_ID);
+
+    expect(status).toBe(200);
+    const row = mockState.getRows('room_members')
+      .find(r => r.room_id === ROOM_ID && r.user_id === USER_ID);
+    expect(row?.role).toBe('owner');
   });
 });
 
@@ -560,5 +612,143 @@ describe('KV cache invalidation', () => {
     await req('POST', `/api/rooms/${ROOM_ID}/join_by_invite`, { token: TOKEN }, USER_ID);
 
     expect(await env.PROFILE_KV.get(kvKey)).toBeNull();
+  });
+
+  it('PUBLIC join: registered→member upgrade clears stale KV entry', async () => {
+    const kvKey = `room_member:${ROOM_ID}:${USER_ID}`;
+
+    mockState.setRows('rooms', [publicRoom]);
+    mockState.setRows('room_members', [registeredRow]);
+    mockState.setRows('account_devices', []);
+
+    await env.PROFILE_KV.put(kvKey, 'registered', { expirationTtl: 300 });
+    expect(await env.PROFILE_KV.get(kvKey)).toBe('registered');
+
+    await req('POST', `/api/rooms/${ROOM_ID}/join`, {}, USER_ID);
+
+    // DB row upgraded to member
+    const row = mockState.getRows('room_members')
+      .find(r => r.room_id === ROOM_ID && r.user_id === USER_ID);
+    expect(row?.role).toBe('member');
+    // Stale KV entry must be deleted
+    expect(await env.PROFILE_KV.get(kvKey)).toBeNull();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Public reading — private rooms are publicly accessible
+// ═══════════════════════════════════════════════════════════════════════
+describe('Public reading — private rooms are publicly accessible', () => {
+  it('GET /api/rooms list includes private_invite_only room (unauthenticated)', async () => {
+    mockState.setRows('rooms', [
+      { ...publicRoom,  id: 'pub-1',  name: 'Public Room'  },
+      { ...privateRoom, id: 'priv-1', name: 'Private Room' },
+    ]);
+    mockState.setRows('room_members', []);
+    mockState.setRows('account_devices', []);
+
+    const request = new Request('https://worker.test/api/rooms', { method: 'GET' });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request as any, env, ctx);
+    await waitOnExecutionContext(ctx);
+    const body = await response.json() as any;
+
+    expect(response.status).toBe(200);
+    const ids = (body?.rooms ?? []).map((r: any) => r.id);
+    expect(ids).toContain('pub-1');
+    expect(ids).toContain('priv-1');
+  });
+
+  it('GET /api/rooms/:id returns private room without auth (no 404)', async () => {
+    mockState.setRows('rooms', [privateRoom]);
+    mockState.setRows('room_members', []);
+    mockState.setRows('account_devices', []);
+    mockState.setRows('room_avatar_options', []);
+
+    const request = new Request(`https://worker.test/api/rooms/${ROOM_ID}`, { method: 'GET' });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request as any, env, ctx);
+    await waitOnExecutionContext(ctx);
+    const body = await response.json() as any;
+
+    expect(response.status).toBe(200);
+    expect(body?.room?.id).toBe(ROOM_ID);
+    expect(body?.my_role).toBeNull();
+  });
+
+  it('GET /api/rooms/:id?fields=design returns private room design without auth (no 404)', async () => {
+    mockState.setRows('rooms', [privateRoom]);
+    mockState.setRows('room_members', []);
+    mockState.setRows('account_devices', []);
+
+    const request = new Request(`https://worker.test/api/rooms/${ROOM_ID}?fields=design`, { method: 'GET' });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request as any, env, ctx);
+    await waitOnExecutionContext(ctx);
+    const body = await response.json() as any;
+
+    expect(response.status).toBe(200);
+    expect(body?.room?.id).toBe(ROOM_ID);
+  });
+
+  it('GET /api/posts?room_id= with members_only read_policy returns posts, not 403', async () => {
+    const postRow = {
+      id: 99, room_id: ROOM_ID, user_id: 'author', content: 'hello private room',
+      post_type: 'status', parent_post_id: null, deleted_at: null,
+      created_at: new Date().toISOString(),
+    };
+    const membersOnlyRoom = {
+      id: ROOM_ID, visibility: 'private_invite_only',
+      read_policy: 'members_only', post_policy: 'members_only',
+    };
+    mockState.setRows('rooms', [membersOnlyRoom]);
+    mockState.setRows('posts', [postRow]);
+    mockState.setRows('room_members', []);
+    mockState.setRows('account_devices', []);
+
+    const request = new Request(`https://worker.test/api/posts?room_id=${ROOM_ID}`, { method: 'GET' });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request as any, env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    // Must not 403 — Room posts are publicly readable regardless of read_policy
+    expect(response.status).not.toBe(403);
+    expect(response.status).toBe(200);
+  });
+
+  it('aggregate posts query (author_id scoped) includes private room posts', async () => {
+    const privPost = {
+      id: 55, room_id: ROOM_ID, user_id: 'author-x', author_id: 'author-x',
+      content: 'private room public post', post_type: 'status',
+      parent_post_id: null, deleted_at: null,
+      created_at: new Date().toISOString(),
+    };
+    mockState.setRows('rooms', [privateRoom]);
+    mockState.setRows('posts', [privPost]);
+    mockState.setRows('room_members', []);
+    mockState.setRows('account_devices', []);
+
+    const request = new Request('https://worker.test/api/posts?author_id=author-x', { method: 'GET' });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request as any, env, ctx);
+    await waitOnExecutionContext(ctx);
+    const body = await response.json() as any;
+
+    expect(response.status).toBe(200);
+    const postIds = (body?.posts ?? []).map((p: any) => p.id);
+    expect(postIds).toContain(55);
+  });
+
+  it('missing room still returns 404', async () => {
+    mockState.setRows('rooms', []);
+    mockState.setRows('room_members', []);
+    mockState.setRows('account_devices', []);
+
+    const request = new Request('https://worker.test/api/rooms/nonexistent-room-id', { method: 'GET' });
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request as any, env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(404);
   });
 });
