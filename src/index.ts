@@ -9206,15 +9206,9 @@ export default {
             : "public";
           const visibility = rawVisibility === "private" ? "private_invite_only" : rawVisibility;
 
-          // Category: required for public rooms, omitted for private
+          // Category: optional for all rooms; accepted if valid, stored as null if absent or unrecognised
           const rawCategory = typeof body?.category === "string" ? body.category.trim() : null;
-          let category: string | null = null;
-          if (visibility === "public") {
-            if (!rawCategory || !ROOM_CATEGORY_KEYS.has(rawCategory)) {
-              throw new HttpError(422, "VALIDATION_ERROR", "category is required for public rooms and must be one of: " + [...ROOM_CATEGORY_KEYS].join(", "));
-            }
-            category = rawCategory;
-          }
+          const category: string | null = (rawCategory && ROOM_CATEGORY_KEYS.has(rawCategory)) ? rawCategory : null;
 
           // ── Creator display name (optional, room identity) ──
           const rawCreatorDisplayName = typeof body?.creator_display_name === "string" ? body.creator_display_name.trim().slice(0, 80) : null;
