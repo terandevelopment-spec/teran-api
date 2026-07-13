@@ -10543,29 +10543,95 @@ export default {
             if (!invite) throw new HttpError(403, "FORBIDDEN", "Invalid invite token");
             if ((invite as any).revoked) throw new HttpError(403, "FORBIDDEN", "This invite has been revoked");
 
-            // A valid invite always grants full publishing membership.
-            // registered → member upgrade is required so an existing registrant
-            // who scans the owner's QR code immediately gains posting access.
-            const existing = await checkRoomMembership(env, roomId, user_id);
-            if (!existing) {
-              const { error } = await sb(env)
-                .from("room_members")
-                .insert({ room_id: roomId, user_id, role: "member" });
-              if (error) throw new Error(error.message);
-            } else if (existing === "registered") {
-              // Upgrade registered → member
-              const { error } = await sb(env)
+            // Read the caller's DIRECT membership row only.
+            // Intentionally bypasses checkRoomMembership's sibling fallback to avoid
+            // a race condition: the async self-heal INSERT (fired inside checkRoomMembership
+            // for the current user_id) can land AFTER our UPDATE, silently leaving
+            // role:'registered' because the UPDATE matched 0 rows at execution time.
+            const { data: directRow, error: directReadErr } = await sb(env)
+              .from("room_members")
+              .select("role, room_display_id, room_icon_key")
+              .eq("room_id", roomId)
+              .eq("user_id", user_id)
+              .maybeSingle();
+
+            if (directReadErr) throw new HttpError(500, "DB_ERROR", `Membership read failed: ${directReadErr.message}`);
+
+            const existingRole = (directRow as any)?.role ?? null;
+
+            if (existingRole === "owner" || existingRole === "member") {
+              // Already has full membership — return authoritative role, no DB write needed.
+              return ok(req, env, request_id, {
+                joined: true,
+                role: existingRole,
+                membership: {
+                  room_id: roomId,
+                  user_id,
+                  role: existingRole,
+                  room_display_id: (directRow as any)?.room_display_id ?? null,
+                  room_icon_key: (directRow as any)?.room_icon_key ?? null,
+                },
+              });
+            }
+
+            if (existingRole === "registered") {
+              // Upgrade existing registered row → member.
+              // The extra .eq("role","registered") guard makes the UPDATE idempotent:
+              // if a concurrent request already upgraded the row, this becomes a no-op
+              // and the re-read below will still see 'member'.
+              const { error: updateErr } = await sb(env)
                 .from("room_members")
                 .update({ role: "member" })
                 .eq("room_id", roomId)
-                .eq("user_id", user_id);
-              if (error) throw new Error(error.message);
-              // Invalidate stale cached role so the user isn't blocked for up to 300s
+                .eq("user_id", user_id)
+                .eq("role", "registered");
+              if (updateErr) throw new HttpError(500, "DB_ERROR", `Membership upgrade failed: ${updateErr.message}`);
+              // Invalidate cached role so the next POST /api/posts sees 'member'
               await env.PROFILE_KV.delete(`room_member:${roomId}:${user_id}`).catch(() => {});
+            } else {
+              // No direct row — insert a fresh member row.
+              const { error: insertErr } = await sb(env)
+                .from("room_members")
+                .insert({ room_id: roomId, user_id, role: "member" });
+              if (insertErr) {
+                if (insertErr.code !== "23505") {
+                  throw new HttpError(500, "DB_ERROR", `Membership insert failed: ${insertErr.message}`);
+                }
+                // 23505 = unique_violation: concurrent request already inserted a row.
+                // Fall through to the re-read so we return the authoritative role.
+              }
             }
-            // existing member/owner: leave unchanged
 
-            return ok(req, env, request_id, { joined: true });
+            // Re-read the authoritative row to verify the final persisted role.
+            // This catches both: (a) UPDATE that matched 0 rows due to a concurrent write,
+            // and (b) INSERT beaten by a concurrent request that used a different role.
+            const { data: finalRow, error: finalReadErr } = await sb(env)
+              .from("room_members")
+              .select("role, room_display_id, room_icon_key")
+              .eq("room_id", roomId)
+              .eq("user_id", user_id)
+              .maybeSingle();
+
+            if (finalReadErr) throw new HttpError(500, "DB_ERROR", `Membership verification failed: ${finalReadErr.message}`);
+            if (!finalRow) throw new HttpError(500, "DB_ERROR", "Membership row missing after write");
+
+            const finalRole = (finalRow as any).role;
+            if (finalRole !== "member" && finalRole !== "owner") {
+              console.error(`[join_by_invite] upgrade failed room=${roomId} user=${user_id} final_role=${finalRole}`);
+              throw new HttpError(500, "UPGRADE_FAILED", "Invite membership could not be confirmed. Please try again.");
+            }
+
+            return ok(req, env, request_id, {
+              joined: true,
+              role: finalRole,
+              membership: {
+                room_id: roomId,
+                user_id,
+                role: finalRole,
+                room_display_id: (finalRow as any).room_display_id ?? null,
+                room_icon_key: (finalRow as any).room_icon_key ?? null,
+              },
+            });
           }
         }
 
