@@ -10526,112 +10526,332 @@ export default {
           const m = path.match(/^\/api\/rooms\/([^/]+)\/join_by_invite$/);
           if (m && req.method === "POST") {
             const roomId = m[1];
-            const user_id = await requireAuth(req, env);
+            const isDebug = req.headers.get("X-Teran-Debug") === "1";
 
-            const body = (await req.json().catch(() => null)) as any;
-            const token = typeof body?.token === "string" ? body.token.trim() : "";
-            if (!token) throw new HttpError(422, "VALIDATION_ERROR", "token is required");
+            // ── Diagnostic accumulator (Part 4) ────────────────────────────
+            const dbg: Record<string, any> = {
+              marker: "join-by-invite-browser-debug-v1",
+              requestId: request_id,
+              roomId,
+              authenticatedUserId: null,
+              inviteTokenPresent: false,
+              inviteTokenLength: 0,
+              inviteValidationResult: null,
+              directMembershipFound: null,
+              directExistingRole: null,
+              siblingMembershipFound: null,
+              siblingRole: null,
+              selectedBranch: null,
+              databaseOperation: null,
+              updateMatchedRows: null,
+              updateReturnedRows: null,
+              insertReturnedRows: null,
+              databaseErrorCode: null,
+              databaseErrorMessage: null,
+              finalMembershipFound: null,
+              finalRole: null,
+              cacheKey: null,
+              cacheInvalidated: null,
+              responseStatus: null,
+            };
 
-            // Validate invite
-            const { data: invite } = await sb(env)
-              .from("room_invites")
-              .select("id,room_id,revoked")
-              .eq("room_id", roomId)
-              .eq("token", token)
-              .maybeSingle();
+            // ── Marker headers added to EVERY response from this handler (Part 2) ──
+            const MARKER_HDRS: Record<string, string> = {
+              "X-Teran-Join-Handler": "join-by-invite-browser-debug-v1",
+              "X-Teran-Worker-Source": "src/index.ts",
+              "Access-Control-Expose-Headers": "X-Cache, X-Cache-Key, X-Request-Id, Cache-Control, X-Teran-Join-Handler, X-Teran-Worker-Source",
+            };
 
-            if (!invite) throw new HttpError(403, "FORBIDDEN", "Invalid invite token");
-            if ((invite as any).revoked) throw new HttpError(403, "FORBIDDEN", "This invite has been revoked");
+            // Inject marker headers into an existing Response
+            const addMarkers = (res: Response): Response => {
+              const h = new Headers(res.headers);
+              for (const [k, v] of Object.entries(MARKER_HDRS)) h.set(k, v);
+              return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+            };
 
-            // Read the caller's DIRECT membership row only.
-            // Intentionally bypasses checkRoomMembership's sibling fallback to avoid
-            // a race condition: the async self-heal INSERT (fired inside checkRoomMembership
-            // for the current user_id) can land AFTER our UPDATE, silently leaving
-            // role:'registered' because the UPDATE matched 0 rows at execution time.
-            const { data: directRow, error: directReadErr } = await sb(env)
-              .from("room_members")
-              .select("role, room_display_id, room_icon_key")
-              .eq("room_id", roomId)
-              .eq("user_id", user_id)
-              .maybeSingle();
+            // Build a failure response with marker headers (+ debug body when debug mode on)
+            const failWithMarkers = (status: number, code: string, msg: string): Response => {
+              const bodyObj: Record<string, any> = { error: { code, message: msg }, request_id };
+              if (isDebug) bodyObj.debug = { ...dbg };
+              return new Response(JSON.stringify(bodyObj), {
+                status,
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Request-Id": request_id,
+                  ...corsHeaders(req, env),
+                  ...MARKER_HDRS,
+                },
+              });
+            };
 
-            if (directReadErr) throw new HttpError(500, "DB_ERROR", `Membership read failed: ${directReadErr.message}`);
+            try {
+              // ── 1. Authenticate ─────────────────────────────────────────
+              const user_id = await requireAuth(req, env);
+              dbg.authenticatedUserId = user_id;
+              dbg.cacheKey = `room_member:${roomId}:${user_id}`;
 
-            const existingRole = (directRow as any)?.role ?? null;
+              // ── 2. Parse token (never expose the token value) ────────────
+              const body = (await req.json().catch(() => null)) as any;
+              const token = typeof body?.token === "string" ? body.token.trim() : "";
+              dbg.inviteTokenPresent = !!token;
+              dbg.inviteTokenLength = token.length;
+              if (!token) {
+                dbg.selectedBranch = "invalid_invite";
+                dbg.responseStatus = 422;
+                console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+                return failWithMarkers(422, "VALIDATION_ERROR", "token is required");
+              }
 
-            if (existingRole === "owner" || existingRole === "member") {
-              // Already has full membership — return authoritative role, no DB write needed.
-              return ok(req, env, request_id, {
+              // ── 3. Validate invite ───────────────────────────────────────
+              const { data: invite, error: inviteErr } = await sb(env)
+                .from("room_invites")
+                .select("id,room_id,revoked")
+                .eq("room_id", roomId)
+                .eq("token", token)
+                .maybeSingle();
+
+              if (!invite) {
+                dbg.inviteValidationResult = inviteErr ? `db_error:${inviteErr.code}` : "invalid";
+                dbg.selectedBranch = "invalid_invite";
+                dbg.responseStatus = 403;
+                console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+                return failWithMarkers(403, "FORBIDDEN", "Invalid invite token");
+              }
+              if ((invite as any).revoked) {
+                dbg.inviteValidationResult = "revoked";
+                dbg.selectedBranch = "revoked_invite";
+                dbg.responseStatus = 403;
+                console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+                return failWithMarkers(403, "FORBIDDEN", "This invite has been revoked");
+              }
+              dbg.inviteValidationResult = "valid";
+
+              // ── 4. Direct membership read (no sibling fallback) ──────────
+              // Intentionally bypasses checkRoomMembership's sibling fallback to avoid
+              // a race condition: the async self-heal INSERT (fired inside checkRoomMembership
+              // for the current user_id) can land AFTER our UPDATE, silently leaving
+              // role:'registered' because the UPDATE matched 0 rows at execution time.
+              const { data: directRow, error: directReadErr } = await sb(env)
+                .from("room_members")
+                .select("role, room_display_id, room_icon_key")
+                .eq("room_id", roomId)
+                .eq("user_id", user_id)
+                .maybeSingle();
+
+              if (directReadErr) {
+                dbg.selectedBranch = "membership_update_failed";
+                dbg.databaseErrorCode = directReadErr.code;
+                dbg.databaseErrorMessage = directReadErr.message;
+                dbg.responseStatus = 500;
+                console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+                return failWithMarkers(500, "DB_ERROR", `Membership read failed: ${directReadErr.message}`);
+              }
+
+              const existingRole = (directRow as any)?.role ?? null;
+              dbg.directMembershipFound = !!directRow;
+              dbg.directExistingRole = existingRole;
+
+              // ── 4b. Sibling check — diagnostic only, debug mode only ─────
+              // Does NOT affect which branch runs. Populates siblingMembershipFound /
+              // siblingRole to confirm the pre-fix race scenario: no direct row but
+              // a sibling device has a registered role, which would have triggered
+              // the self-heal INSERT race in the old checkRoomMembership path.
+              if (isDebug && !directRow) {
+                const { data: acctBind } = await sb(env)
+                  .from("account_devices")
+                  .select("account_id")
+                  .eq("device_id", user_id)
+                  .maybeSingle();
+                const accountId = (acctBind as any)?.account_id ?? null;
+                if (accountId) {
+                  const { data: siblings } = await sb(env)
+                    .from("account_devices")
+                    .select("device_id")
+                    .eq("account_id", accountId)
+                    .neq("device_id", user_id);
+                  const sibIds = (siblings || []).map((s: any) => s.device_id).filter(Boolean);
+                  if (sibIds.length > 0) {
+                    const { data: sibRow } = await sb(env)
+                      .from("room_members")
+                      .select("role")
+                      .eq("room_id", roomId)
+                      .in("user_id", sibIds)
+                      .limit(1)
+                      .maybeSingle();
+                    dbg.siblingMembershipFound = !!sibRow;
+                    dbg.siblingRole = (sibRow as any)?.role ?? null;
+                  } else {
+                    dbg.siblingMembershipFound = false;
+                    dbg.siblingRole = null;
+                  }
+                } else {
+                  dbg.siblingMembershipFound = false;
+                  dbg.siblingRole = null;
+                }
+              }
+
+              // ── 5. Branch on existing role ───────────────────────────────
+              if (existingRole === "owner" || existingRole === "member") {
+                dbg.selectedBranch = existingRole === "owner" ? "preserve_owner" : "already_member";
+                dbg.databaseOperation = "none";
+                dbg.finalMembershipFound = true;
+                dbg.finalRole = existingRole;
+                dbg.cacheInvalidated = false;
+                dbg.responseStatus = 200;
+                console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+                const earlyBody: Record<string, any> = {
+                  joined: true,
+                  role: existingRole,
+                  membership: {
+                    room_id: roomId,
+                    user_id,
+                    role: existingRole,
+                    room_display_id: (directRow as any)?.room_display_id ?? null,
+                    room_icon_key: (directRow as any)?.room_icon_key ?? null,
+                  },
+                };
+                if (isDebug) earlyBody.debug = { ...dbg };
+                return addMarkers(ok(req, env, request_id, earlyBody));
+              }
+
+              let cacheInvalidated = false;
+
+              if (existingRole === "registered") {
+                // Upgrade existing registered row → member.
+                // The extra .eq("role","registered") guard makes the UPDATE idempotent:
+                // if a concurrent request already upgraded the row, this becomes a no-op
+                // and the re-read below will still see 'member'.
+                dbg.selectedBranch = "upgrade_registered_to_member";
+                dbg.databaseOperation = "UPDATE";
+
+                const { data: updatedRows, error: updateErr } = await sb(env)
+                  .from("room_members")
+                  .update({ role: "member" })
+                  .eq("room_id", roomId)
+                  .eq("user_id", user_id)
+                  .eq("role", "registered")
+                  .select("role");
+
+                if (updateErr) {
+                  dbg.databaseErrorCode = updateErr.code;
+                  dbg.databaseErrorMessage = updateErr.message;
+                  dbg.selectedBranch = "membership_update_failed";
+                  dbg.responseStatus = 500;
+                  console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+                  return failWithMarkers(500, "DB_ERROR", `Membership upgrade failed: ${updateErr.message}`);
+                }
+
+                const updCnt = Array.isArray(updatedRows) ? updatedRows.length : 0;
+                dbg.updateMatchedRows = updCnt;
+                dbg.updateReturnedRows = updCnt;
+
+                // Invalidate cached role so the next POST /api/posts sees 'member'
+                await env.PROFILE_KV.delete(`room_member:${roomId}:${user_id}`)
+                  .then(() => { cacheInvalidated = true; })
+                  .catch(() => {});
+                dbg.cacheInvalidated = cacheInvalidated;
+
+              } else {
+                // No direct row — insert a fresh member row.
+                dbg.selectedBranch = "fresh_insert_member";
+                dbg.databaseOperation = "INSERT";
+
+                const { data: insertedRows, error: insertErr } = await sb(env)
+                  .from("room_members")
+                  .insert({ room_id: roomId, user_id, role: "member" })
+                  .select("role");
+
+                if (insertErr) {
+                  dbg.databaseErrorCode = insertErr.code;
+                  if (insertErr.code !== "23505") {
+                    dbg.databaseErrorMessage = insertErr.message;
+                    dbg.selectedBranch = "membership_insert_failed";
+                    dbg.responseStatus = 500;
+                    console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+                    return failWithMarkers(500, "DB_ERROR", `Membership insert failed: ${insertErr.message}`);
+                  }
+                  // 23505 = unique_violation: concurrent request already inserted a row.
+                  // Fall through to the re-read so we return the authoritative role.
+                  dbg.databaseErrorCode = "23505_conflict_ok";
+                } else {
+                  dbg.insertReturnedRows = Array.isArray(insertedRows) ? insertedRows.length : 0;
+                }
+
+                // Invalidate cache on fresh insert too (clears any stale null/registered entry)
+                await env.PROFILE_KV.delete(`room_member:${roomId}:${user_id}`)
+                  .then(() => { cacheInvalidated = true; })
+                  .catch(() => {});
+                dbg.cacheInvalidated = cacheInvalidated;
+              }
+
+              // ── 6. Re-read authoritative final row ───────────────────────
+              // Catches: (a) UPDATE that matched 0 rows due to concurrent write,
+              //          (b) INSERT race beaten by a concurrent request.
+              const { data: finalRow, error: finalReadErr } = await sb(env)
+                .from("room_members")
+                .select("role, room_display_id, room_icon_key")
+                .eq("room_id", roomId)
+                .eq("user_id", user_id)
+                .maybeSingle();
+
+              if (finalReadErr) {
+                dbg.databaseErrorCode = finalReadErr.code;
+                dbg.databaseErrorMessage = finalReadErr.message;
+                dbg.selectedBranch = "final_role_verification_failed";
+                dbg.responseStatus = 500;
+                console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+                return failWithMarkers(500, "DB_ERROR", `Membership verification failed: ${finalReadErr.message}`);
+              }
+
+              dbg.finalMembershipFound = !!finalRow;
+
+              if (!finalRow) {
+                dbg.finalRole = null;
+                dbg.selectedBranch = "final_role_verification_failed";
+                dbg.responseStatus = 500;
+                console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+                return failWithMarkers(500, "DB_ERROR", "Membership row missing after write");
+              }
+
+              const finalRole = (finalRow as any).role;
+              dbg.finalRole = finalRole;
+
+              if (finalRole !== "member" && finalRole !== "owner") {
+                dbg.selectedBranch = "final_role_verification_failed";
+                dbg.responseStatus = 500;
+                console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+                return failWithMarkers(500, "UPGRADE_FAILED", "Invite membership could not be confirmed. Please try again.");
+              }
+
+              dbg.responseStatus = 200;
+              console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+
+              const successBody: Record<string, any> = {
                 joined: true,
-                role: existingRole,
+                role: finalRole,
                 membership: {
                   room_id: roomId,
                   user_id,
-                  role: existingRole,
-                  room_display_id: (directRow as any)?.room_display_id ?? null,
-                  room_icon_key: (directRow as any)?.room_icon_key ?? null,
+                  role: finalRole,
+                  room_display_id: (finalRow as any).room_display_id ?? null,
+                  room_icon_key: (finalRow as any).room_icon_key ?? null,
                 },
-              });
-            }
+              };
+              if (isDebug) successBody.debug = { ...dbg };
+              return addMarkers(ok(req, env, request_id, successBody));
 
-            if (existingRole === "registered") {
-              // Upgrade existing registered row → member.
-              // The extra .eq("role","registered") guard makes the UPDATE idempotent:
-              // if a concurrent request already upgraded the row, this becomes a no-op
-              // and the re-read below will still see 'member'.
-              const { error: updateErr } = await sb(env)
-                .from("room_members")
-                .update({ role: "member" })
-                .eq("room_id", roomId)
-                .eq("user_id", user_id)
-                .eq("role", "registered");
-              if (updateErr) throw new HttpError(500, "DB_ERROR", `Membership upgrade failed: ${updateErr.message}`);
-              // Invalidate cached role so the next POST /api/posts sees 'member'
-              await env.PROFILE_KV.delete(`room_member:${roomId}:${user_id}`).catch(() => {});
-            } else {
-              // No direct row — insert a fresh member row.
-              const { error: insertErr } = await sb(env)
-                .from("room_members")
-                .insert({ room_id: roomId, user_id, role: "member" });
-              if (insertErr) {
-                if (insertErr.code !== "23505") {
-                  throw new HttpError(500, "DB_ERROR", `Membership insert failed: ${insertErr.message}`);
-                }
-                // 23505 = unique_violation: concurrent request already inserted a row.
-                // Fall through to the re-read so we return the authoritative role.
+            } catch (e: any) {
+              // Catch HttpError from requireAuth (401) or any unhandled throw.
+              // Ensures marker headers are present even on auth failures.
+              if (e instanceof HttpError) {
+                dbg.responseStatus = e.status;
+                console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+                return failWithMarkers(e.status, e.code, e.message);
               }
+              // Unknown error — re-throw to outer handler
+              console.error("[join_by_invite] unexpected error:", e?.message);
+              throw e;
             }
-
-            // Re-read the authoritative row to verify the final persisted role.
-            // This catches both: (a) UPDATE that matched 0 rows due to a concurrent write,
-            // and (b) INSERT beaten by a concurrent request that used a different role.
-            const { data: finalRow, error: finalReadErr } = await sb(env)
-              .from("room_members")
-              .select("role, room_display_id, room_icon_key")
-              .eq("room_id", roomId)
-              .eq("user_id", user_id)
-              .maybeSingle();
-
-            if (finalReadErr) throw new HttpError(500, "DB_ERROR", `Membership verification failed: ${finalReadErr.message}`);
-            if (!finalRow) throw new HttpError(500, "DB_ERROR", "Membership row missing after write");
-
-            const finalRole = (finalRow as any).role;
-            if (finalRole !== "member" && finalRole !== "owner") {
-              console.error(`[join_by_invite] upgrade failed room=${roomId} user=${user_id} final_role=${finalRole}`);
-              throw new HttpError(500, "UPGRADE_FAILED", "Invite membership could not be confirmed. Please try again.");
-            }
-
-            return ok(req, env, request_id, {
-              joined: true,
-              role: finalRole,
-              membership: {
-                room_id: roomId,
-                user_id,
-                role: finalRole,
-                room_display_id: (finalRow as any).room_display_id ?? null,
-                room_icon_key: (finalRow as any).room_icon_key ?? null,
-              },
-            });
           }
         }
 
