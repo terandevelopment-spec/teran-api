@@ -861,7 +861,6 @@ export default {
           const mood_param = url.searchParams.get("mood");                 // CSV: "Happy,Curious"
           const q_param = url.searchParams.get("q");                       // keyword search
           const light = url.searchParams.get("light") === "1";              // lightweight mode: skip enrichment
-          const room_category_param = url.searchParams.get("room_category"); // CSV: "games,music"
           const include_global_param = url.searchParams.get("include_global"); // "0" to exclude global threads
           const feed_param = url.searchParams.get("feed");                     // "wire" → Room root posts only
           const isReplyQuery = !!parent_post_id_param;
@@ -893,7 +892,7 @@ export default {
           // ── Edge cache: eligible for public, non-personalized feeds ──
           // Allow scoped main feeds (status/global, thread/root, rooms/root)
           // as well as the legacy unfiltered feed.
-          const hasPersonalizedFilters = !!mode_param || !!mood_param || !!q_param || !!room_category_param || include_global_param === "0";
+          const hasPersonalizedFilters = !!mode_param || !!mood_param || !!q_param || include_global_param === "0";
           const isRootOnly = root_only_param === "1" || root_only_param === "true";
           const isStandardScopedFeed = (
             !hasPersonalizedFilters &&
@@ -926,7 +925,6 @@ export default {
             if (post_type_param) cacheUrl.searchParams.set("pt", post_type_param);
             if (root_only_param) cacheUrl.searchParams.set("ro", root_only_param);
             if (room_scope_param) cacheUrl.searchParams.set("rs", room_scope_param);
-            if (room_category_param) cacheUrl.searchParams.set("rc", room_category_param);
             if (include_global_param) cacheUrl.searchParams.set("ig", include_global_param);
             if (light) cacheUrl.searchParams.set("lt", "1");
             feedCacheKey = new Request(cacheUrl.toString(), { method: "GET" });
@@ -982,8 +980,8 @@ export default {
           // user_id is intentionally included here even in light mode:
           // ownership checks (e.g. appearance overrides) require it, and
           // omitting it causes String(undefined) !== jwt_sub → silent 403.
-          // Trimmed light select: removed mode, moods, show_in_feed, room_category
-          // (not rendered by feed cards; show_in_feed/room_category only used in WHERE, not SELECT)
+          // Trimmed light select: removed mode, moods, show_in_feed
+          // (not rendered by feed cards; show_in_feed only used in WHERE, not SELECT)
           const lightSelectFields = "id,user_id,created_at,last_activity_at,title,content,author_id,author_name,author_avatar,room_id,parent_post_id,post_type,media(type,key,thumb_key,optimized_key,processing_status,duration_ms,trim_start_ms,trim_end_ms,object_pos_x,object_pos_y),uses_room_avatar,uses_room_display_name,room_anon_id";
           const selectFields = light ? lightSelectFields : feedSelectFields;
 
@@ -1157,14 +1155,6 @@ export default {
               q = q.or(
                 `title.ilike.${keyword},content.ilike.${keyword}`
               );
-            }
-
-            // ── room_category filter (CSV → .in) ──
-            if (room_category_param) {
-              const categories = room_category_param.split(",").map(c => c.trim()).filter(Boolean);
-              if (categories.length > 0) {
-                q = q.in("room_category", categories);
-              }
             }
 
             // ── include_global filter ──
@@ -2428,7 +2418,7 @@ export default {
           }
 
           // Pre-declare feed-elig slot so the parallel task can write into it
-          let feedEligRoomRow: { visibility: string; category: string | null } | null = null;
+          let feedEligRoomRow: { visibility: string } | null = null;
           let feedEligMs = 0;
 
           // Parse room-member KV result (read in the kv_batch above)
@@ -2488,7 +2478,7 @@ export default {
               try {
                 const { data: roomRow } = await sb(env)
                   .from("rooms")
-                  .select("visibility, category")
+                  .select("visibility")
                   .eq("id", room_id)
                   .maybeSingle();
                 feedEligMs = Date.now() - tFE;
@@ -2682,13 +2672,11 @@ export default {
           // The rooms SELECT was hoisted into step1Tasks (parallel with room_members),
           // so feedEligRoomRow is already populated by the time we reach here.
           let show_in_feed = false;
-          let room_category: string | null = null;
 
           if (rawShowInFeed && room_id && room_id !== "global") {
             const roomRow = feedEligRoomRow;
-            if (roomRow && (roomRow as any).visibility === "public" && (roomRow as any).category) {
+            if (roomRow && (roomRow as any).visibility === "public") {
               show_in_feed = true;
-              room_category = (roomRow as any).category;
             }
             console.log(`[perf] /api/posts feed_elig_check rid=${request_id}`, {
               feed_elig_ms: feedEligMs,
@@ -2697,7 +2685,7 @@ export default {
               src: 'parallel_step1',
             });
           }
-          console.log(`[ROOM_FEED_DEBUG][ROOM_ELIGIBILITY]`, { rid: request_id, room_id, rawShowInFeed, show_in_feed, room_category, entered_lookup: !!(rawShowInFeed && room_id && room_id !== "global") });
+          console.log(`[ROOM_FEED_DEBUG][ROOM_ELIGIBILITY]`, { rid: request_id, room_id, rawShowInFeed, show_in_feed, entered_lookup: !!(rawShowInFeed && room_id && room_id !== "global") });
           mark("feed_eligibility");
 
           // ── Resolve root_post_id before insert ──
@@ -2749,7 +2737,7 @@ export default {
           // Narrow select: only DB-generated values; reconstruct rest from input
           const POST_RETURN_COLS = "id, created_at";
           let data: any;
-          console.log(`[ROOM_FEED_DEBUG][POST_INSERT]`, { rid: request_id, room_id, show_in_feed, room_category, post_type, parent_post_id, has_title: !!(title && title.trim()) });
+          console.log(`[ROOM_FEED_DEBUG][POST_INSERT]`, { rid: request_id, room_id, show_in_feed, post_type, parent_post_id, has_title: !!(title && title.trim()) });
           const tInsert = Date.now();
           try {
             const insertResult = await sb(env)
@@ -2769,7 +2757,6 @@ export default {
                 mode,
                 moods,
                 show_in_feed,
-                room_category,
                 last_activity_at: new Date().toISOString(),
                 uses_room_avatar: body?.uses_room_avatar === true,
                 ...(body?.uses_room_display_name === true ? { uses_room_display_name: true } : {}),
@@ -8735,23 +8722,6 @@ export default {
         // ROOMS API
         // ═══════════════════════════════════════════
 
-        // SYNC REQUIRED: these keys must stay in sync with
-        //   frontend/src/lib/roomCategories.js  AND  DB rooms_category_allowed constraint.
-        const ROOM_CATEGORY_KEYS = new Set([
-          'lounge',
-          'anime_manga',
-          'games',
-          'music',
-          'film_visuals',
-          'fashion_vintage',
-          'art_design',
-          'tech_gadgets',
-          'food_places',
-          'local_city',
-          'work_career',
-          'politics_society',
-        ]);
-
         // GET /api/rooms — list public rooms, or rooms by owner_id
         if (path === "/api/rooms" && req.method === "GET") {
           const tListTotal = performance.now();
@@ -8811,15 +8781,6 @@ export default {
             // Default: list all rooms — private rooms are publicly discoverable
           }
 
-          // Optional category filter
-          const categoryParam = url.searchParams.get("category")?.trim() || null;
-          if (categoryParam) {
-            if (!ROOM_CATEGORY_KEYS.has(categoryParam)) {
-              throw new HttpError(400, "BAD_REQUEST", "Invalid category");
-            }
-            q = q.eq("category", categoryParam);
-          }
-
           const paramsMs = performance.now() - tListTotal;
 
           const tDbRooms = performance.now();
@@ -8857,7 +8818,7 @@ export default {
           const transformMs = performance.now() - tTransform;
           const totalMs = performance.now() - tListTotal;
 
-          console.log(`[perf] /api/rooms(list) breakdown`, JSON.stringify({ rid: request_id, owner_id: owner_id_param || "none", category: categoryParam || "none", visibility_filter: owner_id_param ? "all" : "public", params_ms: +paramsMs.toFixed(1), db_rooms_ms: +dbRoomsMs.toFixed(1), db_counts_ms: +dbCountsMs.toFixed(1), transform_ms: +transformMs.toFixed(1), total_ms: +totalMs.toFixed(1), rows: rooms.length }));
+          console.log(`[perf] /api/rooms(list) breakdown`, JSON.stringify({ rid: request_id, owner_id: owner_id_param || "none", visibility_filter: owner_id_param ? "all" : "public", params_ms: +paramsMs.toFixed(1), db_rooms_ms: +dbRoomsMs.toFixed(1), db_counts_ms: +dbCountsMs.toFixed(1), transform_ms: +transformMs.toFixed(1), total_ms: +totalMs.toFixed(1), rows: rooms.length }));
 
           return ok(req, env, request_id, { rooms });
         }
@@ -9206,10 +9167,6 @@ export default {
             : "public";
           const visibility = rawVisibility === "private" ? "private_invite_only" : rawVisibility;
 
-          // Category: optional for all rooms; accepted if valid, stored as null if absent or unrecognised
-          const rawCategory = typeof body?.category === "string" ? body.category.trim() : null;
-          const category: string | null = (rawCategory && ROOM_CATEGORY_KEYS.has(rawCategory)) ? rawCategory : null;
-
           // ── Creator display name (optional, room identity) ──
           const rawCreatorDisplayName = typeof body?.creator_display_name === "string" ? body.creator_display_name.trim().slice(0, 80) : null;
           const creator_display_name = rawCreatorDisplayName || null;
@@ -9302,7 +9259,7 @@ export default {
 
           const tDbInsertRoom = performance.now();
           const insertObj: Record<string, any> = {
-            name, description, icon_key, icon_thumb_key, category, room_key,
+            name, description, icon_key, icon_thumb_key, room_key,
             owner_id: user_id,
             visibility, read_policy: "public", post_policy: "members_only",
           };
@@ -9541,13 +9498,6 @@ export default {
                 throw new HttpError(422, "VALIDATION_ERROR", "Invalid post_policy value");
               }
               updates.post_policy = body.post_policy;
-            }
-            if (typeof body?.category === "string") {
-              const cat = body.category.trim();
-              if (!ROOM_CATEGORY_KEYS.has(cat)) {
-                throw new HttpError(422, "VALIDATION_ERROR", "Invalid category");
-              }
-              updates.category = cat;
             }
             // ── Creator display name ──
             if (body?.creator_display_name !== undefined) {
