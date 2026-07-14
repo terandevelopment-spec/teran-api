@@ -6814,6 +6814,7 @@ export default {
                 thread_card_style, social_reply_mode,
                 card_bg_color, card_text_color,
                 card_glass_enabled, card_glass_style,
+                card_border_visible, card_shape,
                 card_bg_image_key, card_bg_image_opacity,
                 like_color, like_visible, list_icon_shape, list_show_icons,
                 room_bg_color, room_bg_image_key, room_bg_image_opacity
@@ -6846,6 +6847,7 @@ export default {
                   thread_card_style, social_reply_mode,
                   card_bg_color, card_text_color,
                   card_glass_enabled, card_glass_style,
+                  card_border_visible, card_shape,
                   card_bg_image_key, card_bg_image_opacity,
                   like_color, like_visible, list_icon_shape, list_show_icons,
                   room_bg_color, room_bg_image_key, room_bg_image_opacity
@@ -8729,7 +8731,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,icon_thumb_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled,card_shape");
+            .select("id,room_key,name,description,emoji,icon_key,icon_thumb_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled,card_shape,card_border_visible");
 
           if (owner_id_param) {
             const callerId = await optionalAuth(req, env);
@@ -8891,6 +8893,7 @@ export default {
                 card_bg_color, card_text_color,
                 thread_card_style, social_reply_mode,
                 card_glass_enabled, card_glass_style,
+                card_border_visible, card_shape,
                 card_bg_image_key, card_bg_image_opacity,
                 like_color, like_visible, list_icon_shape, list_show_icons,
                 room_bg_color, room_bg_image_key, room_bg_image_opacity
@@ -9199,9 +9202,13 @@ export default {
           const list_icon_shape = typeof design.listIconShape === "string" && VALID_ICON_SHAPES.includes(design.listIconShape) ? design.listIconShape : null;
           const detail_icon_shape = typeof design.detailIconShape === "string" && VALID_ICON_SHAPES.includes(design.detailIconShape) ? design.detailIconShape : null;
           const VALID_CARD_SHAPES = ["flat", "rounded"];
-          const card_shape = typeof design.cardShape === "string" && VALID_CARD_SHAPES.includes(design.cardShape) ? design.cardShape
-            : typeof design.card_shape === "string" && VALID_CARD_SHAPES.includes(design.card_shape) ? design.card_shape
-            : null;
+          // ── Card Border + Card Shape (flat snake_case primary, nested design fallback) ──
+          const cardBorderVisible =
+            typeof body?.card_border_visible === "boolean"
+              ? body.card_border_visible
+              : design.cardBorderVisible === true;
+          const requestedCardShape = body?.card_shape ?? design.cardShape ?? design.card_shape;
+          const card_shape = requestedCardShape === "rounded" ? "rounded" : "flat";
           const header_bg_image_key = typeof design.headerBgImageKey === "string" && design.headerBgImageKey.length > 0 && design.headerBgImageKey.length <= 300 ? design.headerBgImageKey : null;
           const header_text_enabled = typeof design.headerTextEnabled === "boolean" ? design.headerTextEnabled : null;
           const VALID_HEADER_HEIGHTS = ["small", "medium", "large"];
@@ -9287,7 +9294,8 @@ export default {
           if (list_show_icons !== null) insertObj.list_show_icons = list_show_icons;
           if (list_icon_shape !== null) insertObj.list_icon_shape = list_icon_shape;
           if (detail_icon_shape !== null) insertObj.detail_icon_shape = detail_icon_shape;
-          if (card_shape !== null) insertObj.card_shape = card_shape;
+          insertObj.card_border_visible = cardBorderVisible;
+          insertObj.card_shape = card_shape;
           if (header_bg_image_key !== null) insertObj.header_bg_image_key = header_bg_image_key;
           if (header_text_enabled !== null) insertObj.header_text_enabled = header_text_enabled;
           if (header_height !== null) insertObj.header_height = header_height;
@@ -9327,12 +9335,30 @@ export default {
           if (social_reply_mode !== null) insertObj.social_reply_mode = social_reply_mode;
           if (creator_display_name !== null) insertObj.creator_display_name = creator_display_name;
 
+          // ── [ROOM_BORDER_TRACE] temporary diagnostics (remove after production verification) ──
+          console.log('[ROOM_BORDER_TRACE][REQUEST]', {
+            flatBorder: body?.card_border_visible,
+            nestedBorder: design?.cardBorderVisible,
+            flatShape: body?.card_shape,
+            nestedShape: design?.cardShape,
+          });
+          console.log('[ROOM_BORDER_TRACE][INSERT]', {
+            card_border_visible: insertObj.card_border_visible,
+            card_shape: insertObj.card_shape,
+          });
+
           const { data: room, error } = await sb(env)
             .from("rooms")
             .insert(insertObj)
             .select()
             .single();
           const dbInsertRoomMs = performance.now() - tDbInsertRoom;
+          console.log('[ROOM_BORDER_TRACE][RESULT]', {
+            roomId: (room as any)?.id,
+            card_border_visible: (room as any)?.card_border_visible,
+            card_shape: (room as any)?.card_shape,
+            hasError: Boolean(error),
+          });
           if (error) {
             console.log(`[perf] /api/rooms(create) error`, JSON.stringify({ rid: request_id, step: "db_room_insert", code: (error as any).code, message: error.message }));
             throw new Error(error.message);
@@ -9563,11 +9589,23 @@ export default {
               updates.detail_icon_shape = design.detailIconShape;
             else if (typeof design?.detail_icon_shape === "string" && VALID_ICON_SHAPES.includes(design.detail_icon_shape))
               updates.detail_icon_shape = design.detail_icon_shape;
-            const VALID_CARD_SHAPES = ["flat", "rounded"];
-            if (typeof design?.cardShape === "string" && VALID_CARD_SHAPES.includes(design.cardShape))
-              updates.card_shape = design.cardShape;
-            else if (typeof design?.card_shape === "string" && VALID_CARD_SHAPES.includes(design.card_shape))
-              updates.card_shape = design.card_shape;
+            // ── Card Border + Card Shape (explicit presence checks; preserve explicit false) ──
+            const hasCardBorderVisible =
+              Object.prototype.hasOwnProperty.call(body || {}, "card_border_visible") ||
+              Object.prototype.hasOwnProperty.call(body?.design || {}, "cardBorderVisible");
+            if (hasCardBorderVisible) {
+              updates.card_border_visible =
+                typeof body?.card_border_visible === "boolean"
+                  ? body.card_border_visible
+                  : body?.design?.cardBorderVisible === true;
+            }
+            const hasCardShape =
+              Object.prototype.hasOwnProperty.call(body || {}, "card_shape") ||
+              Object.prototype.hasOwnProperty.call(body?.design || {}, "cardShape");
+            if (hasCardShape) {
+              const requestedCardShape = body?.card_shape ?? body?.design?.cardShape;
+              updates.card_shape = requestedCardShape === "rounded" ? "rounded" : "flat";
+            }
             // Header background image key (string or null to clear)
             if (typeof design?.headerBgImageKey === "string")
               updates.header_bg_image_key = design.headerBgImageKey.length > 0 && design.headerBgImageKey.length <= 300 ? design.headerBgImageKey : null;
