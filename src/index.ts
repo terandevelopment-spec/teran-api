@@ -9602,10 +9602,10 @@ export default {
               updates.card_bg_image_key = design.card_bg_image_key;
             else if (design?.cardBgImageKey === null || design?.card_bg_image_key === null)
               updates.card_bg_image_key = null;
-            // Card background image opacity (only when image key is being set)
-            if (updates.card_bg_image_key && typeof design?.cardBgImageOpacity === "number" && design.cardBgImageOpacity >= 0 && design.cardBgImageOpacity <= 1)
+            // Card background image opacity (independent of image key)
+            if (typeof design?.cardBgImageOpacity === "number" && design.cardBgImageOpacity >= 0 && design.cardBgImageOpacity <= 1)
               updates.card_bg_image_opacity = design.cardBgImageOpacity;
-            else if (updates.card_bg_image_key && typeof design?.card_bg_image_opacity === "number" && design.card_bg_image_opacity >= 0 && design.card_bg_image_opacity <= 1)
+            else if (typeof design?.card_bg_image_opacity === "number" && design.card_bg_image_opacity >= 0 && design.card_bg_image_opacity <= 1)
               updates.card_bg_image_opacity = design.card_bg_image_opacity;
             // Card glass mode
             if (typeof design?.cardGlassEnabled === "boolean")
