@@ -9212,7 +9212,8 @@ export default {
           const card_bg_image_opacity = card_bg_image_key && typeof design.cardBgImageOpacity === "number" && design.cardBgImageOpacity >= 0 && design.cardBgImageOpacity <= 1 ? design.cardBgImageOpacity : null;
           const card_glass_enabled = typeof design.cardGlassEnabled === "boolean" ? design.cardGlassEnabled : null;
           const VALID_GLASS_STYLES = ["frosted", "clear", "tinted"];
-          const card_glass_style = typeof design.cardGlassStyle === "string" && VALID_GLASS_STYLES.includes(design.cardGlassStyle) ? design.cardGlassStyle : null;
+          const card_glass_style_raw = typeof design.cardGlassStyle === "string" && VALID_GLASS_STYLES.includes(design.cardGlassStyle) ? design.cardGlassStyle : null;
+          const card_glass_style = card_glass_style_raw === "tinted" ? "frosted" : card_glass_style_raw;
           const header_glass_enabled = typeof design.headerGlassEnabled === "boolean" ? design.headerGlassEnabled : null;
           const header_glass_style = typeof design.headerGlassStyle === "string" && VALID_GLASS_STYLES.includes(design.headerGlassStyle) ? design.headerGlassStyle : null;
 
@@ -9615,9 +9616,9 @@ export default {
             // Card glass style
             const VALID_GLASS_STYLES_U = ["frosted", "clear", "tinted"];
             if (typeof design?.cardGlassStyle === "string" && VALID_GLASS_STYLES_U.includes(design.cardGlassStyle))
-              updates.card_glass_style = design.cardGlassStyle;
+              updates.card_glass_style = design.cardGlassStyle === "tinted" ? "frosted" : design.cardGlassStyle;
             else if (typeof design?.card_glass_style === "string" && VALID_GLASS_STYLES_U.includes(design.card_glass_style))
-              updates.card_glass_style = design.card_glass_style;
+              updates.card_glass_style = design.card_glass_style === "tinted" ? "frosted" : design.card_glass_style;
             // Header glass mode
             if (typeof design?.headerGlassEnabled === "boolean")
               updates.header_glass_enabled = design.headerGlassEnabled;
