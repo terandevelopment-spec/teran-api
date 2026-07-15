@@ -495,6 +495,139 @@ async function sha256Hex(str: string): Promise<string> {
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
+
+// --------- News date/history helpers ----------
+/**
+ * Shape of a normalized news article used by the /api/rss endpoint and stored
+ * in the news_articles table.
+ */
+export interface RssArticle {
+  article_id: string;
+  title: string;
+  description: string;
+  image_url: string | null;
+  link: string;
+  source_id: string;
+  pubDate: string; // ISO 8601 UTC
+}
+
+/**
+ * Strict YYYY-MM-DD validation. Rejects malformed strings and impossible
+ * calendar dates (e.g. 2026-02-31, 2026-13-01).
+ */
+export function isValidCalendarDate(s: string): boolean {
+  if (typeof s !== "string") return false;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return false;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return false;
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return (
+    dt.getUTCFullYear() === y &&
+    dt.getUTCMonth() === mo - 1 &&
+    dt.getUTCDate() === d
+  );
+}
+
+/**
+ * Convert a JST (Asia/Tokyo, UTC+09:00, no DST) calendar date (YYYY-MM-DD)
+ * into a half-open UTC instant range [startUtc, endUtc). A row belongs to the
+ * JST day when pub_date >= startUtc AND pub_date < endUtc.
+ */
+export function jstDayRangeUtc(dateStr: string): { startUtc: string; endUtc: string } {
+  const start = new Date(`${dateStr}T00:00:00+09:00`);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  return { startUtc: start.toISOString(), endUtc: end.toISOString() };
+}
+
+/**
+ * Current JST calendar date as YYYY-MM-DD. Uses a fixed +09:00 offset since
+ * JST has no daylight saving time.
+ */
+export function getJstDateString(now: Date = new Date()): string {
+  const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+  const y = jst.getUTCFullYear();
+  const mo = String(jst.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(jst.getUTCDate()).padStart(2, "0");
+  return `${y}-${mo}-${d}`;
+}
+
+/**
+ * Query persisted news articles for a category within a UTC instant range,
+ * newest first. Returns items in the same shape as the live RSS response.
+ */
+async function queryStoredNews(
+  env: Env,
+  category: string,
+  startUtc: string,
+  endUtc: string,
+  limit = 50
+): Promise<RssArticle[]> {
+  const { data, error } = await sb(env)
+    .from("news_articles")
+    .select("article_id, title, description, image_url, link, source_id, pub_date")
+    .eq("category", category)
+    .gte("pub_date", startUtc)
+    .lt("pub_date", endUtc)
+    .order("pub_date", { ascending: false })
+    .limit(limit);
+  if (error) throw new Error(`news_articles select failed: ${error.message}`);
+  return (data ?? []).map((row: any) => ({
+    article_id: String(row.article_id),
+    title: String(row.title ?? ""),
+    description: String(row.description ?? ""),
+    image_url: row.image_url ?? null,
+    link: String(row.link ?? ""),
+    source_id: String(row.source_id ?? "yahoo_news"),
+    pubDate: new Date(row.pub_date).toISOString(),
+  }));
+}
+
+/**
+ * Append-and-upsert persisted news articles keyed by (category, article_id).
+ * On conflict, mutable fields and updated_at are refreshed while ingested_at
+ * is preserved (it is never included in the payload, so the row default and
+ * existing value are kept). Malformed articles must be filtered out by the
+ * caller; this function additionally skips anything missing required fields
+ * or a valid pubDate.
+ */
+async function upsertStoredNews(
+  env: Env,
+  category: string,
+  articles: RssArticle[]
+): Promise<number> {
+  const now = new Date().toISOString();
+  const rows = articles
+    .filter(
+      (a) =>
+        a &&
+        a.article_id &&
+        a.title &&
+        a.link &&
+        a.pubDate &&
+        !Number.isNaN(Date.parse(a.pubDate))
+    )
+    .map((a) => ({
+      category,
+      article_id: a.article_id,
+      title: a.title,
+      description: a.description ?? "",
+      image_url: a.image_url ?? null,
+      link: a.link,
+      source_id: a.source_id || "yahoo_news",
+      pub_date: new Date(a.pubDate).toISOString(),
+      updated_at: now,
+    }));
+  if (rows.length === 0) return 0;
+  const { error } = await sb(env)
+    .from("news_articles")
+    .upsert(rows, { onConflict: "category,article_id" });
+  if (error) throw new Error(`news_articles upsert failed: ${error.message}`);
+  return rows.length;
+}
+
 // --------- Room metadata helper ----------
 async function resolveRoomMeta(
   env: Env,
@@ -8479,9 +8612,32 @@ export default {
             });
           }
 
-          // ── Cache API: check edge cache first ──
+          // Optional date parameter (JST calendar date, strict YYYY-MM-DD).
+          const dateParam = url.searchParams.get("date")?.trim() || "";
+          if (dateParam && !isValidCalendarDate(dateParam)) {
+            console.log(`[rss] rid=${request_id} invalid_date category=${category} date=${dateParam}`);
+            return new Response(JSON.stringify({
+              status: "error",
+              message: "Invalid date. Expected format YYYY-MM-DD.",
+              request_id,
+            }), {
+              status: 400,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+                ...corsHeaders(req, env),
+              },
+            });
+          }
+          const todayJst = getJstDateString();
+          const isDateRequest = dateParam.length > 0;
+          const isToday = isDateRequest && dateParam === todayJst;
+          const isHistoryOnly = isDateRequest && !isToday; // past or future: store only
+
+          // ── Cache API: check edge cache first (date-aware key) ──
           const cacheUrl = new URL("https://cache.internal/rss");
           cacheUrl.searchParams.set("category", category);
+          cacheUrl.searchParams.set("date", isDateRequest ? dateParam : "latest");
           const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
           const cache = caches.default;
           const cached = await cache.match(cacheKey);
@@ -8504,7 +8660,56 @@ export default {
             });
           }
 
-          // ── Cache MISS: fetch + parse upstream RSS ──
+          // ── Past/future date: serve exclusively from persisted history. ──
+          // Never fetch live RSS and never fall back to current news.
+          if (isHistoryOnly) {
+            const RSS_HISTORY_TTL = 300; // seconds (historical rows are stable)
+            try {
+              const { startUtc, endUtc } = jstDayRangeUtc(dateParam);
+              const results = await queryStoredNews(env, category, startUtc, endUtc);
+              const body = JSON.stringify({ status: "success", results, request_id });
+              try {
+                await cache.put(cacheKey, new Response(body, {
+                  status: 200,
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Cache-Control": `public, max-age=${RSS_HISTORY_TTL}`,
+                  },
+                }));
+              } catch (putErr: any) {
+                console.error(`[cache] rss history put fail category=${category} date=${dateParam} rid=${request_id}`, putErr);
+              }
+              console.log(`[perf] rss rid=${request_id} mode=history category=${category} date=${dateParam} results=${results.length} total=${Date.now() - t0}ms colo=${colo} key=${cacheKey.url}`);
+              return new Response(body, {
+                status: 200,
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Request-Id": request_id,
+                  "X-Cache": "MISS",
+                  "X-Category": category,
+                  "X-News-Date": dateParam,
+                  "Cache-Control": `public, max-age=${RSS_HISTORY_TTL}`,
+                  ...corsHeaders(req, env),
+                },
+              });
+            } catch (e: any) {
+              console.error(`[RSS] history query failed category=${category} date=${dateParam}:`, e?.message);
+              return new Response(JSON.stringify({
+                status: "error",
+                message: "News history query failed",
+                request_id,
+              }), {
+                status: 502,
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Request-Id": request_id,
+                  ...corsHeaders(req, env),
+                },
+              });
+            }
+          }
+
+          // ── Cache MISS: fetch + parse upstream RSS (no-date latest, or today) ──
           const rssUrl = RSS_FEEDS[category];
 
           try {
@@ -8664,10 +8869,35 @@ export default {
               }));
             }
 
+            // ── Persist parsed articles (append-and-upsert). ──
+            // Today: block on persistence so the response is served from the
+            //   same historical store. No-date latest: persist in the
+            //   background so the live response contract/perf is preserved.
+            let results: RssArticle[] = items;
+            if (isToday) {
+              try {
+                const persisted = await upsertStoredNews(env, category, items);
+                const { startUtc, endUtc } = jstDayRangeUtc(dateParam);
+                results = await queryStoredNews(env, category, startUtc, endUtc);
+                console.log(`[rss] rid=${request_id} mode=today category=${category} date=${dateParam} parsed=${items.length} persisted=${persisted} results=${results.length}`);
+              } catch (persistErr: any) {
+                // If persistence/query fails on today, fall back to the freshly
+                // parsed live items so today is never empty due to a store error.
+                console.error(`[RSS] today persist/query failed category=${category} date=${dateParam}:`, persistErr?.message);
+                results = items;
+              }
+            } else {
+              ctx.waitUntil(
+                upsertStoredNews(env, category, items)
+                  .then((n) => console.log(`[rss] rid=${request_id} mode=latest category=${category} persisted=${n}`))
+                  .catch((err) => console.error(`[RSS] latest persist failed category=${category}:`, err?.message))
+              );
+            }
+
             // Build response body
             const body = JSON.stringify({
               status: "success",
-              results: items,
+              results,
               request_id,
             });
 
@@ -8681,13 +8911,13 @@ export default {
             });
             try {
               await cache.put(cacheKey, cacheResponse);
-              console.log(`[cache] rss put ok category=${category} rid=${request_id} key=${cacheKey.url} colo=${colo}`);
+              console.log(`[cache] rss put ok category=${category} date=${isDateRequest ? dateParam : "latest"} rid=${request_id} key=${cacheKey.url} colo=${colo}`);
             } catch (putErr: any) {
               console.error(`[cache] rss put fail category=${category} rid=${request_id}`, putErr);
             }
 
             const tEnd = Date.now();
-            console.log(`[perf] rss rid=${request_id} cache=MISS category=${category} cacheCheck=${tCache - t0}ms fetch=${tFetch - tCache}ms parse=${tParse - tFetch}ms ogp=${tOgp - tParse}ms total=${tEnd - t0}ms payloadBytes=${body.length} items=${items.length} ogpOk=${ogpOk} ogpFail=${ogpFail} colo=${colo} key=${cacheKey.url}`);
+            console.log(`[perf] rss rid=${request_id} cache=MISS mode=${isToday ? "today" : "latest"} category=${category} cacheCheck=${tCache - t0}ms fetch=${tFetch - tCache}ms parse=${tParse - tFetch}ms ogp=${tOgp - tParse}ms total=${tEnd - t0}ms payloadBytes=${body.length} items=${results.length} ogpOk=${ogpOk} ogpFail=${ogpFail} colo=${colo} key=${cacheKey.url}`);
 
             // Build response
             const response = new Response(body, {
@@ -8698,6 +8928,7 @@ export default {
                 "X-Cache": "MISS",
                 "Cache-Control": `public, max-age=${RSS_CACHE_TTL}`,
                 "X-Category": category,
+                ...(isDateRequest ? { "X-News-Date": dateParam } : {}),
                 ...corsHeaders(req, env),
               },
             });
