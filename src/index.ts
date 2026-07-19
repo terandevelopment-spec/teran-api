@@ -861,6 +861,57 @@ function generateInviteToken(): string {
   return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
 }
 
+// ── Read-only invite validation ──────────────────────────────────────────
+// Validates that `token` is a currently-active invite for `roomId`.
+// This is a PURE READ: it performs no writes, no membership lookup, no
+// membership mutation, no KV mutation, and no role change. It is shared by
+// join_by_invite (which then performs its own membership mutation) and by the
+// Room-links endpoint (which performs NO membership mutation).
+//
+// Returns a discriminated result so each caller can map it to its own error
+// convention (join_by_invite uses marker/debug responses; other callers use
+// HttpError) without changing behavior.
+type InviteValidation =
+  | { ok: true; invite: { id: any; room_id: string; revoked: boolean } }
+  | { ok: false; reason: "empty_token" | "not_found" | "revoked"; errorCode: string | null };
+
+async function validateRoomInvite(env: Env, roomId: string, token: string): Promise<InviteValidation> {
+  const t = typeof token === "string" ? token.trim() : "";
+  if (!t) return { ok: false, reason: "empty_token", errorCode: null };
+
+  const { data: invite, error } = await sb(env)
+    .from("room_invites")
+    .select("id,room_id,revoked")
+    .eq("room_id", roomId)
+    .eq("token", t)
+    .maybeSingle();
+
+  if (!invite) return { ok: false, reason: "not_found", errorCode: error ? (error as any).code ?? null : null };
+  if ((invite as any).revoked) return { ok: false, reason: "revoked", errorCode: null };
+  return { ok: true, invite: invite as any };
+}
+
+// ── Room-links helpers ────────────────────────────────────────────────────
+// Minimal target-Room summary returned by the Room-links endpoints. Contains
+// only confirmed `rooms` columns needed for navigation/display — never member
+// lists, roles, Post permission, invite tokens, or full design payloads.
+const ROOM_LINK_SUMMARY_FIELDS = "id,room_key,name,description,emoji,icon_key,icon_thumb_key,visibility";
+
+// Read-only load of a Room's authoritative core fields (id, visibility, owner_id).
+// Private status must ALWAYS be read via this DB value, never trusted from the client.
+async function loadRoomCore(
+  env: Env,
+  roomId: string
+): Promise<{ id: string; visibility: string; owner_id: string } | null> {
+  const { data, error } = await sb(env)
+    .from("rooms")
+    .select("id,visibility,owner_id")
+    .eq("id", roomId)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return (data as any) ?? null;
+}
+
 // --------- cursor pagination helpers ----------
 function parseCursor(raw: string | null): { created_at: string; id: number } | null {
   if (!raw || typeof raw !== "string") return null;
@@ -10816,22 +10867,19 @@ export default {
                 return failWithMarkers(422, "VALIDATION_ERROR", "token is required");
               }
 
-              // ── 3. Validate invite ───────────────────────────────────────
-              const { data: invite, error: inviteErr } = await sb(env)
-                .from("room_invites")
-                .select("id,room_id,revoked")
-                .eq("room_id", roomId)
-                .eq("token", token)
-                .maybeSingle();
+              // ── 3. Validate invite (shared read-only helper) ─────────────
+              const inviteResult = await validateRoomInvite(env, roomId, token);
 
-              if (!invite) {
-                dbg.inviteValidationResult = inviteErr ? `db_error:${inviteErr.code}` : "invalid";
+              if (!inviteResult.ok && inviteResult.reason !== "revoked") {
+                // "empty_token" cannot occur here (guarded above) but is treated
+                // as invalid for safety. Preserves the original "invalid" message.
+                dbg.inviteValidationResult = inviteResult.errorCode ? `db_error:${inviteResult.errorCode}` : "invalid";
                 dbg.selectedBranch = "invalid_invite";
                 dbg.responseStatus = 403;
                 console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
                 return failWithMarkers(403, "FORBIDDEN", "Invalid invite token");
               }
-              if ((invite as any).revoked) {
+              if (!inviteResult.ok && inviteResult.reason === "revoked") {
                 dbg.inviteValidationResult = "revoked";
                 dbg.selectedBranch = "revoked_invite";
                 dbg.responseStatus = 403;
@@ -11066,6 +11114,232 @@ export default {
               console.error("[join_by_invite] unexpected error:", e?.message);
               throw e;
             }
+          }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // Room Links — Private Room → Private Room navigation relationships
+        // Navigation-only. These routes NEVER touch room_members, never grant
+        // any role/permission, never call join/join_by_invite, and never store
+        // invite tokens. The target invite token is used once (POST) purely as
+        // proof the source owner was invited; only the target UUID is stored.
+        // ══════════════════════════════════════════════════════════════
+
+        // GET /api/rooms/:sourceRoomId/links — list a source Room's linked Rooms
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)\/links$/);
+          if (m && req.method === "GET") {
+            const sourceRoomId = m[1];
+
+            // Source must exist and be Private (authoritative DB read).
+            const sourceRoom = await loadRoomCore(env, sourceRoomId);
+            if (!sourceRoom) throw new HttpError(404, "NOT_FOUND", "Source room not found");
+            if (sourceRoom.visibility !== "private_invite_only") {
+              throw new HttpError(422, "SOURCE_ROOM_NOT_PRIVATE", "Source room is not private");
+            }
+            // Viewing the linked-Room row does NOT require source-owner auth.
+
+            // All links for this source, stable order.
+            const { data: linkRows, error: linksErr } = await sb(env)
+              .from("room_links")
+              .select("id,source_room_id,target_room_id,position,created_at")
+              .eq("source_room_id", sourceRoomId)
+              .order("position", { ascending: true })
+              .order("created_at", { ascending: true });
+            if (linksErr) throw new Error(linksErr.message);
+
+            const links = (linkRows as any[]) ?? [];
+            if (links.length === 0) return ok(req, env, request_id, { links: [] });
+
+            // Batch-load all target Rooms in ONE query (no N+1).
+            const targetIds = Array.from(new Set(links.map((l: any) => l.target_room_id)));
+            const { data: targetRooms, error: roomsErr } = await sb(env)
+              .from("rooms")
+              .select(ROOM_LINK_SUMMARY_FIELDS)
+              .in("id", targetIds);
+            if (roomsErr) throw new Error(roomsErr.message);
+
+            const roomById = new Map<string, any>();
+            for (const r of (targetRooms as any[]) ?? []) roomById.set(String((r as any).id), r);
+
+            // Preserve link order; omit missing targets and non-private targets.
+            const out: any[] = [];
+            for (const l of links) {
+              const room = roomById.get(String(l.target_room_id));
+              if (!room) continue;
+              if ((room as any).visibility !== "private_invite_only") continue;
+              out.push({
+                id: l.id,
+                source_room_id: l.source_room_id,
+                target_room_id: l.target_room_id,
+                position: l.position,
+                created_at: l.created_at,
+                room,
+              });
+            }
+
+            return ok(req, env, request_id, { links: out });
+          }
+        }
+
+        // POST /api/rooms/:sourceRoomId/links — source owner links a target Private Room
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)\/links$/);
+          if (m && req.method === "POST") {
+            const sourceRoomId = m[1];
+
+            // 1. Authenticate.
+            const user_id = await requireAuth(req, env);
+
+            // 2-4. Parse + validate body.
+            const body = (await req.json().catch(() => null)) as any;
+            const targetRoomId = typeof body?.target_room_id === "string" ? body.target_room_id.trim() : "";
+            const inviteToken = typeof body?.invite_token === "string" ? body.invite_token.trim() : "";
+            if (!targetRoomId) throw new HttpError(422, "VALIDATION_ERROR", "target_room_id is required");
+            if (!inviteToken) throw new HttpError(422, "VALIDATION_ERROR", "invite_token is required");
+
+            // 5-7. Load source Room; must exist and be Private.
+            const sourceRoom = await loadRoomCore(env, sourceRoomId);
+            if (!sourceRoom) throw new HttpError(404, "NOT_FOUND", "Source room not found");
+            if (sourceRoom.visibility !== "private_invite_only") {
+              throw new HttpError(422, "SOURCE_ROOM_NOT_PRIVATE", "Source room is not private");
+            }
+
+            // 8. Actor must own the source Room (established owner pattern).
+            const myRole = await checkRoomMembership(env, sourceRoomId, user_id);
+            if (myRole !== "owner") {
+              throw new HttpError(403, "FORBIDDEN", "Only the source room owner can add links");
+            }
+
+            // 12. Reject self-link early (before extra reads).
+            if (sourceRoomId === targetRoomId) {
+              throw new HttpError(422, "SELF_LINK_NOT_ALLOWED", "A room cannot link to itself");
+            }
+
+            // 9-11. Load target Room by canonical UUID; must exist and be Private.
+            const targetRoom = await loadRoomCore(env, targetRoomId);
+            if (!targetRoom) throw new HttpError(404, "NOT_FOUND", "Target room not found");
+            if (targetRoom.visibility !== "private_invite_only") {
+              throw new HttpError(422, "TARGET_ROOM_NOT_PRIVATE", "Target room is not private");
+            }
+
+            // 13. Validate the invite for the TARGET Room (read-only helper).
+            //     Token is proof-of-invitation only; it is NEVER stored.
+            const inviteResult = await validateRoomInvite(env, targetRoomId, inviteToken);
+            if (!inviteResult.ok) {
+              if (inviteResult.reason === "revoked") {
+                throw new HttpError(403, "FORBIDDEN", "This invite has been revoked");
+              }
+              throw new HttpError(403, "FORBIDDEN", "Invalid invite token");
+            }
+
+            // 14. Friendly duplicate pre-check.
+            const { data: existingLink, error: existErr } = await sb(env)
+              .from("room_links")
+              .select("id")
+              .eq("source_room_id", sourceRoomId)
+              .eq("target_room_id", targetRoomId)
+              .maybeSingle();
+            if (existErr) throw new Error(existErr.message);
+            if (existingLink) throw new HttpError(409, "ROOM_ALREADY_LINKED", "This room is already linked");
+
+            // Determine next stable position: max(position) + 1, else 0.
+            const { data: lastRow, error: posErr } = await sb(env)
+              .from("room_links")
+              .select("position")
+              .eq("source_room_id", sourceRoomId)
+              .order("position", { ascending: false })
+              .limit(1)
+              .maybeSingle();
+            if (posErr) throw new Error(posErr.message);
+            const nextPosition = lastRow ? ((lastRow as any).position ?? 0) + 1 : 0;
+
+            // 15. Insert exactly the navigation fields (never the invite token).
+            const { data: inserted, error: insertErr } = await sb(env)
+              .from("room_links")
+              .insert({
+                source_room_id: sourceRoomId,
+                target_room_id: targetRoomId,
+                created_by: user_id,
+                position: nextPosition,
+              })
+              .select("id,source_room_id,target_room_id,position,created_at")
+              .single();
+
+            if (insertErr) {
+              // DB-level duplicate → same 409 as the friendly pre-check.
+              if ((insertErr as any).code === "23505") {
+                throw new HttpError(409, "ROOM_ALREADY_LINKED", "This room is already linked");
+              }
+              throw new Error(insertErr.message);
+            }
+
+            // 16. Load target summary for the response.
+            const { data: targetSummary, error: sumErr } = await sb(env)
+              .from("rooms")
+              .select(ROOM_LINK_SUMMARY_FIELDS)
+              .eq("id", targetRoomId)
+              .maybeSingle();
+            if (sumErr) throw new Error(sumErr.message);
+
+            return ok(
+              req,
+              env,
+              request_id,
+              { link: { ...(inserted as any), room: targetSummary ?? null } },
+              201
+            );
+          }
+        }
+
+        // DELETE /api/rooms/:sourceRoomId/links/:linkId — source owner removes a link
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)\/links\/([^/]+)$/);
+          if (m && req.method === "DELETE") {
+            const sourceRoomId = m[1];
+            const linkIdRaw = m[2];
+
+            // 1. Authenticate.
+            const user_id = await requireAuth(req, env);
+
+            const linkId = Number(linkIdRaw);
+            if (!Number.isInteger(linkId) || linkId <= 0) {
+              throw new HttpError(404, "NOT_FOUND", "Link not found");
+            }
+
+            // 2-4. Source must exist and be Private.
+            const sourceRoom = await loadRoomCore(env, sourceRoomId);
+            if (!sourceRoom) throw new HttpError(404, "NOT_FOUND", "Source room not found");
+            if (sourceRoom.visibility !== "private_invite_only") {
+              throw new HttpError(422, "SOURCE_ROOM_NOT_PRIVATE", "Source room is not private");
+            }
+
+            // 5. Actor must own the source Room.
+            const myRole = await checkRoomMembership(env, sourceRoomId, user_id);
+            if (myRole !== "owner") {
+              throw new HttpError(403, "FORBIDDEN", "Only the source room owner can remove links");
+            }
+
+            // 6-7. Link must belong to THIS source Room.
+            const { data: linkRow, error: linkErr } = await sb(env)
+              .from("room_links")
+              .select("id")
+              .eq("id", linkId)
+              .eq("source_room_id", sourceRoomId)
+              .maybeSingle();
+            if (linkErr) throw new Error(linkErr.message);
+            if (!linkRow) throw new HttpError(404, "NOT_FOUND", "Link not found");
+
+            // 8. Delete exactly this relationship. Nothing else is touched:
+            //    no room_members, no target invite, no roles/permissions.
+            const { error: delErr } = await sb(env)
+              .from("room_links")
+              .delete()
+              .eq("id", linkId)
+              .eq("source_room_id", sourceRoomId);
+            if (delErr) throw new Error(delErr.message);
+
+            return ok(req, env, request_id, { deleted: true, link_id: linkId });
           }
         }
 
