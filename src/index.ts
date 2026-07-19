@@ -628,6 +628,405 @@ async function upsertStoredNews(
   return rows.length;
 }
 
+// --------- Fixed daily News Feed slots ----------
+/**
+ * Stored row shape for the immutable, append-only news_daily_slots table.
+ * Each row is a COMPLETE article snapshot taken at selection time and must
+ * never be updated to reflect later changes in news_articles.
+ */
+export type NewsDailySlotRow = {
+  id?: number;
+  category: string;
+  news_date: string; // JST calendar date, YYYY-MM-DD
+  slot_index: number; // 0..7
+  source_id: string;
+  article_id: string;
+  title: string;
+  description: string;
+  image_url: string | null;
+  link: string;
+  pub_date: string; // ISO 8601 UTC
+  selected_at?: string;
+};
+
+/**
+ * Pure mapping from a stored slot row back into the existing /api/rss result
+ * article shape. The frontend contract is preserved exactly: slot.pub_date is
+ * exposed as `pubDate`, and slot_index is intentionally not exposed.
+ */
+export function slotRowToArticle(row: NewsDailySlotRow): RssArticle {
+  return {
+    article_id: String(row.article_id),
+    title: String(row.title ?? ""),
+    description: String(row.description ?? ""),
+    image_url: row.image_url ?? null,
+    link: String(row.link ?? ""),
+    source_id: String(row.source_id ?? "yahoo_news"),
+    pubDate: new Date(row.pub_date).toISOString(),
+  };
+}
+
+/**
+ * Version-1 URL normalization for exact-duplicate detection. Never throws:
+ * on parse failure it returns a trimmed lowercase fallback string so callers
+ * can still compare deterministically. Does NOT merge URLs by hostname alone —
+ * the path and meaningful query identifiers are preserved.
+ */
+export function normalizeNewsUrlForDedupe(input: string): string {
+  const raw = (input ?? "").trim();
+  if (!raw) return "";
+  try {
+    const u = new URL(raw);
+    u.hash = "";
+    u.hostname = u.hostname.toLowerCase();
+    // Drop tracking parameters: all utm_* plus Yahoo's source=rss marker.
+    const toDelete: string[] = [];
+    u.searchParams.forEach((_v, k) => {
+      const lk = k.toLowerCase();
+      if (lk.startsWith("utm_") || lk === "source" || lk === "fbclid" || lk === "gclid") {
+        toDelete.push(k);
+      }
+    });
+    for (const k of toDelete) u.searchParams.delete(k);
+    let out = u.toString();
+    // Remove trailing slash except for the root path.
+    if (out.endsWith("/") && u.pathname !== "/") out = out.slice(0, -1);
+    return out;
+  } catch {
+    return raw.toLowerCase();
+  }
+}
+
+/**
+ * Version-1 title normalization for exact-duplicate detection. Conservative:
+ * NFC, trim, collapse whitespace, full-width→normal spaces, lowercase Latin,
+ * strip an obvious trailing "Yahoo!ニュース" suffix, and collapse repeated
+ * decorative punctuation. Meaningful names, numbers, quotes, and Japanese text
+ * are preserved. No fuzzy/semantic matching.
+ */
+export function normalizeNewsTitleForDedupe(input: unknown): string {
+  let t = typeof input === "string" ? input : String(input ?? "");
+  try {
+    t = t.normalize("NFC");
+  } catch { /* older runtimes: keep as-is */ }
+  // Full-width space (U+3000) and other unusual spaces -> normal space.
+  t = t.replace(/[\u3000\u00a0]/g, " ");
+  // Strip an obvious trailing Yahoo!ニュース suffix in its common forms.
+  t = t.replace(/\s*[-｜|（(]\s*Yahoo!\s*ニュース\s*[)）]?\s*$/u, "");
+  // Strip an obvious trailing NHK suffix (｜NHK, - NHK, （NHK）, NHKニュース).
+  // Only removes a trailing marker; "NHK" inside a headline is preserved.
+  t = t.replace(/\s*[-｜|（(]\s*NHK(?:\s*ニュース)?\s*[)）]?\s*$/u, "");
+  // Collapse repeated decorative punctuation (…, ・, -, ! etc.) conservatively.
+  t = t.replace(/([・\-–—…!?！？]){2,}/gu, "$1");
+  // Collapse whitespace and trim.
+  t = t.replace(/\s+/g, " ").trim();
+  // Lowercase Latin characters only (Japanese text is unaffected by toLowerCase,
+  // but this keeps intent explicit and stable).
+  t = t.toLowerCase();
+  return t;
+}
+
+/**
+ * Query the canonical fixed slots for a category + JST date, ordered by
+ * slot_index ascending, at most 8. This table is the source of truth for the
+ * News Feed; it never silently falls back to news_articles. Database errors
+ * are surfaced to the caller.
+ */
+async function queryDailyNewsSlots(
+  env: Env,
+  category: string,
+  newsDate: string
+): Promise<NewsDailySlotRow[]> {
+  const { data, error } = await sb(env)
+    .from("news_daily_slots")
+    .select(
+      "id, category, news_date, slot_index, source_id, article_id, title, description, image_url, link, pub_date, selected_at"
+    )
+    .eq("category", category)
+    .eq("news_date", newsDate)
+    .order("slot_index", { ascending: true })
+    .limit(8);
+  if (error) throw new Error(`news_daily_slots select failed: ${error.message}`);
+  return (data ?? []).map((row: any) => ({
+    id: row.id,
+    category: String(row.category),
+    news_date: String(row.news_date),
+    slot_index: Number(row.slot_index),
+    source_id: String(row.source_id),
+    article_id: String(row.article_id),
+    title: String(row.title ?? ""),
+    description: String(row.description ?? ""),
+    image_url: row.image_url ?? null,
+    link: String(row.link ?? ""),
+    pub_date: new Date(row.pub_date).toISOString(),
+    selected_at: row.selected_at ? String(row.selected_at) : undefined,
+  }));
+}
+
+/**
+ * Classify a Supabase/Postgres error as an expected uniqueness conflict
+ * (safe to ignore during insert-only slot races) vs. a genuine failure.
+ */
+function isUniqueViolation(err: any): boolean {
+  const code = err?.code ?? err?.details?.code;
+  if (code === "23505") return true;
+  const msg = String(err?.message ?? "");
+  return /duplicate key value|unique constraint/i.test(msg);
+}
+
+/**
+ * Insert-only persistence for fixed slots. Never updates existing rows and
+ * never uses overwrite-style upsert. Rows are inserted one at a time so that a
+ * uniqueness conflict on any single row (a concurrent request already claimed
+ * that slot or article) is ignored without discarding the other rows. Genuine
+ * (non-conflict) database errors are thrown for the caller to handle.
+ */
+async function insertDailyNewsSlots(
+  env: Env,
+  rows: NewsDailySlotRow[]
+): Promise<{ inserted: number; conflicts: number }> {
+  let inserted = 0;
+  let conflicts = 0;
+  for (const row of rows) {
+    const { error } = await sb(env).from("news_daily_slots").insert(row as any);
+    if (error) {
+      if (isUniqueViolation(error)) {
+        conflicts++;
+        continue;
+      }
+      throw new Error(`news_daily_slots insert failed: ${error.message}`);
+    }
+    inserted++;
+  }
+  return { inserted, conflicts };
+}
+
+/**
+ * A candidate is only eligible for a slot if it has a title, a link, and a
+ * parseable publication date. A missing image is allowed (frontend fallback).
+ */
+export function isSlotEligibleCandidate(a: RssArticle | null | undefined): boolean {
+  return !!(
+    a &&
+    a.title &&
+    a.title.trim() &&
+    a.link &&
+    a.link.trim() &&
+    a.pubDate &&
+    !Number.isNaN(Date.parse(a.pubDate))
+  );
+}
+
+/**
+ * Deterministic candidate ordering: newest pubDate first, ties broken by
+ * article_id ascending. Does not rely on JavaScript sort stability. Returns a
+ * new array; the input is not mutated.
+ */
+export function sortYahooCandidates(items: RssArticle[]): RssArticle[] {
+  return [...items].sort((a, b) => {
+    const at = Date.parse(a.pubDate);
+    const bt = Date.parse(b.pubDate);
+    const av = Number.isNaN(at) ? -Infinity : at;
+    const bv = Number.isNaN(bt) ? -Infinity : bt;
+    if (av !== bv) return bv - av; // pubDate DESC
+    if (a.article_id < b.article_id) return -1; // article_id ASC
+    if (a.article_id > b.article_id) return 1;
+    return 0;
+  });
+}
+
+/**
+ * Given the existing (already fixed) slots and a deterministically ordered list
+ * of candidates, decide which candidates fill which empty slot indexes.
+ *
+ * Rules:
+ * - Empty indexes are derived from 0..7 minus existing slot_index values, in
+ *   ascending order (existing slots may be sparse and are never reordered).
+ * - A candidate is skipped when it is ineligible, when (source_id, article_id)
+ *   already exists, or when its normalized URL/title collides with an existing
+ *   slot or a candidate already accepted in this pass.
+ * - Each accepted candidate takes the lowest remaining empty index.
+ * - At most 8 total; never proposes more than the number of empty slots.
+ */
+export function planDailySlotAssignments(
+  existing: Array<Pick<NewsDailySlotRow, "slot_index" | "source_id" | "article_id" | "link" | "title">>,
+  candidates: RssArticle[]
+): Array<{ slot_index: number; article: RssArticle }> {
+  const usedIndexes = new Set(existing.map((s) => s.slot_index));
+  const emptyIndexes: number[] = [];
+  for (let i = 0; i < 8; i++) if (!usedIndexes.has(i)) emptyIndexes.push(i);
+
+  const usedKey = new Set(existing.map((s) => `${s.source_id}\u0000${s.article_id}`));
+  const seenUrl = new Set(existing.map((s) => normalizeNewsUrlForDedupe(s.link)));
+  const seenTitle = new Set(existing.map((s) => normalizeNewsTitleForDedupe(s.title)));
+
+  const out: Array<{ slot_index: number; article: RssArticle }> = [];
+  let cursor = 0;
+  for (const c of candidates) {
+    if (cursor >= emptyIndexes.length) break;
+    if (!isSlotEligibleCandidate(c)) continue;
+    const key = `${c.source_id || "yahoo_news"}\u0000${c.article_id}`;
+    if (usedKey.has(key)) continue;
+    const nu = normalizeNewsUrlForDedupe(c.link);
+    const nt = normalizeNewsTitleForDedupe(c.title);
+    if (nu && seenUrl.has(nu)) continue;
+    if (nt && seenTitle.has(nt)) continue;
+    out.push({ slot_index: emptyIndexes[cursor], article: c });
+    cursor++;
+    usedKey.add(key);
+    if (nu) seenUrl.add(nu);
+    if (nt) seenTitle.add(nt);
+  }
+  return out;
+}
+
+/**
+ * Secondary News Feed sources per category (version 1: NHK only). Used to fill
+ * remaining empty slots after Yahoo. Categories absent here (`it`, `local`)
+ * remain Yahoo-only. The configured NHK URLs currently redirect to an internal
+ * NHK host; normal HTTP redirect following handles that.
+ */
+export const SECONDARY_NEWS_FEEDS: Record<string, { sourceId: string; sourceName: string; url: string }> = {
+  domestic: { sourceId: "nhk", sourceName: "NHK", url: "https://www.nhk.or.jp/rss/news/cat1.xml" },
+  world: { sourceId: "nhk", sourceName: "NHK", url: "https://www.nhk.or.jp/rss/news/cat6.xml" },
+  business: { sourceId: "nhk", sourceName: "NHK", url: "https://www.nhk.or.jp/rss/news/cat5.xml" },
+  entertainment: { sourceId: "nhk", sourceName: "NHK", url: "https://www.nhk.or.jp/rss/news/cat2.xml" },
+  sports: { sourceId: "nhk", sourceName: "NHK", url: "https://www.nhk.or.jp/rss/news/cat7.xml" },
+  science: { sourceId: "nhk", sourceName: "NHK", url: "https://www.nhk.or.jp/rss/news/cat3.xml" },
+};
+
+/**
+ * Pure RSS 2.0 item parser shared by Yahoo News Japan and NHK feeds. Extracts
+ * up to `maxItems` items:
+ *   - title/description/link (CDATA or plain text)
+ *   - guid (including attributes such as isPermaLink) → article_id; when absent,
+ *     a deterministic SHA-256 prefix of the link is used
+ *   - pubDate → ISO UTC (RFC 822 with explicit +0900 is parsed correctly)
+ *   - image_url from media:thumbnail, then media:content, then an https image
+ *     enclosure; null when none is present (NHK has no reliable images)
+ * Items missing a title or link are skipped. source_id is set from opts.
+ * No Atom/JSON Feed support; entity handling matches the historical parser.
+ */
+export async function parseNewsRssItems(
+  xmlText: string,
+  opts: { sourceId: string; maxItems?: number }
+): Promise<RssArticle[]> {
+  const sourceId = opts.sourceId;
+  const maxItems = opts.maxItems ?? 50;
+  const items: RssArticle[] = [];
+  const itemRegex = /<item>([\s\S]*?)<\/item>/gi;
+  let itemMatch: RegExpExecArray | null;
+  while ((itemMatch = itemRegex.exec(xmlText)) !== null && items.length < maxItems) {
+    const itemXml = itemMatch[1];
+
+    const titleMatch = itemXml.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
+    const title = titleMatch ? titleMatch[1].trim().replace(/<!\[CDATA\[|\]\]>/g, "") : "";
+
+    const descMatch = itemXml.match(/<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/i);
+    const description = descMatch ? descMatch[1].trim().replace(/<!\[CDATA\[|\]\]>/g, "") : "";
+
+    const linkMatch = itemXml.match(/<link>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/link>/i);
+    const link = linkMatch ? linkMatch[1].trim().replace(/<!\[CDATA\[|\]\]>/g, "") : "";
+
+    const guidMatch = itemXml.match(/<guid[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/guid>/i);
+    let article_id = guidMatch ? guidMatch[1].trim().replace(/<!\[CDATA\[|\]\]>/g, "") : "";
+    if (!article_id && link) {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(link);
+      const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+      const hashArray = new Uint8Array(hashBuffer);
+      article_id = Array.from(hashArray.slice(0, 8))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    }
+
+    const pubDateMatch = itemXml.match(/<pubDate>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/pubDate>/i);
+    let pubDate = "";
+    if (pubDateMatch) {
+      try {
+        const parsed = new Date(pubDateMatch[1].trim());
+        if (!isNaN(parsed.getTime())) pubDate = parsed.toISOString();
+      } catch { /* ignore parse errors */ }
+    }
+
+    let image_url: string | null = null;
+    const mediaThumbnailMatch = itemXml.match(/<media:thumbnail[^>]*url=["']([^"']+)["'][^>]*\/?>/i);
+    if (mediaThumbnailMatch) {
+      image_url = mediaThumbnailMatch[1];
+    } else {
+      const mediaContentMatch = itemXml.match(/<media:content[^>]*url=["']([^"']+)["'][^>]*\/?>/i);
+      if (mediaContentMatch) {
+        image_url = mediaContentMatch[1];
+      } else {
+        // Accept an <enclosure> only when it is an explicit https image.
+        const enclosureMatch = itemXml.match(/<enclosure[^>]*\/?>/i);
+        if (enclosureMatch) {
+          const tag = enclosureMatch[0];
+          const urlM = tag.match(/url=["']([^"']+)["']/i);
+          const typeM = tag.match(/type=["']([^"']+)["']/i);
+          const u = urlM ? urlM[1] : "";
+          const ty = typeM ? typeM[1].toLowerCase() : "";
+          if (u && u.startsWith("https://") && (ty.startsWith("image/") || /\.(jpe?g|png|webp|gif)(\?|$)/i.test(u))) {
+            image_url = u;
+          }
+        }
+      }
+    }
+
+    if (!title || !link) continue;
+
+    items.push({ article_id, title, description, image_url, link, source_id: sourceId, pubDate });
+  }
+  return items;
+}
+
+/**
+ * Keep only candidates whose publication instant falls in the half-open JST
+ * day range [startUtc, endUtc). Candidates without a valid pubDate are dropped.
+ * Applied to BOTH Yahoo and NHK before slot assignment so today's fixed slots
+ * never receive stale (e.g. previous-day) articles from multi-day feeds.
+ */
+export function filterCandidatesToJstDay(
+  items: RssArticle[],
+  startUtc: string,
+  endUtc: string
+): RssArticle[] {
+  const s = Date.parse(startUtc);
+  const e = Date.parse(endUtc);
+  return items.filter((a) => {
+    if (!a || !a.pubDate) return false;
+    const t = Date.parse(a.pubDate);
+    if (Number.isNaN(t)) return false;
+    return t >= s && t < e;
+  });
+}
+
+/**
+ * Build complete immutable slot snapshot rows from a set of slot assignments.
+ * source_id is taken from the candidate (yahoo_news or nhk); falls back to
+ * yahoo_news defensively.
+ */
+export function buildDailySlotRows(
+  assignments: Array<{ slot_index: number; article: RssArticle }>,
+  category: string,
+  newsDate: string
+): NewsDailySlotRow[] {
+  const nowIso = new Date().toISOString();
+  return assignments.map((a) => ({
+    category,
+    news_date: newsDate,
+    slot_index: a.slot_index,
+    source_id: a.article.source_id || "yahoo_news",
+    article_id: a.article.article_id,
+    title: a.article.title,
+    description: a.article.description ?? "",
+    image_url: a.article.image_url ?? null,
+    link: a.article.link,
+    pub_date: new Date(a.article.pubDate).toISOString(),
+    selected_at: nowIso,
+  }));
+}
+
 // --------- Room metadata helper ----------
 async function resolveRoomMeta(
   env: Env,
@@ -8630,7 +9029,6 @@ export default {
         // GET /api/rss?category=<category>
         // Returns news articles in NewsData.io-compatible format from Yahoo News Japan RSS feeds
         if (path === "/api/rss" && req.method === "GET") {
-          const RSS_CACHE_TTL = 120; // seconds
           const t0 = Date.now();
 
           // Category -> Yahoo News Japan RSS URL mapping (allowlist)
@@ -8680,10 +9078,23 @@ export default {
               },
             });
           }
+          // ── Fixed daily News Feed slots ──
+          // Canonical results come from the immutable, append-only
+          // news_daily_slots table. "latest" (no date) and an explicit today
+          // both resolve to the current JST date — there is no separate
+          // "latest" slot namespace. Only the current JST date may create or
+          // fill slots; past dates are read-only; future dates return empty.
           const todayJst = getJstDateString();
           const isDateRequest = dateParam.length > 0;
-          const isToday = isDateRequest && dateParam === todayJst;
-          const isHistoryOnly = isDateRequest && !isToday; // past or future: store only
+          const newsDate = isDateRequest ? dateParam : todayJst;
+          const isPast = isDateRequest && dateParam < todayJst;
+          const isFuture = isDateRequest && dateParam > todayJst;
+
+          // TTLs: partial slot sets converge quickly; complete/historical sets
+          // are stable and may be cached longer.
+          const SLOT_PARTIAL_TTL = 45;    // seconds (fewer than 8 slots)
+          const SLOT_COMPLETE_TTL = 300;  // seconds (exactly 8 slots / historical)
+          const SLOT_FUTURE_TTL = 30;     // seconds (empty future results)
 
           // ── Cache API: check edge cache first (date-aware key) ──
           const cacheUrl = new URL("https://cache.internal/rss");
@@ -8691,9 +9102,16 @@ export default {
           cacheUrl.searchParams.set("date", isDateRequest ? dateParam : "latest");
           const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
           const cache = caches.default;
-          const cached = await cache.match(cacheKey);
-          const tCache = Date.now();
           const colo = (req as any).cf?.colo || "unknown";
+
+          let cached: Response | undefined;
+          try {
+            cached = await cache.match(cacheKey);
+          } catch (cacheErr: any) {
+            // Cache failure is non-fatal: continue through the DB flow.
+            console.error(`[cache] rss match fail category=${category} rid=${request_id}`, cacheErr?.message);
+            cached = undefined;
+          }
 
           if (cached) {
             const hitBody = await cached.text();
@@ -8705,69 +9123,98 @@ export default {
                 "X-Request-Id": request_id,
                 "X-Cache": "HIT",
                 "X-Category": category,
-                "Cache-Control": `public, max-age=${RSS_CACHE_TTL}`,
+                ...(isDateRequest ? { "X-News-Date": dateParam } : {}),
                 ...corsHeaders(req, env),
               },
             });
           }
 
-          // ── Past/future date: serve exclusively from persisted history. ──
-          // Never fetch live RSS and never fall back to current news.
-          if (isHistoryOnly) {
-            const RSS_HISTORY_TTL = 300; // seconds (historical rows are stable)
+          // Build + cache a canonical slot response.
+          const respondSlots = async (results: RssArticle[], ttl: number, mode: string) => {
+            const body = JSON.stringify({ status: "success", results, request_id });
             try {
-              const { startUtc, endUtc } = jstDayRangeUtc(dateParam);
-              const results = await queryStoredNews(env, category, startUtc, endUtc);
-              const body = JSON.stringify({ status: "success", results, request_id });
-              try {
-                await cache.put(cacheKey, new Response(body, {
-                  status: 200,
-                  headers: {
-                    "Content-Type": "application/json",
-                    "Cache-Control": `public, max-age=${RSS_HISTORY_TTL}`,
-                  },
-                }));
-              } catch (putErr: any) {
-                console.error(`[cache] rss history put fail category=${category} date=${dateParam} rid=${request_id}`, putErr);
-              }
-              console.log(`[perf] rss rid=${request_id} mode=history category=${category} date=${dateParam} results=${results.length} total=${Date.now() - t0}ms colo=${colo} key=${cacheKey.url}`);
-              return new Response(body, {
+              await cache.put(cacheKey, new Response(body, {
                 status: 200,
                 headers: {
                   "Content-Type": "application/json",
-                  "X-Request-Id": request_id,
-                  "X-Cache": "MISS",
-                  "X-Category": category,
-                  "X-News-Date": dateParam,
-                  "Cache-Control": `public, max-age=${RSS_HISTORY_TTL}`,
-                  ...corsHeaders(req, env),
+                  "Cache-Control": `public, max-age=${ttl}`,
                 },
-              });
+              }));
+            } catch (putErr: any) {
+              console.error(`[cache] rss put fail category=${category} rid=${request_id}`, putErr?.message);
+            }
+            console.log(`[perf] rss rid=${request_id} cache=MISS mode=${mode} category=${category} date=${newsDate} results=${results.length} ttl=${ttl} total=${Date.now() - t0}ms colo=${colo} key=${cacheKey.url}`);
+            return new Response(body, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+                "X-Cache": "MISS",
+                "X-Category": category,
+                ...(isDateRequest ? { "X-News-Date": dateParam } : {}),
+                "Cache-Control": `public, max-age=${ttl}`,
+                ...corsHeaders(req, env),
+              },
+            });
+          };
+
+          const slotDbError = () => new Response(JSON.stringify({
+            status: "error",
+            message: "News slots query failed",
+            request_id,
+          }), {
+            status: 502,
+            headers: {
+              "Content-Type": "application/json",
+              "X-Request-Id": request_id,
+              ...corsHeaders(req, env),
+            },
+          });
+
+          // ── Future date: never fetch, never write, empty results. ──
+          if (isFuture) {
+            return await respondSlots([], SLOT_FUTURE_TTL, "future");
+          }
+
+          // ── Past date: canonical fixed slots only. No fetch, no writes,
+          //    no backfill. Zero stored slots means empty results. ──
+          if (isPast) {
+            try {
+              const slots = await queryDailyNewsSlots(env, category, newsDate);
+              return await respondSlots(slots.map(slotRowToArticle), SLOT_COMPLETE_TTL, "history");
             } catch (e: any) {
-              console.error(`[RSS] history query failed category=${category} date=${dateParam}:`, e?.message);
-              return new Response(JSON.stringify({
-                status: "error",
-                message: "News history query failed",
-                request_id,
-              }), {
-                status: 502,
-                headers: {
-                  "Content-Type": "application/json",
-                  "X-Request-Id": request_id,
-                  ...corsHeaders(req, env),
-                },
-              });
+              console.error(`[RSS] history slots query failed category=${category} date=${newsDate}:`, e?.message);
+              return slotDbError();
             }
           }
 
-          // ── Cache MISS: fetch + parse upstream RSS (no-date latest, or today) ──
-          const rssUrl = RSS_FEEDS[category];
-
+          // ── Current JST date (explicit today or no-date latest). ──
+          // 1. Read canonical fixed slots.
+          let existingSlots: NewsDailySlotRow[];
           try {
-            // Fetch RSS feed (with timeout)
+            existingSlots = await queryDailyNewsSlots(env, category, newsDate);
+          } catch (e: any) {
+            // Strict invariant: never fall back to volatile live results.
+            console.error(`[RSS] slots read failed category=${category} date=${newsDate}:`, e?.message);
+            return slotDbError();
+          }
+
+          // 2. Eight slots already fixed → return immediately, no Yahoo fetch.
+          if (existingSlots.length >= 8) {
+            return await respondSlots(
+              existingSlots.slice(0, 8).map(slotRowToArticle),
+              SLOT_COMPLETE_TTL,
+              "slots-full"
+            );
+          }
+
+          // 3. Fewer than 8 → fetch + parse Yahoo, then fill empty slots.
+          const rssUrl = RSS_FEEDS[category];
+          let parsedItems: RssArticle[] = [];
+          let yahooOk = false;
+          try {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
-
             const rssResponse = await fetch(rssUrl, {
               signal: controller.signal,
               headers: {
@@ -8780,226 +9227,144 @@ export default {
 
             if (!rssResponse.ok) {
               console.error(`[RSS] Fetch failed: ${rssUrl} -> ${rssResponse.status}`);
-              return new Response(JSON.stringify({
-                status: "error",
-                message: "RSS fetch failed",
-                request_id,
-              }), {
-                status: 502,
+            } else {
+              const xmlText = await rssResponse.text();
+              parsedItems = await parseNewsRssItems(xmlText, { sourceId: "yahoo_news" });
+              yahooOk = true;
+
+              // OGP thumbnail enrichment (best-effort, batched by 4).
+              const OGP_BATCH_SIZE = 4;
+              let ogpOk = 0;
+              let ogpFail = 0;
+              for (let batchStart = 0; batchStart < parsedItems.length; batchStart += OGP_BATCH_SIZE) {
+                const batch = parsedItems.slice(batchStart, batchStart + OGP_BATCH_SIZE);
+                const ogpResults = await Promise.allSettled(
+                  batch.map(item => item.link ? fetchOgImage(item.link) : Promise.resolve(null))
+                );
+                for (let j = 0; j < batch.length; j++) {
+                  const r = ogpResults[j];
+                  if (r.status === "fulfilled" && r.value) {
+                    parsedItems[batchStart + j].image_url = r.value;
+                    ogpOk++;
+                  } else {
+                    ogpFail++;
+                  }
+                }
+              }
+              console.log(`[rss:ogp] rid=${request_id} category=${category} ok=${ogpOk} fail=${ogpFail} elapsed=${Date.now() - tFetch}ms`);
+            }
+          } catch (e: any) {
+            // Yahoo fetch/parse failure is non-fatal: fall through with
+            // yahooOk=false and preserve any existing slots.
+            console.error(`[RSS] fetch/parse error category=${category}:`, e?.message);
+          }
+
+          // Candidate priority: existing slots → Yahoo → NHK. Only the current
+          // JST day range may seed slots; candidates are filtered to it.
+          const { startUtc, endUtc } = jstDayRangeUtc(newsDate);
+          let canonical: NewsDailySlotRow[] = existingSlots;
+
+          // 4. Yahoo processing (primary). On Yahoo failure we keep the existing
+          //    canonical slots and still attempt NHK for a supported category.
+          if (yahooOk) {
+            // Diagnostics only: keep feeding the news_articles candidate table
+            // in the background. Never drives display and never mutates slots.
+            if (parsedItems.length > 0) {
+              ctx.waitUntil(
+                upsertStoredNews(env, category, parsedItems)
+                  .then((n) => console.log(`[rss] rid=${request_id} diag_upsert category=${category} persisted=${n}`))
+                  .catch((err) => console.error(`[RSS] diag upsert failed category=${category}:`, err?.message))
+              );
+            }
+            const yahooCands = sortYahooCandidates(filterCandidatesToJstDay(parsedItems, startUtc, endUtc));
+            const yahooAssign = planDailySlotAssignments(canonical, yahooCands);
+            if (yahooAssign.length > 0) {
+              try {
+                const { inserted, conflicts } = await insertDailyNewsSlots(env, buildDailySlotRows(yahooAssign, category, newsDate));
+                console.log(`[rss] rid=${request_id} yahoo_insert category=${category} date=${newsDate} inserted=${inserted} conflicts=${conflicts}`);
+              } catch (e: any) {
+                console.error(`[RSS] yahoo slots insert failed category=${category} date=${newsDate}:`, e?.message);
+              }
+            }
+            // Canonical re-read (never return unpersisted candidates).
+            try {
+              canonical = await queryDailyNewsSlots(env, category, newsDate);
+            } catch (e: any) {
+              console.error(`[RSS] yahoo re-read failed category=${category} date=${newsDate}:`, e?.message);
+              // Keep the previously read canonical slots.
+            }
+          } else {
+            console.warn(`[RSS] yahoo unavailable category=${category} date=${newsDate}; attempting secondary if configured`);
+          }
+
+          // 5. If slots are full, or the category has no secondary source,
+          //    return the current canonical set now (do NOT fetch NHK).
+          const secondary = SECONDARY_NEWS_FEEDS[category];
+          if (canonical.length >= 8 || !secondary) {
+            const ttl = canonical.length >= 8 ? SLOT_COMPLETE_TTL : SLOT_PARTIAL_TTL;
+            return await respondSlots(
+              canonical.slice(0, 8).map(slotRowToArticle),
+              ttl,
+              secondary ? "slots-yahoo" : "slots-yahoo-only"
+            );
+          }
+
+          // 6. Secondary source (NHK): fill only slots still empty after Yahoo.
+          //    Failure/timeout/malformed XML must never fail the endpoint —
+          //    preserve the existing + Yahoo canonical set.
+          try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 7000); // secondary budget (6-8s)
+            let nhkItems: RssArticle[] = [];
+            try {
+              const resp = await fetch(secondary.url, {
+                signal: controller.signal,
+                redirect: "follow", // configured NHK URLs redirect to an internal host
                 headers: {
-                  "Content-Type": "application/json",
-                  "X-Request-Id": request_id,
-                  ...corsHeaders(req, env),
+                  "User-Agent": "Teran-News-Aggregator/1.0",
+                  "Accept": "application/rss+xml, application/xml, text/xml",
                 },
               });
-            }
-
-            const xmlText = await rssResponse.text();
-
-            // Parse RSS XML (simple regex-based parser for RSS 2.0)
-            const items: Array<{
-              article_id: string;
-              title: string;
-              description: string;
-              image_url: string | null;
-              link: string;
-              source_id: string;
-              pubDate: string;
-            }> = [];
-
-            // Extract items from RSS
-            const itemRegex = /<item>([\s\S]*?)<\/item>/gi;
-            let itemMatch;
-            while ((itemMatch = itemRegex.exec(xmlText)) !== null && items.length < 50) {
-              const itemXml = itemMatch[1];
-
-              // Extract title
-              const titleMatch = itemXml.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
-              const title = titleMatch ? titleMatch[1].trim().replace(/<!\[CDATA\[|\]\]>/g, "") : "";
-
-              // Extract description
-              const descMatch = itemXml.match(/<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/i);
-              const description = descMatch ? descMatch[1].trim().replace(/<!\[CDATA\[|\]\]>/g, "") : "";
-
-              // Extract link
-              const linkMatch = itemXml.match(/<link>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/link>/i);
-              const link = linkMatch ? linkMatch[1].trim().replace(/<!\[CDATA\[|\]\]>/g, "") : "";
-
-              // Extract guid (fallback to link hash)
-              const guidMatch = itemXml.match(/<guid[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/guid>/i);
-              let article_id = guidMatch ? guidMatch[1].trim().replace(/<!\[CDATA\[|\]\]>/g, "") : "";
-              if (!article_id && link) {
-                // Generate hash from link
-                const encoder = new TextEncoder();
-                const data = encoder.encode(link);
-                const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-                const hashArray = new Uint8Array(hashBuffer);
-                article_id = Array.from(hashArray.slice(0, 8))
-                  .map((b) => b.toString(16).padStart(2, "0"))
-                  .join("");
-              }
-
-              // Extract pubDate
-              const pubDateMatch = itemXml.match(/<pubDate>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/pubDate>/i);
-              let pubDate = "";
-              if (pubDateMatch) {
-                try {
-                  const parsed = new Date(pubDateMatch[1].trim());
-                  if (!isNaN(parsed.getTime())) {
-                    pubDate = parsed.toISOString();
-                  }
-                } catch { /* ignore parse errors */ }
-              }
-
-              // Extract image from media:thumbnail or media:content
-              let image_url: string | null = null;
-              const mediaThumbnailMatch = itemXml.match(/<media:thumbnail[^>]*url=["']([^"']+)["'][^>]*\/?>/i);
-              if (mediaThumbnailMatch) {
-                image_url = mediaThumbnailMatch[1];
+              if (!resp.ok) {
+                console.warn(`[RSS] secondary fetch non-ok source=${secondary.sourceId} category=${category} status=${resp.status}`);
               } else {
-                const mediaContentMatch = itemXml.match(/<media:content[^>]*url=["']([^"']+)["'][^>]*\/?>/i);
-                if (mediaContentMatch) {
-                  image_url = mediaContentMatch[1];
+                const xml = await resp.text();
+                nhkItems = await parseNewsRssItems(xml, { sourceId: secondary.sourceId });
+              }
+            } finally {
+              clearTimeout(timeoutId);
+            }
+
+            if (nhkItems.length > 0) {
+              // Dedupe against existing + Yahoo (already in canonical) and within
+              // the NHK pass; NHK takes only the lowest remaining empty indexes.
+              const nhkCands = sortYahooCandidates(filterCandidatesToJstDay(nhkItems, startUtc, endUtc));
+              const nhkAssign = planDailySlotAssignments(canonical, nhkCands);
+              if (nhkAssign.length > 0) {
+                try {
+                  const { inserted, conflicts } = await insertDailyNewsSlots(env, buildDailySlotRows(nhkAssign, category, newsDate));
+                  console.log(`[rss] rid=${request_id} nhk_insert category=${category} date=${newsDate} inserted=${inserted} conflicts=${conflicts}`);
+                } catch (e: any) {
+                  console.error(`[RSS] nhk slots insert failed category=${category} date=${newsDate}:`, e?.message);
                 }
               }
-
-              // Skip items without title or link
-              if (!title || !link) continue;
-
-              items.push({
-                article_id,
-                title,
-                description,
-                image_url,
-                link,
-                source_id: "yahoo_news",
-                pubDate,
-              });
-            }
-
-            // Sort by pubDate descending (newest first)
-            items.sort((a, b) => {
-              if (!a.pubDate && !b.pubDate) return 0;
-              if (!a.pubDate) return 1;
-              if (!b.pubDate) return -1;
-              return new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime();
-            });
-            const tParse = Date.now();
-
-            // ── OGP thumbnail enrichment (best-effort, batched) ──
-            // Batch in groups of 4 to stay within subrequest concurrency limits
-            const OGP_BATCH_SIZE = 4;
-            let ogpOk = 0;
-            let ogpFail = 0;
-            for (let batchStart = 0; batchStart < items.length; batchStart += OGP_BATCH_SIZE) {
-              const batch = items.slice(batchStart, batchStart + OGP_BATCH_SIZE);
-              const results = await Promise.allSettled(
-                batch.map(item => item.link ? fetchOgImage(item.link) : Promise.resolve(null))
-              );
-              for (let j = 0; j < batch.length; j++) {
-                const r = results[j];
-                if (r.status === "fulfilled" && r.value) {
-                  items[batchStart + j].image_url = r.value;
-                  ogpOk++;
-                } else {
-                  ogpFail++;
-                }
-              }
-            }
-            const tOgp = Date.now();
-            console.log(`[rss:ogp] rid=${request_id} category=${category} ok=${ogpOk} fail=${ogpFail} elapsed=${tOgp - tParse}ms`);
-
-            // DEBUG: log first parsed item to verify enrichment
-            if (items.length > 0) {
-              console.log(`[rss] PARSED_ITEM_0 rid=${request_id}`, JSON.stringify({
-                title: items[0].title,
-                description: items[0].description?.slice(0, 120),
-                image_url: items[0].image_url,
-                link: items[0].link,
-                pubDate: items[0].pubDate,
-              }));
-            }
-
-            // ── Persist parsed articles (append-and-upsert). ──
-            // Today: block on persistence so the response is served from the
-            //   same historical store. No-date latest: persist in the
-            //   background so the live response contract/perf is preserved.
-            let results: RssArticle[] = items;
-            if (isToday) {
               try {
-                const persisted = await upsertStoredNews(env, category, items);
-                const { startUtc, endUtc } = jstDayRangeUtc(dateParam);
-                results = await queryStoredNews(env, category, startUtc, endUtc);
-                console.log(`[rss] rid=${request_id} mode=today category=${category} date=${dateParam} parsed=${items.length} persisted=${persisted} results=${results.length}`);
-              } catch (persistErr: any) {
-                // If persistence/query fails on today, fall back to the freshly
-                // parsed live items so today is never empty due to a store error.
-                console.error(`[RSS] today persist/query failed category=${category} date=${dateParam}:`, persistErr?.message);
-                results = items;
+                canonical = await queryDailyNewsSlots(env, category, newsDate);
+              } catch (e: any) {
+                console.error(`[RSS] nhk re-read failed category=${category} date=${newsDate}:`, e?.message);
               }
-            } else {
-              ctx.waitUntil(
-                upsertStoredNews(env, category, items)
-                  .then((n) => console.log(`[rss] rid=${request_id} mode=latest category=${category} persisted=${n}`))
-                  .catch((err) => console.error(`[RSS] latest persist failed category=${category}:`, err?.message))
-              );
             }
-
-            // Build response body
-            const body = JSON.stringify({
-              status: "success",
-              results,
-              request_id,
-            });
-
-            // Store in Cache API (await to ensure entry is written before next request)
-            const cacheResponse = new Response(body, {
-              status: 200,
-              headers: {
-                "Content-Type": "application/json",
-                "Cache-Control": `public, max-age=${RSS_CACHE_TTL}`,
-              },
-            });
-            try {
-              await cache.put(cacheKey, cacheResponse);
-              console.log(`[cache] rss put ok category=${category} date=${isDateRequest ? dateParam : "latest"} rid=${request_id} key=${cacheKey.url} colo=${colo}`);
-            } catch (putErr: any) {
-              console.error(`[cache] rss put fail category=${category} rid=${request_id}`, putErr);
-            }
-
-            const tEnd = Date.now();
-            console.log(`[perf] rss rid=${request_id} cache=MISS mode=${isToday ? "today" : "latest"} category=${category} cacheCheck=${tCache - t0}ms fetch=${tFetch - tCache}ms parse=${tParse - tFetch}ms ogp=${tOgp - tParse}ms total=${tEnd - t0}ms payloadBytes=${body.length} items=${results.length} ogpOk=${ogpOk} ogpFail=${ogpFail} colo=${colo} key=${cacheKey.url}`);
-
-            // Build response
-            const response = new Response(body, {
-              status: 200,
-              headers: {
-                "Content-Type": "application/json",
-                "X-Request-Id": request_id,
-                "X-Cache": "MISS",
-                "Cache-Control": `public, max-age=${RSS_CACHE_TTL}`,
-                "X-Category": category,
-                ...(isDateRequest ? { "X-News-Date": dateParam } : {}),
-                ...corsHeaders(req, env),
-              },
-            });
-
-            return response;
           } catch (e: any) {
-            console.error(`[RSS] Error for category=${category}:`, e?.message);
-            return new Response(JSON.stringify({
-              status: "error",
-              message: "RSS fetch failed",
-              request_id,
-            }), {
-              status: 502,
-              headers: {
-                "Content-Type": "application/json",
-                "X-Request-Id": request_id,
-                ...corsHeaders(req, env),
-              },
-            });
+            console.warn(`[RSS] secondary source failed source=${secondary.sourceId} category=${category} date=${newsDate}: ${e?.message}`);
           }
+
+          // 7. Return only persisted canonical slots (final cache write here).
+          const finalTtl = canonical.length >= 8 ? SLOT_COMPLETE_TTL : SLOT_PARTIAL_TTL;
+          return await respondSlots(
+            canonical.slice(0, 8).map(slotRowToArticle),
+            finalTtl,
+            "slots-yahoo-nhk"
+          );
         }
 
         // ═══════════════════════════════════════════
