@@ -3707,39 +3707,23 @@ export default {
             }
 
             // ── Eligibility guards: main/global root status posts only ──
-            // Exception: origin user (teran.origin) can edit posts in rooms they own.
+            // TEMPORARY_SHOWCASE_SELF_POST_EDIT — allow a verified post OWNER to
+            // edit their own Room root post (content + image media only). Post
+            // ownership is already verified above (_ownershipMatch); any other
+            // account was rejected there with 403. This intentionally removes the
+            // prior origin/room-owner-only restriction FOR THE POST OWNER.
+            //
+            // Deliberately unchanged / NOT consulted here: room posting
+            // permission, room membership, room_id, Room visibility, and Private
+            // Room access rules. This grant never lets a user edit another
+            // member's Room post, create Room posts, or change any Room field.
+            // Identity-field editing (author_name/author_avatar/title) remains
+            // origin-only via the guard further below.
+            //
+            // To revert: restore the origin + room-owner guard that previously
+            // wrapped `if (roomId && roomId !== "global")`.
             const roomId: string | null = (post as any).room_id ?? null;
-            if (roomId && roomId !== "global") {
-              if (!_isOriginEditor) {
-                throw new HttpError(403, "FORBIDDEN", "Editing is only available for main/global posts");
-              }
-
-              // Origin user must also own the room — account-aware sibling expansion
-              // (same pattern as post ownership check above)
-              const { data: _patchRoom } = await sb(env)
-                .from("rooms")
-                .select("owner_id")
-                .eq("id", roomId)
-                .maybeSingle();
-              if (!_patchRoom) {
-                throw new HttpError(403, "FORBIDDEN", "Only room owner can edit room posts");
-              }
-              const _roomOwnerId = String((_patchRoom as any).owner_id);
-              let _roomOwnerMatch = _roomOwnerId === String(user_id);
-              if (!_roomOwnerMatch && (_patchBinding as any)?.account_id) {
-                const { data: _ownerSiblings } = await sb(env)
-                  .from("account_devices")
-                  .select("device_id")
-                  .eq("account_id", (_patchBinding as any).account_id);
-                if (_ownerSiblings) {
-                  const _ownerSiblingIds = new Set((_ownerSiblings as any[]).map((r: any) => String(r.device_id)));
-                  _roomOwnerMatch = _ownerSiblingIds.has(_roomOwnerId);
-                }
-              }
-              if (!_roomOwnerMatch) {
-                throw new HttpError(403, "FORBIDDEN", "Only room owner can edit room posts");
-              }
-            }
+            void roomId;
 
             const postType: string = (post as any).post_type ?? "status";
             if (postType === "share") {
