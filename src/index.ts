@@ -2263,7 +2263,7 @@ export default {
                 // ── Cache API for room metadata (rarely changes, 5m TTL) ──
                 const ROOM_META_TTL = 300; // 5 minutes
                 const sortedRoomIds = [...roomIds].sort();
-                const roomCacheData = `room_meta:v3:${sortedRoomIds.join(",")}`;
+                const roomCacheData = `room_meta:v4:${sortedRoomIds.join(",")}`;
                 const roomCacheHash = await sha256Hex(roomCacheData);
                 const roomCacheReq = new Request(`https://cache.internal/room-meta/${roomCacheHash}`, { method: "GET" });
                 const edgeCache = caches.default;
@@ -2279,7 +2279,7 @@ export default {
                   const tRoomDb = performance.now();
                   const { data: roomRows } = await sb(env)
                     .from("rooms")
-                    .select("id, name, icon_key, icon_thumb_key, detail_bg_image_key, detail_bg_color, detail_bg_image_opacity")
+                    .select("id, name, visibility, icon_key, icon_thumb_key, detail_bg_image_key, detail_bg_color, detail_bg_image_opacity")
                     .in("id", roomIds);
                   roomDbMs = performance.now() - tRoomDb;
                   for (const r of (roomRows ?? [])) {
@@ -2287,6 +2287,7 @@ export default {
                       icon_key: (r as any).icon_key ?? null,
                       icon_thumb_key: (r as any).icon_thumb_key ?? null,
                       name: (r as any).name ?? null,
+                      visibility: (r as any).visibility ?? null,
                       detail_bg_image_key: (r as any).detail_bg_image_key ?? null,
                       detail_bg_color: (r as any).detail_bg_color ?? null,
                       detail_bg_image_opacity: (r as any).detail_bg_image_opacity ?? null,
