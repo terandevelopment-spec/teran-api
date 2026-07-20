@@ -1311,6 +1311,30 @@ async function loadRoomCore(
   return (data as any) ?? null;
 }
 
+// Resolve the account-level Teran ID (accounts.teran_handle) for an authenticated
+// identity using the same proven path as GET /api/accounts/me:
+//   user_id (JWT sub / device_id) → account_devices.account_id → accounts.teran_handle
+// Account-device siblings share the same account_id and therefore resolve to the
+// same account-level Teran ID. Returns the trimmed handle string, or null when the
+// account has no Teran ID (or the device is not yet bound to an account).
+// PURE READ: performs no writes and never logs invite tokens.
+async function resolveAccountTeranHandle(env: Env, user_id: string): Promise<string | null> {
+  const { data: binding } = await sb(env)
+    .from("account_devices")
+    .select("account_id")
+    .eq("device_id", user_id)
+    .maybeSingle();
+  const accountId = (binding as any)?.account_id ?? null;
+  if (!accountId) return null;
+  const { data: account } = await sb(env)
+    .from("accounts")
+    .select("teran_handle")
+    .eq("id", accountId)
+    .maybeSingle();
+  const handle = (account as any)?.teran_handle;
+  return typeof handle === "string" && handle.trim().length > 0 ? handle.trim() : null;
+}
+
 // --------- cursor pagination helpers ----------
 function parseCursor(raw: string | null): { created_at: string; id: number } | null {
   if (!raw || typeof raw !== "string") return null;
@@ -11323,6 +11347,43 @@ export default {
                 };
                 if (isDebug) earlyBody.debug = { ...dbg };
                 return addMarkers(ok(req, env, request_id, earlyBody));
+              }
+
+              // ── 4c. Teran ID prerequisite (Private Room publishing invites) ──
+              // At this point existingRole is 'registered' or null, so accepting the
+              // invite would GRANT Post permission (member). For Private Rooms only,
+              // the receiving ACCOUNT must have an account-level Teran ID
+              // (accounts.teran_handle) BEFORE any membership row is written or
+              // upgraded. Room visibility is read from the authoritative DB value —
+              // never trusted from the client or the invite URL. Existing owner/member
+              // rows already returned above, preserving idempotency. No membership
+              // write has occurred yet on this branch.
+              let roomCore: { id: string; visibility: string; owner_id: string } | null = null;
+              try {
+                roomCore = await loadRoomCore(env, roomId);
+              } catch (roomErr: any) {
+                dbg.selectedBranch = "room_load_failed";
+                dbg.databaseErrorMessage = roomErr?.message ?? null;
+                dbg.responseStatus = 500;
+                console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+                return failWithMarkers(500, "DB_ERROR", "Failed to load room");
+              }
+
+              if (roomCore?.visibility === "private_invite_only") {
+                const teranHandle = await resolveAccountTeranHandle(env, user_id);
+                const hasTeranId =
+                  typeof teranHandle === "string" && teranHandle.trim().length > 0;
+                if (!hasTeranId) {
+                  dbg.selectedBranch = "teran_id_required";
+                  dbg.databaseOperation = "none";
+                  dbg.responseStatus = 403;
+                  console.log(JSON.stringify({ event: "join_by_invite_debug", ...dbg }));
+                  return failWithMarkers(
+                    403,
+                    "TERAN_ID_REQUIRED",
+                    "Create a Teran ID before accepting this Private Room publishing invite."
+                  );
+                }
               }
 
               let cacheInvalidated = false;
