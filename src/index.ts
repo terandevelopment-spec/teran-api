@@ -1283,6 +1283,18 @@ function parseCatalogColumns(
   return { ok: false };
 }
 
+// catalog_title_enabled: whether root Catalog posts use a title. Accepts only
+// real booleans (no string/number coercion). Returns { value: undefined } when
+// omitted so callers decide default (create → true) vs. preserve (update).
+// Behaviorally relevant only when room_type === "catalog".
+function parseCatalogTitleEnabled(
+  raw: unknown
+): { ok: true; value: boolean | undefined } | { ok: false } {
+  if (raw === undefined || raw === null) return { ok: true, value: undefined };
+  if (typeof raw === "boolean") return { ok: true, value: raw };
+  return { ok: false };
+}
+
 // ── Read-only invite validation ──────────────────────────────────────────
 // Validates that `token` is a currently-active invite for `roomId`.
 // This is a PURE READ: it performs no writes, no membership lookup, no
@@ -1317,7 +1329,7 @@ async function validateRoomInvite(env: Env, roomId: string, token: string): Prom
 // Minimal target-Room summary returned by the Room-links endpoints. Contains
 // only confirmed `rooms` columns needed for navigation/display — never member
 // lists, roles, Post permission, invite tokens, or full design payloads.
-const ROOM_LINK_SUMMARY_FIELDS = "id,room_key,name,description,emoji,icon_key,icon_thumb_key,visibility,room_type,thread_card_style,catalog_columns";
+const ROOM_LINK_SUMMARY_FIELDS = "id,room_key,name,description,emoji,icon_key,icon_thumb_key,visibility,room_type,thread_card_style,catalog_columns,catalog_title_enabled";
 
 // Read-only load of a Room's authoritative core fields (id, visibility, owner_id).
 // Private status must ALWAYS be read via this DB value, never trusted from the client.
@@ -3133,8 +3145,10 @@ export default {
             })());
           }
 
-          // Pre-declare feed-elig slot so the parallel task can write into it
-          let feedEligRoomRow: { visibility: string } | null = null;
+          // Pre-declare room-settings slot so the parallel task can write into it.
+          // Used for (a) feed-inclusion eligibility (visibility) and (b) trusted
+          // Catalog title validation (room_type + catalog_title_enabled).
+          let feedEligRoomRow: { visibility: string; room_type?: string | null; catalog_title_enabled?: boolean | null } | null = null;
           let feedEligMs = 0;
 
           // Parse room-member KV result (read in the kv_batch above)
@@ -3185,16 +3199,20 @@ export default {
             });
           }
 
-          // Fix 2: hoist feed-eligibility rooms SELECT into step1 so it overlaps
-          // with the room_members check (and any acct DB fallback) instead of
-          // running after them in a separate serial await.
-          if (rawShowInFeed && room_id && room_id !== "global") {
+          // Fix 2: hoist the rooms SELECT into step1 so it overlaps with the
+          // room_members check (and any acct DB fallback) instead of running
+          // after them in a separate serial await. Runs for every ROOT room post
+          // (not just feed opt-ins) because Catalog title validation needs the
+          // trusted room_type + catalog_title_enabled regardless of show_in_feed.
+          const needsRoomSettings =
+            !!room_id && room_id !== "global" && !parent_post_id;
+          if (needsRoomSettings) {
             step1Tasks.push((async () => {
               const tFE = Date.now();
               try {
                 const { data: roomRow } = await sb(env)
                   .from("rooms")
-                  .select("visibility")
+                  .select("visibility, room_type, catalog_title_enabled")
                   .eq("id", room_id)
                   .maybeSingle();
                 feedEligMs = Date.now() - tFE;
@@ -3403,6 +3421,21 @@ export default {
           }
           console.log(`[ROOM_FEED_DEBUG][ROOM_ELIGIBILITY]`, { rid: request_id, room_id, rawShowInFeed, show_in_feed, entered_lookup: !!(rawShowInFeed && room_id && room_id !== "global") });
           mark("feed_eligibility");
+
+          // ── Catalog root-post title requirement ──────────────────────────
+          // For Catalog rooms with titles enabled, every ROOT post (no parent)
+          // must carry a non-empty title. Enforced from the trusted room row
+          // (feedEligRoomRow) rather than any client-sent flag, so it can't be
+          // bypassed. Replies (parent_post_id set) are exempt.
+          if (
+            !parent_post_id &&
+            feedEligRoomRow &&
+            (feedEligRoomRow as any).room_type === CATALOG_ROOM_TYPE &&
+            (feedEligRoomRow as any).catalog_title_enabled !== false &&
+            !title
+          ) {
+            throw new HttpError(422, "VALIDATION_ERROR", "A title is required for posts in this Catalog");
+          }
 
           // ── Resolve root_post_id before insert ──
           let root_post_id: number | null = null;
@@ -9495,7 +9528,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,icon_thumb_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled,card_shape,card_border_visible,catalog_columns");
+            .select("id,room_key,name,description,emoji,icon_key,icon_thumb_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled,card_shape,card_border_visible,catalog_columns,catalog_title_enabled");
 
           if (owner_id_param) {
             const callerId = await optionalAuth(req, env);
@@ -9662,7 +9695,7 @@ export default {
               rooms:room_id (
                 id, name, room_key, icon_key, emoji, visibility,
                 card_bg_color, card_text_color,
-                room_type, thread_card_style, social_reply_mode, catalog_columns,
+                room_type, thread_card_style, social_reply_mode, catalog_columns, catalog_title_enabled,
                 card_glass_enabled, card_glass_style,
                 card_border_visible, card_shape,
                 card_bg_image_key, card_bg_image_opacity,
@@ -9713,9 +9746,10 @@ export default {
             // the ~130ms Supabase round-trip. my_role is always resolved fresh
             // (user-specific — never cached). Private rooms are excluded.
             const ROOM_CACHE_TTL = 30; // seconds
-            // Cache key version bumped to v2 when catalog_columns was added to
-            // the room row shape, so stale pre-migration entries aren't reused.
-            const roomCacheUrl = new URL(`https://cache.internal/rooms/${roomId}/row-v2`);
+            // Cache key version bumped to v3 when catalog_title_enabled was added
+            // to the room row shape (v2 added catalog_columns), so stale entries
+            // that predate the new field aren't reused.
+            const roomCacheUrl = new URL(`https://cache.internal/rooms/${roomId}/row-v3`);
             const roomCacheKey = new Request(roomCacheUrl.toString(), { method: "GET" });
             const roomCache = caches.default;
 
@@ -10047,6 +10081,15 @@ export default {
           }
           const catalog_columns = catalogColsParsed.value ?? 3;
 
+          // catalog_title_enabled: whether Catalog root posts use a title.
+          // Default true when omitted. Stored uniformly; only meaningful for
+          // room_type=catalog.
+          const catalogTitleParsed = parseCatalogTitleEnabled(body?.catalog_title_enabled);
+          if (!catalogTitleParsed.ok) {
+            throw new HttpError(422, "VALIDATION_ERROR", "catalog_title_enabled must be a boolean");
+          }
+          const catalog_title_enabled = catalogTitleParsed.value ?? true;
+
           const tValidate = performance.now();
 
           // Generate random room_key (16 hex chars)
@@ -10122,6 +10165,9 @@ export default {
           // Always persist catalog_columns (uniform serialization); DB default is
           // also 3, so non-catalog rooms are unaffected behaviorally.
           insertObj.catalog_columns = catalog_columns;
+          // Always persist catalog_title_enabled (uniform serialization); DB
+          // default is also true, so non-catalog rooms are unaffected.
+          insertObj.catalog_title_enabled = catalog_title_enabled;
           if (thread_card_style !== null) insertObj.thread_card_style = thread_card_style;
           if (social_reply_mode !== null) insertObj.social_reply_mode = social_reply_mode;
           if (creator_display_name !== null) insertObj.creator_display_name = creator_display_name;
@@ -10595,6 +10641,16 @@ export default {
                 throw new HttpError(422, "VALIDATION_ERROR", "catalog_columns must be 2 or 3");
               }
               if (catalogColsUpd.value !== undefined) updates.catalog_columns = catalogColsUpd.value;
+            }
+
+            // ── catalog_title_enabled (boolean) ──
+            // Apply only when present, so omitting it preserves the stored value.
+            if (body?.catalog_title_enabled !== undefined) {
+              const catalogTitleUpd = parseCatalogTitleEnabled(body.catalog_title_enabled);
+              if (!catalogTitleUpd.ok) {
+                throw new HttpError(422, "VALIDATION_ERROR", "catalog_title_enabled must be a boolean");
+              }
+              if (catalogTitleUpd.value !== undefined) updates.catalog_title_enabled = catalogTitleUpd.value;
             }
 
             // Guard the invalid Catalog + social combination when both the
@@ -11973,6 +12029,12 @@ export default {
             if (!catalogColsParsed.ok) throw new HttpError(422, "VALIDATION_ERROR", "catalog_columns must be 2 or 3");
             const catalog_columns = catalogColsParsed.value ?? 3;
 
+            // catalog_title_enabled: whether Catalog root posts use a title.
+            // Default true when omitted.
+            const catalogTitleParsed = parseCatalogTitleEnabled(body?.catalog_title_enabled);
+            if (!catalogTitleParsed.ok) throw new HttpError(422, "VALIDATION_ERROR", "catalog_title_enabled must be a boolean");
+            const catalog_title_enabled = catalogTitleParsed.value ?? true;
+
             // Optional creator display name (room identity) — same as normal create.
             const rawCreatorDisplayName = typeof body?.creator_display_name === "string" ? body.creator_display_name.trim().slice(0, 80) : null;
             const creator_display_name = rawCreatorDisplayName || null;
@@ -11989,6 +12051,7 @@ export default {
               room_type: CATALOG_ROOM_TYPE,
               thread_card_style,
               catalog_columns,
+              catalog_title_enabled,
             };
             if (creator_display_name !== null) insertObj.creator_display_name = creator_display_name;
 
