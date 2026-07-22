@@ -1260,6 +1260,29 @@ function generateInviteToken(): string {
   return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
 }
 
+// ── Catalog Mode (Phase 1) shared validation ────────────────────────────
+// Valid Room types across create + update. "catalog" is a Room type (like
+// "post"/"thread"), NOT a card style; it reuses the Thread post structure and
+// may use the "teran" or "standard" card style (never "social").
+const CATALOG_ROOM_TYPE = "catalog";
+
+// catalog_columns: number of Teran columns for Catalog Rooms. Only 2 or 3 are
+// allowed (default 3). It is behaviorally relevant only when
+// room_type === "catalog" AND thread_card_style === "teran", but is persisted
+// and serialized uniformly so the client can use it in later phases.
+// Returns { ok:true, value:number } for a valid 2|3, { ok:true, value:undefined }
+// when omitted (caller decides default vs. preserve), or { ok:false } when invalid.
+function parseCatalogColumns(
+  raw: unknown
+): { ok: true; value: number | undefined } | { ok: false } {
+  if (raw === undefined || raw === null) return { ok: true, value: undefined };
+  const n = typeof raw === "number"
+    ? raw
+    : (typeof raw === "string" && raw.trim() !== "" && Number.isFinite(Number(raw)) ? Number(raw) : NaN);
+  if (n === 2 || n === 3) return { ok: true, value: n };
+  return { ok: false };
+}
+
 // ── Read-only invite validation ──────────────────────────────────────────
 // Validates that `token` is a currently-active invite for `roomId`.
 // This is a PURE READ: it performs no writes, no membership lookup, no
@@ -1294,7 +1317,7 @@ async function validateRoomInvite(env: Env, roomId: string, token: string): Prom
 // Minimal target-Room summary returned by the Room-links endpoints. Contains
 // only confirmed `rooms` columns needed for navigation/display — never member
 // lists, roles, Post permission, invite tokens, or full design payloads.
-const ROOM_LINK_SUMMARY_FIELDS = "id,room_key,name,description,emoji,icon_key,icon_thumb_key,visibility";
+const ROOM_LINK_SUMMARY_FIELDS = "id,room_key,name,description,emoji,icon_key,icon_thumb_key,visibility,room_type,thread_card_style,catalog_columns";
 
 // Read-only load of a Room's authoritative core fields (id, visibility, owner_id).
 // Private status must ALWAYS be read via this DB value, never trusted from the client.
@@ -1309,6 +1332,50 @@ async function loadRoomCore(
     .maybeSingle();
   if (error) throw new Error(error.message);
   return (data as any) ?? null;
+}
+
+// ── Catalog Mode (Phase 3): Wire exclusion helper ─────────────────────────
+// posts.room_id has NO foreign key to rooms.id, so PostgREST cannot filter Wire
+// posts by the related room's room_type via a relational join. Instead we resolve
+// the set of Catalog Room IDs and exclude them in the posts query BEFORE the
+// limit (preserving pagination + ordering). The set is cached at the edge with a
+// short TTL to keep the id list resolution cheap and bounded; catalogs are rare
+// so the resulting NOT IN list stays small. A stale set only widens the exclusion
+// window briefly — the light-mode room-metadata post-filter covers that gap.
+async function getCatalogRoomIds(env: Env, ctx: any): Promise<string[]> {
+  const edgeCache = caches.default;
+  const cacheReq = new Request("https://cache.internal/catalog-room-ids/v1", { method: "GET" });
+  try {
+    const cached = await edgeCache.match(cacheReq);
+    if (cached) {
+      const ids = await cached.json();
+      if (Array.isArray(ids)) return ids as string[];
+    }
+  } catch { /* cache read failure is non-fatal */ }
+
+  const { data, error } = await sb(env)
+    .from("rooms")
+    .select("id")
+    .eq("room_type", "catalog");
+  if (error) {
+    // Non-fatal: never break Wire because the exclusion set could not be resolved.
+    // The light-mode defensive post-filter still removes any Catalog posts present.
+    console.warn("[catalog_wire] failed to resolve catalog room ids:", error.message);
+    return [];
+  }
+  const ids = (data ?? []).map((r: any) => String((r as any).id));
+  try {
+    ctx.waitUntil(
+      edgeCache.put(
+        cacheReq,
+        new Response(JSON.stringify(ids), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=60" },
+        })
+      ).catch(() => {})
+    );
+  } catch { /* waitUntil/put failure is non-fatal */ }
+  return ids;
 }
 
 // Resolve the account-level Teran ID (accounts.teran_handle) for an authenticated
@@ -1520,7 +1587,11 @@ export default {
           const cache = caches.default;
 
           if (isFeed) {
-            const cacheUrl = new URL("https://cache.internal/posts/feed");
+            // Cache key version bumped to v2 for Catalog Mode (Phase 3) Wire
+            // exclusion: the feed's filtering behavior changed, so pre-deploy
+            // cached responses (which could contain Catalog posts) must not be
+            // reused. Response shape is unchanged.
+            const cacheUrl = new URL("https://cache.internal/posts/feed-v2");
             cacheUrl.searchParams.set("limit", limit_param || "50");
             // actor_id only affects liked_by_me — which is skipped in light mode (hardcoded false).
             // Including it creates per-user cache slots for identical data, defeating shared caching.
@@ -1619,8 +1690,30 @@ export default {
             (post_type_param === "thread" && room_scope_param !== "rooms")
           ) && !id_param && !user_id_param && !author_id_param;
 
+          // Catalog Mode (Phase 3): identify every Wire discovery entry point so
+          // Catalog Room posts can be excluded. Covers the `feed=wire` shorthand
+          // and the two legacy Wire shapes (root thread feed, root rooms feed).
+          // Excludes profile (user_id/author_id), single-post (id), and single-Room
+          // (room_id) queries so Catalog posts stay visible on those surfaces.
+          const isWireDiscoveryFeed = (
+            feed_param === "wire" ||
+            (isRootOnly && post_type_param === "thread" && room_scope_param !== "rooms") ||
+            (isRootOnly && !post_type_param && room_scope_param === "rooms")
+          ) && !id_param && !user_id_param && !author_id_param && !room_id_param;
+
           // Apply filters - priority: id > user_id > author_id > default
           let lim = 1; // will be set per branch below
+
+          // Exclude Catalog Room posts from Wire IN-QUERY, before the limit, so
+          // pagination + ordering are preserved (posts.room_id has no FK to
+          // rooms.id, so a relational join is not possible — see getCatalogRoomIds).
+          // Authoritative backend guarantee: applies to both light and full modes.
+          if (isWireDiscoveryFeed) {
+            const catalogRoomIds = await getCatalogRoomIds(env, ctx);
+            if (catalogRoomIds.length > 0) {
+              q = q.not("room_id", "in", `(${catalogRoomIds.map((cid) => `"${cid}"`).join(",")})`);
+            }
+          }
           if (id_param) {
             // Single post by ID
             const parsedId = Number(id_param);
@@ -2263,7 +2356,10 @@ export default {
                 // ── Cache API for room metadata (rarely changes, 5m TTL) ──
                 const ROOM_META_TTL = 300; // 5 minutes
                 const sortedRoomIds = [...roomIds].sort();
-                const roomCacheData = `room_meta:v4:${sortedRoomIds.join(",")}`;
+                // Cache version bumped v4 → v5: room_type added to the metadata
+                // shape (Catalog Mode Phase 3). Old v4 entries lack room_type and
+                // must not be reused for the defensive Wire post-filter below.
+                const roomCacheData = `room_meta:v5:${sortedRoomIds.join(",")}`;
                 const roomCacheHash = await sha256Hex(roomCacheData);
                 const roomCacheReq = new Request(`https://cache.internal/room-meta/${roomCacheHash}`, { method: "GET" });
                 const edgeCache = caches.default;
@@ -2279,7 +2375,7 @@ export default {
                   const tRoomDb = performance.now();
                   const { data: roomRows } = await sb(env)
                     .from("rooms")
-                    .select("id, name, visibility, icon_key, icon_thumb_key, detail_bg_image_key, detail_bg_color, detail_bg_image_opacity")
+                    .select("id, name, visibility, room_type, icon_key, icon_thumb_key, detail_bg_image_key, detail_bg_color, detail_bg_image_opacity")
                     .in("id", roomIds);
                   roomDbMs = performance.now() - tRoomDb;
                   for (const r of (roomRows ?? [])) {
@@ -2288,6 +2384,7 @@ export default {
                       icon_thumb_key: (r as any).icon_thumb_key ?? null,
                       name: (r as any).name ?? null,
                       visibility: (r as any).visibility ?? null,
+                      room_type: (r as any).room_type ?? null,
                       detail_bg_image_key: (r as any).detail_bg_image_key ?? null,
                       detail_bg_color: (r as any).detail_bg_color ?? null,
                       detail_bg_image_opacity: (r as any).detail_bg_image_opacity ?? null,
@@ -2312,6 +2409,17 @@ export default {
                     ? { ...p, room: roomMap[p.room_id] }
                     : p
                 );
+
+                // Catalog Mode (Phase 3): defensive Wire post-filter. The in-query
+                // NOT IN above is the authoritative exclusion; this covers only the
+                // brief window where a Catalog created within the id-set cache TTL
+                // is not yet in that set. Gated to Wire discovery feeds so a user's
+                // own Catalog posts remain visible on profile/room-scoped surfaces.
+                if (isWireDiscoveryFeed) {
+                  enrichedPosts = enrichedPosts.filter(
+                    (p: any) => !(p.room && p.room.room_type === "catalog")
+                  );
+                }
               } catch {
                 // non-fatal: fall back to posts without room metadata
                 enrichedPosts = lightPosts;
@@ -9387,7 +9495,7 @@ export default {
 
           let q = sb(env)
             .from("rooms")
-            .select("id,room_key,name,description,emoji,icon_key,icon_thumb_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled,card_shape,card_border_visible");
+            .select("id,room_key,name,description,emoji,icon_key,icon_thumb_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled,card_shape,card_border_visible,catalog_columns");
 
           if (owner_id_param) {
             const callerId = await optionalAuth(req, env);
@@ -9436,7 +9544,14 @@ export default {
               // All callers see all visibility levels — private rooms are publicly discoverable
             }
           } else {
-            // Default: list all rooms — private rooms are publicly discoverable
+            // Default: list all rooms — private rooms are publicly discoverable.
+            // Catalog Mode (Phase 3): Catalog Rooms are NOT globally discoverable,
+            // so they are excluded from the Portal/discovery listing at the query
+            // level (authoritative — not a frontend-only assumption). Rows with a
+            // NULL room_type (legacy) remain visible, since `neq` alone would drop
+            // NULLs. Owner-scoped listings above are unaffected — owners still see
+            // their Catalog Rooms.
+            q = q.or("room_type.is.null,room_type.neq.catalog");
           }
 
           const paramsMs = performance.now() - tListTotal;
@@ -9547,7 +9662,7 @@ export default {
               rooms:room_id (
                 id, name, room_key, icon_key, emoji, visibility,
                 card_bg_color, card_text_color,
-                thread_card_style, social_reply_mode,
+                room_type, thread_card_style, social_reply_mode, catalog_columns,
                 card_glass_enabled, card_glass_style,
                 card_border_visible, card_shape,
                 card_bg_image_key, card_bg_image_opacity,
@@ -9598,7 +9713,9 @@ export default {
             // the ~130ms Supabase round-trip. my_role is always resolved fresh
             // (user-specific — never cached). Private rooms are excluded.
             const ROOM_CACHE_TTL = 30; // seconds
-            const roomCacheUrl = new URL(`https://cache.internal/rooms/${roomId}/row`);
+            // Cache key version bumped to v2 when catalog_columns was added to
+            // the room row shape, so stale pre-migration entries aren't reused.
+            const roomCacheUrl = new URL(`https://cache.internal/rooms/${roomId}/row-v2`);
             const roomCacheKey = new Request(roomCacheUrl.toString(), { method: "GET" });
             const roomCache = caches.default;
 
@@ -9908,12 +10025,27 @@ export default {
           const detail_reply_badge_glass_enabled = typeof design.detailReplyBadgeGlassEnabled === "boolean" ? design.detailReplyBadgeGlassEnabled : null;
 
           // ── Room content type (top-level, not inside design) ──
-          const VALID_ROOM_TYPES = ["post", "thread"];
+          const VALID_ROOM_TYPES = ["post", "thread", CATALOG_ROOM_TYPE];
           const VALID_CARD_STYLES = ["standard", "teran", "social"];
           const VALID_SOCIAL_REPLY_MODES = ["x", "reddit"];
           const room_type = typeof body?.room_type === "string" && VALID_ROOM_TYPES.includes(body.room_type) ? body.room_type : "post";
           const thread_card_style = typeof body?.thread_card_style === "string" && VALID_CARD_STYLES.includes(body.thread_card_style) ? body.thread_card_style : null;
           const social_reply_mode = typeof body?.social_reply_mode === "string" && VALID_SOCIAL_REPLY_MODES.includes(body.social_reply_mode) ? body.social_reply_mode : null;
+
+          // Catalog Rooms may only use the "teran" or "standard" card style.
+          // Reject the invalid "social" combination up front.
+          if (room_type === CATALOG_ROOM_TYPE && thread_card_style === "social") {
+            throw new HttpError(422, "VALIDATION_ERROR", "Catalog rooms cannot use the social card style");
+          }
+
+          // catalog_columns: validate 2|3; default to 3 when omitted. Stored for
+          // every room (uniform serialization) but only meaningful for
+          // room_type=catalog + thread_card_style=teran.
+          const catalogColsParsed = parseCatalogColumns(body?.catalog_columns);
+          if (!catalogColsParsed.ok) {
+            throw new HttpError(422, "VALIDATION_ERROR", "catalog_columns must be 2 or 3");
+          }
+          const catalog_columns = catalogColsParsed.value ?? 3;
 
           const tValidate = performance.now();
 
@@ -9987,6 +10119,9 @@ export default {
           if (detail_reply_badge_bg_color !== null) insertObj.detail_reply_badge_bg_color = detail_reply_badge_bg_color;
           if (detail_reply_badge_glass_enabled !== null) insertObj.detail_reply_badge_glass_enabled = detail_reply_badge_glass_enabled;
           insertObj.room_type = room_type;
+          // Always persist catalog_columns (uniform serialization); DB default is
+          // also 3, so non-catalog rooms are unaffected behaviorally.
+          insertObj.catalog_columns = catalog_columns;
           if (thread_card_style !== null) insertObj.thread_card_style = thread_card_style;
           if (social_reply_mode !== null) insertObj.social_reply_mode = social_reply_mode;
           if (creator_display_name !== null) insertObj.creator_display_name = creator_display_name;
@@ -10439,7 +10574,7 @@ export default {
               updates.detail_reply_badge_glass_enabled = design.detail_reply_badge_glass_enabled;
 
             // ── Room content type (top-level fields) ──
-            const VALID_ROOM_TYPES = ["post", "thread"];
+            const VALID_ROOM_TYPES = ["post", "thread", CATALOG_ROOM_TYPE];
             const VALID_CARD_STYLES = ["standard", "teran", "social"];
             const VALID_SOCIAL_REPLY_MODES = ["x", "reddit"];
             if (typeof body?.room_type === "string" && VALID_ROOM_TYPES.includes(body.room_type))
@@ -10450,6 +10585,23 @@ export default {
               updates.social_reply_mode = body.social_reply_mode;
             else if (body?.social_reply_mode === null)
               updates.social_reply_mode = null;
+
+            // ── catalog_columns (2|3) ──
+            // Only apply when the field is present, so omitting it never
+            // silently overwrites the stored value. Reject invalid values.
+            if (body?.catalog_columns !== undefined) {
+              const catalogColsUpd = parseCatalogColumns(body.catalog_columns);
+              if (!catalogColsUpd.ok) {
+                throw new HttpError(422, "VALIDATION_ERROR", "catalog_columns must be 2 or 3");
+              }
+              if (catalogColsUpd.value !== undefined) updates.catalog_columns = catalogColsUpd.value;
+            }
+
+            // Guard the invalid Catalog + social combination when both the
+            // resulting room_type and card style are set in this request.
+            if (updates.room_type === CATALOG_ROOM_TYPE && updates.thread_card_style === "social") {
+              throw new HttpError(422, "VALIDATION_ERROR", "Catalog rooms cannot use the social card style");
+            }
 
             // ── Replace avatar_options if provided ──
             const hasAvatarOptions = Array.isArray(body?.avatar_options);
@@ -11542,12 +11694,14 @@ export default {
           if (m && req.method === "GET") {
             const sourceRoomId = m[1];
 
-            // Source must exist and be Private (authoritative DB read).
+            // Source must exist (authoritative DB read).
             const sourceRoom = await loadRoomCore(env, sourceRoomId);
             if (!sourceRoom) throw new HttpError(404, "NOT_FOUND", "Source room not found");
-            if (sourceRoom.visibility !== "private_invite_only") {
-              throw new HttpError(422, "SOURCE_ROOM_NOT_PRIVATE", "Source room is not private");
-            }
+            // Catalog Mode (Phase 2): a Public parent may expose its attached
+            // Catalog targets, so this endpoint no longer rejects Public sources.
+            // Target-level filtering below still prevents a Public parent from
+            // exposing arbitrary (non-Catalog) linked Rooms.
+            const sourceIsPrivate = sourceRoom.visibility === "private_invite_only";
             // Viewing the linked-Room row does NOT require source-owner auth.
 
             // All links for this source, stable order.
@@ -11573,12 +11727,19 @@ export default {
             const roomById = new Map<string, any>();
             for (const r of (targetRooms as any[]) ?? []) roomById.set(String((r as any).id), r);
 
-            // Preserve link order; omit missing targets and non-private targets.
+            // Preserve link order; apply visibility-aware target filtering.
+            //   * Catalog targets (room_type === "catalog") are always returned,
+            //     regardless of the parent's visibility.
+            //   * Otherwise, only a Private parent may expose its Private linked
+            //     Rooms (existing behavior). A Public parent NEVER exposes an
+            //     arbitrary non-Catalog target.
             const out: any[] = [];
             for (const l of links) {
               const room = roomById.get(String(l.target_room_id));
               if (!room) continue;
-              if ((room as any).visibility !== "private_invite_only") continue;
+              const isCatalogTarget = (room as any).room_type === "catalog";
+              const isPrivateLinkedRoom = sourceIsPrivate && (room as any).visibility === "private_invite_only";
+              if (!isCatalogTarget && !isPrivateLinkedRoom) continue;
               out.push({
                 id: l.id,
                 source_room_id: l.source_room_id,
@@ -11751,6 +11912,137 @@ export default {
             if (delErr) throw new Error(delErr.message);
 
             return ok(req, env, request_id, { deleted: true, link_id: linkId });
+          }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // Catalog Mode (Phase 2) — create a Catalog Room from a parent Room
+        // POST /api/rooms/:parentRoomId/catalog
+        //
+        // Distinct from the generic POST /:id/links (which links two EXISTING
+        // Private Rooms and requires a target invite token). This flow CREATES a
+        // new child Room (room_type='catalog'), makes the caller its owner, and
+        // auto-links parent→catalog. No invite token is required. The generic
+        // link endpoint's Private + invite-token checks are left untouched.
+        //
+        // Forced/derived (client may NOT override): room_type, visibility
+        // (inherited from parent), owner_id, and the parent link relationship.
+        // Single-parent is enforced here in endpoint logic (exactly one link is
+        // created); no DB-level constraint is added in this phase.
+        // ══════════════════════════════════════════════════════════════
+        {
+          const m = path.match(/^\/api\/rooms\/([^/]+)\/catalog$/);
+          if (m && req.method === "POST") {
+            const parentRoomId = m[1];
+
+            // 1. Authenticate.
+            const user_id = await requireAuth(req, env);
+
+            // 2-3. Parent must exist (authoritative DB read incl. visibility).
+            const parentRoom = await loadRoomCore(env, parentRoomId);
+            if (!parentRoom) throw new HttpError(404, "NOT_FOUND", "Parent room not found");
+
+            // 4. Only the parent Room owner may create a Catalog under it.
+            const myRole = await checkRoomMembership(env, parentRoomId, user_id);
+            if (myRole !== "owner") {
+              throw new HttpError(403, "FORBIDDEN", "Only the parent room owner can create a catalog");
+            }
+
+            // 5. Validate Catalog input using the existing create-room patterns.
+            const body = (await req.json().catch(() => null)) as any;
+            const name = typeof body?.name === "string" ? body.name.trim() : "";
+            if (!name) throw new HttpError(422, "VALIDATION_ERROR", "name is required");
+            if (name.length > 80) throw new HttpError(422, "VALIDATION_ERROR", "name max 80 chars");
+
+            const description = typeof body?.description === "string" ? body.description.trim().slice(0, 500) : null;
+            const icon_key = typeof body?.icon_key === "string" ? body.icon_key.trim() : null;
+            const icon_thumb_key = typeof body?.icon_thumb_key === "string" ? body.icon_thumb_key.trim() : null;
+            if (icon_key && icon_key.startsWith("data:")) throw new HttpError(422, "VALIDATION_ERROR", "icon_key must not be a data URI");
+            if (icon_thumb_key && icon_thumb_key.startsWith("data:")) throw new HttpError(422, "VALIDATION_ERROR", "icon_thumb_key must not be a data URI");
+            const emoji = typeof body?.emoji === "string" && body.emoji.trim() ? body.emoji.trim().slice(0, 16) : null;
+
+            // 7-9. Card style: Catalog allows only "teran" | "standard"; default "teran".
+            const rawCardStyle = typeof body?.thread_card_style === "string" ? body.thread_card_style : null;
+            if (rawCardStyle === "social") {
+              throw new HttpError(422, "VALIDATION_ERROR", "Catalog rooms cannot use the social card style");
+            }
+            const thread_card_style = (rawCardStyle === "standard" || rawCardStyle === "teran") ? rawCardStyle : "teran";
+
+            // catalog_columns: 2|3, default 3 (Phase 1 helper).
+            const catalogColsParsed = parseCatalogColumns(body?.catalog_columns);
+            if (!catalogColsParsed.ok) throw new HttpError(422, "VALIDATION_ERROR", "catalog_columns must be 2 or 3");
+            const catalog_columns = catalogColsParsed.value ?? 3;
+
+            // Optional creator display name (room identity) — same as normal create.
+            const rawCreatorDisplayName = typeof body?.creator_display_name === "string" ? body.creator_display_name.trim().slice(0, 80) : null;
+            const creator_display_name = rawCreatorDisplayName || null;
+
+            // 6. Forced/derived fields — never taken from the client.
+            const visibility = parentRoom.visibility;   // inherit parent visibility
+            const room_key = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+            const insertObj: Record<string, any> = {
+              name, description, icon_key, icon_thumb_key, emoji, room_key,
+              owner_id: user_id,
+              visibility,
+              read_policy: "public",
+              post_policy: "members_only",
+              room_type: CATALOG_ROOM_TYPE,
+              thread_card_style,
+              catalog_columns,
+            };
+            if (creator_display_name !== null) insertObj.creator_display_name = creator_display_name;
+
+            // 10. Create the Catalog Room.
+            const { data: room, error: roomErr } = await sb(env)
+              .from("rooms").insert(insertObj).select().single();
+            if (roomErr) throw new Error(roomErr.message);
+            const catalogRoomId = (room as any).id;
+
+            // 11. Owner membership (must succeed). Compensate on failure so we
+            //     never leave a Catalog Room without its owner membership.
+            const { error: memErr } = await sb(env)
+              .from("room_members")
+              .insert({ room_id: catalogRoomId, user_id, role: "owner" });
+            if (memErr) {
+              console.error("[catalog_create] membership failed, rolling back room", { rid: request_id, room_id: catalogRoomId, error: memErr.message });
+              await sb(env).from("rooms").delete().eq("id", catalogRoomId);
+              throw new Error("Catalog room created but owner membership failed: " + memErr.message);
+            }
+
+            // 12-15. Insert the parent→catalog link. On failure, clean up the
+            //        membership AND the room so no orphan Catalog Room remains.
+            const { data: lastRow } = await sb(env)
+              .from("room_links").select("position")
+              .eq("source_room_id", parentRoomId)
+              .order("position", { ascending: false }).limit(1).maybeSingle();
+            const nextPosition = lastRow ? (((lastRow as any).position ?? 0) + 1) : 0;
+
+            const { data: inserted, error: linkErr } = await sb(env)
+              .from("room_links")
+              .insert({
+                source_room_id: parentRoomId,
+                target_room_id: catalogRoomId,
+                created_by: user_id,
+                position: nextPosition,
+              })
+              .select("id,source_room_id,target_room_id,position,created_at")
+              .single();
+            if (linkErr) {
+              console.error("[catalog_create] link failed, rolling back room + membership", { rid: request_id, room_id: catalogRoomId, error: linkErr.message });
+              await sb(env).from("room_members").delete().eq("room_id", catalogRoomId);
+              await sb(env).from("rooms").delete().eq("id", catalogRoomId);
+              throw new Error("Catalog room created but link failed: " + linkErr.message);
+            }
+
+            // 16. Link summary (same shape as the generic link response).
+            const { data: targetSummary } = await sb(env)
+              .from("rooms").select(ROOM_LINK_SUMMARY_FIELDS).eq("id", catalogRoomId).maybeSingle();
+
+            return ok(req, env, request_id, {
+              room: { ...(room as any), member_count: 1 },
+              my_role: "owner",
+              link: { ...(inserted as any), room: targetSummary ?? null },
+            }, 201);
           }
         }
 
