@@ -12109,6 +12109,303 @@ export default {
           }
         }
 
+        // ══════════════════════════════════════════════════════════════
+        // Profile-Linked Private Rooms
+        // Manages a profile owner's curated list of Private Rooms shown on
+        // their public profile page.
+        //
+        // Security model:
+        //   * owner_user_id is ALWAYS resolved from the verified JWT — never
+        //     trusted from the client request body or query string.
+        //   * invite_token is used once for server-side validation only.
+        //     It is NEVER stored in profile_linked_rooms and NEVER returned
+        //     in any response.
+        //   * These routes perform NO room_members mutations, NO role changes,
+        //     NO membership grants, and NO join operations.
+        //   * Only users with a valid Teran ID may add profile-linked rooms.
+        // ══════════════════════════════════════════════════════════════
+
+        // GET /api/profile-rooms?user_id=<id|me>
+        // Public read for explicit user_id; authenticated self-read for user_id=me.
+        if (path === "/api/profile-rooms" && req.method === "GET") {
+          const rawUserId = url.searchParams.get("user_id");
+          if (!rawUserId || rawUserId.trim() === "") {
+            throw new HttpError(400, "BAD_REQUEST", "user_id query parameter is required");
+          }
+
+          let resolvedOwnerId: string;
+          if (rawUserId.trim() === "me") {
+            // Auth required: resolve from JWT, never from client
+            resolvedOwnerId = await requireAuth(req, env);
+          } else {
+            // Public read: treat as the literal profile user_id
+            resolvedOwnerId = rawUserId.trim();
+          }
+
+          // Query profile_linked_rooms by owner_user_id, ordered stably.
+          const { data: linkRows, error: linksErr } = await sb(env)
+            .from("profile_linked_rooms")
+            .select("id, owner_user_id, target_room_id, position, created_at")
+            .eq("owner_user_id", resolvedOwnerId)
+            .order("position", { ascending: true })
+            .order("created_at", { ascending: true });
+          if (linksErr) throw new Error(linksErr.message);
+
+          const links = (linkRows as any[]) ?? [];
+          if (links.length === 0) {
+            return ok(req, env, request_id, { rooms: [] });
+          }
+
+          // Batch-load all target Rooms in a single query (no N+1).
+          const targetIds = Array.from(new Set(links.map((l: any) => String(l.target_room_id))));
+          const { data: targetRooms, error: roomsErr } = await sb(env)
+            .from("rooms")
+            .select(ROOM_LINK_SUMMARY_FIELDS)
+            .in("id", targetIds);
+          if (roomsErr) throw new Error(roomsErr.message);
+
+          const roomById = new Map<string, any>();
+          for (const r of (targetRooms as any[]) ?? []) {
+            roomById.set(String((r as any).id), r);
+          }
+
+          // Preserve link order; omit links whose Room has been deleted
+          // (cascade should already remove those) or changed to non-private.
+          const out: any[] = [];
+          for (const l of links) {
+            const room = roomById.get(String(l.target_room_id));
+            if (!room) continue;
+            // Only Private Rooms are exposed on a profile.
+            // If the room became public, omit it silently (do not mutate during GET).
+            if ((room as any).visibility !== "private_invite_only") continue;
+            out.push({
+              link_id: l.id,
+              target_room_id: l.target_room_id,
+              position: l.position,
+              created_at: l.created_at,
+              room: {
+                id: (room as any).id,
+                room_key: (room as any).room_key ?? null,
+                name: (room as any).name,
+                description: (room as any).description ?? null,
+                visibility: (room as any).visibility,
+                room_type: (room as any).room_type ?? null,
+                emoji: (room as any).emoji ?? null,
+                icon_key: (room as any).icon_key ?? null,
+                icon_thumb_key: (room as any).icon_thumb_key ?? null,
+              },
+            });
+          }
+
+          return ok(req, env, request_id, { rooms: out });
+        }
+
+        // POST /api/profile-rooms
+        // Add one Private Room to the authenticated owner's public profile.
+        if (path === "/api/profile-rooms" && req.method === "POST") {
+          // 1. Authenticate: resolve owner identity from JWT — never from body.
+          const user_id = await requireAuth(req, env);
+
+          // 2. Parse + validate body.
+          const body = (await req.json().catch(() => null)) as any;
+          const targetRoomIdRaw = typeof body?.target_room_id === "string"
+            ? body.target_room_id.trim() : "";
+          const inviteToken = typeof body?.invite_token === "string"
+            ? body.invite_token.trim() : "";
+
+          if (!targetRoomIdRaw) {
+            throw new HttpError(400, "BAD_REQUEST", "target_room_id is required");
+          }
+          if (!inviteToken) {
+            throw new HttpError(400, "BAD_REQUEST", "invite_token is required");
+          }
+
+          // 3. Teran ID prerequisite — same eligibility check used by join_by_invite
+          //    for Private Rooms. Only accounts with a claimed Teran ID may curate
+          //    profile-linked rooms.
+          const teranHandle = await resolveAccountTeranHandle(env, user_id);
+          const hasTeranId = typeof teranHandle === "string" && teranHandle.trim().length > 0;
+          if (!hasTeranId) {
+            throw new HttpError(
+              403,
+              "TERAN_ID_REQUIRED",
+              "Create a Teran ID before adding rooms to your profile."
+            );
+          }
+
+          // 4. Confirm the authenticated identity exists in user_profiles.
+          //    (The FK on the table already enforces this at the DB level, but
+          //    an early check gives a cleaner 403 rather than a FK 500.)
+          const { data: profileRow } = await sb(env)
+            .from("user_profiles")
+            .select("user_id")
+            .eq("user_id", user_id)
+            .maybeSingle();
+          if (!profileRow) {
+            throw new HttpError(
+              403,
+              "PROFILE_NOT_FOUND",
+              "Your profile must exist in user_profiles before adding profile rooms."
+            );
+          }
+
+          // 5. Load the target Room from the canonical rooms table.
+          const targetRoom = await loadRoomCore(env, targetRoomIdRaw);
+          if (!targetRoom) {
+            throw new HttpError(404, "NOT_FOUND", "Target room not found");
+          }
+
+          // 6. Confirm the Room is Private. Public Rooms or other visibility types
+          //    are not allowed as profile-linked rooms.
+          if (targetRoom.visibility !== "private_invite_only") {
+            throw new HttpError(
+              400,
+              "TARGET_ROOM_NOT_PRIVATE",
+              "Only Private (invite-only) rooms may be added to a profile"
+            );
+          }
+
+          // 7. Validate the invite token for the target Room (read-only helper).
+          //    The token proves the owner was invited. It is NEVER stored and
+          //    NEVER returned in this or any response.
+          const inviteResult = await validateRoomInvite(env, targetRoomIdRaw, inviteToken);
+          if (!inviteResult.ok) {
+            if (inviteResult.reason === "revoked") {
+              throw new HttpError(403, "FORBIDDEN", "This invite has been revoked");
+            }
+            throw new HttpError(403, "FORBIDDEN", "Invalid invite token");
+          }
+
+          // 8. Friendly duplicate pre-check.
+          const { data: existingLink, error: existErr } = await sb(env)
+            .from("profile_linked_rooms")
+            .select("id")
+            .eq("owner_user_id", user_id)
+            .eq("target_room_id", targetRoomIdRaw)
+            .maybeSingle();
+          if (existErr) throw new Error(existErr.message);
+          if (existingLink) {
+            throw new HttpError(409, "ROOM_ALREADY_LINKED", "This room is already linked to your profile");
+          }
+
+          // 9. Determine next stable position: max(position) + 1, else 0.
+          const { data: lastRow, error: posErr } = await sb(env)
+            .from("profile_linked_rooms")
+            .select("position")
+            .eq("owner_user_id", user_id)
+            .order("position", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (posErr) throw new Error(posErr.message);
+          const nextPosition = lastRow ? ((lastRow as any).position ?? 0) + 1 : 0;
+
+          // 10. Insert exactly the navigation fields.
+          //     NEVER insert: invite_token, room name, icon, description, or
+          //     any other cached metadata.
+          const { data: inserted, error: insertErr } = await sb(env)
+            .from("profile_linked_rooms")
+            .insert({
+              owner_user_id: user_id,   // resolved from JWT — never from body
+              target_room_id: targetRoomIdRaw,
+              position: nextPosition,
+            } as any)
+            .select("id, owner_user_id, target_room_id, position, created_at")
+            .single();
+
+          if (insertErr) {
+            // DB-level duplicate → same 409 as the friendly pre-check.
+            if ((insertErr as any).code === "23505") {
+              throw new HttpError(409, "ROOM_ALREADY_LINKED", "This room is already linked to your profile");
+            }
+            throw new Error(insertErr.message);
+          }
+
+          // 11. Load target Room summary for the response (canonical fields only).
+          const { data: targetSummary, error: sumErr } = await sb(env)
+            .from("rooms")
+            .select(ROOM_LINK_SUMMARY_FIELDS)
+            .eq("id", targetRoomIdRaw)
+            .maybeSingle();
+          if (sumErr) throw new Error(sumErr.message);
+
+          const ins = inserted as any;
+          const tgt = targetSummary as any;
+
+          console.log(`[profile-rooms] POST rid=${request_id} owner=${user_id} target=${targetRoomIdRaw} position=${nextPosition}`);
+
+          return ok(
+            req,
+            env,
+            request_id,
+            {
+              room: {
+                link_id: ins.id,
+                target_room_id: ins.target_room_id,
+                position: ins.position,
+                created_at: ins.created_at,
+                room: tgt ? {
+                  id: tgt.id,
+                  room_key: tgt.room_key ?? null,
+                  name: tgt.name,
+                  description: tgt.description ?? null,
+                  visibility: tgt.visibility,
+                  room_type: tgt.room_type ?? null,
+                  emoji: tgt.emoji ?? null,
+                  icon_key: tgt.icon_key ?? null,
+                  icon_thumb_key: tgt.icon_thumb_key ?? null,
+                } : null,
+              },
+            },
+            201
+          );
+        }
+
+        // DELETE /api/profile-rooms/:linkId
+        // Remove one linked Room from the authenticated owner's profile.
+        {
+          const m = path.match(/^\/api\/profile-rooms\/([^/]+)$/);
+          if (m && req.method === "DELETE") {
+            const linkIdRaw = m[1];
+
+            // 1. Authenticate: resolve owner from JWT — never from body.
+            const user_id = await requireAuth(req, env);
+
+            // 2. linkId must be a non-empty string (UUID stored as TEXT in this table).
+            const linkId = typeof linkIdRaw === "string" ? linkIdRaw.trim() : "";
+            if (!linkId) {
+              throw new HttpError(400, "BAD_REQUEST", "linkId is required");
+            }
+
+            // 3. Find the link row scoped to both id AND owner_user_id.
+            //    A user can never delete another profile's linked Room: the
+            //    owner_user_id guard makes an impersonation attempt return 404.
+            const { data: linkRow, error: linkErr } = await sb(env)
+              .from("profile_linked_rooms")
+              .select("id")
+              .eq("id", linkId)
+              .eq("owner_user_id", user_id)
+              .maybeSingle();
+            if (linkErr) throw new Error(linkErr.message);
+            if (!linkRow) {
+              throw new HttpError(404, "NOT_FOUND", "Profile room link not found");
+            }
+
+            // 4. Delete exactly this profile_linked_rooms row.
+            //    Nothing else is touched: no rooms, no room_members, no invites,
+            //    no roles, no memberships, no other profiles.
+            const { error: delErr } = await sb(env)
+              .from("profile_linked_rooms")
+              .delete()
+              .eq("id", linkId)
+              .eq("owner_user_id", user_id);
+            if (delErr) throw new Error(delErr.message);
+
+            console.log(`[profile-rooms] DELETE rid=${request_id} owner=${user_id} link=${linkId}`);
+
+            return ok(req, env, request_id, { success: true, deleted_id: linkId });
+          }
+        }
+
         throw new HttpError(404, "NOT_FOUND", "Not found");
 
       } catch (e: any) {
