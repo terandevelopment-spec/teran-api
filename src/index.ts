@@ -1226,6 +1226,28 @@ function generateInviteToken(): string {
 // may use the "teran" or "standard" card style (never "social").
 const CATALOG_ROOM_TYPE = 'catalog';
 
+// ── DM-as-a-Room (Phase 1) ──────────────────────────────────────────────
+// A DM Room is a normal `rooms` row with room_type = 'dm' shared by exactly
+// two Personas. DM Rooms are fully private: they and all posts inside them are
+// excluded from every public Room/post surface. They are NEVER created or
+// mutated through generic Room endpoints — only the dedicated DM lifecycle
+// (Phase 2). 'dm' is a recognized/valid Room type for validation purposes, but
+// generic create/convert paths explicitly reject it (see below).
+const DM_ROOM_TYPE = 'dm';
+
+// ── DM-as-a-Room (Phase 2) ──────────────────────────────────────────────
+// Each DM Room hosts exactly ONE internal system post whose only job is to be
+// the parent/root that the existing comment stream (Phase 3) attaches to. It
+// carries no user-facing content and is created ONLY by POST /api/dm/open.
+// It uses a dedicated post_type so it is (a) trivially excluded from every feed
+// query that filters post_type IN ('status','thread',...), and (b) uniquely
+// identifiable per Room. `post_type` has NO DB CHECK constraint, so this adds a
+// new internal type without weakening normal post validation. Uniqueness is
+// enforced by the partial index in sql/dm_system_post.sql:
+//   CREATE UNIQUE INDEX posts_dm_system_uidx ON posts(room_id)
+//     WHERE post_type = 'dm_system';
+const DM_SYSTEM_POST_TYPE = 'dm_system';
+
 // catalog_columns: number of Teran columns for Catalog Rooms. Only 2 or 3 are
 // allowed (default 3). It is behaviorally relevant only when
 // room_type === "catalog" AND thread_card_style === "teran", but is persisted
@@ -1340,6 +1362,280 @@ async function getCatalogRoomIds(env: Env, ctx: any): Promise<string[]> {
 		/* waitUntil/put failure is non-fatal */
 	}
 	return ids;
+}
+
+// ── DM Room exclusion set (Phase 1) ─────────────────────────────────────
+// Authoritative backend list of room_type='dm' Room IDs, used to exclude DM
+// Rooms and their posts from every public surface. Mirrors getCatalogRoomIds
+// but with its own cache key and a shorter TTL (DM privacy is stricter than
+// Catalog discoverability, so we bound the staleness window more tightly).
+// Returns [] on error so a lookup failure can never surface DM content.
+// NOTE (Phase 2): the DM creation flow must purge this cache key on new DM
+// Room insert so a freshly-created DM Room's posts cannot leak during the TTL.
+async function getDmRoomIds(env: Env, ctx: any): Promise<string[]> {
+	const edgeCache = caches.default;
+	const cacheReq = new Request('https://cache.internal/dm-room-ids/v1', { method: 'GET' });
+	try {
+		const cached = await edgeCache.match(cacheReq);
+		if (cached) {
+			const ids = await cached.json();
+			if (Array.isArray(ids)) return ids as string[];
+		}
+	} catch {
+		/* cache read failure is non-fatal */
+	}
+
+	const { data, error } = await sb(env).from('rooms').select('id').eq('room_type', DM_ROOM_TYPE);
+	if (error) {
+		console.warn('[dm_exclusion] failed to resolve dm room ids:', error.message);
+		return [];
+	}
+	const ids = (data ?? []).map((r: any) => String((r as any).id));
+	try {
+		ctx.waitUntil(
+			edgeCache
+				.put(
+					cacheReq,
+					new Response(JSON.stringify(ids), {
+						status: 200,
+						headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=20' },
+					}),
+				)
+				.catch(() => {}),
+		);
+	} catch {
+		/* waitUntil/put failure is non-fatal */
+	}
+	return ids;
+}
+
+// ── DM-as-a-Room (Phase 2): shared authorization helpers ────────────────
+// These are the ONLY authority for who may open a DM. Access is defined purely
+// by the canonical two-Persona pair — NEVER by account ID, device ID,
+// room_members, or sibling-account membership inheritance.
+
+// Canonical Persona-pair normalizer. Validates both Persona author_ids, rejects
+// missing IDs and self-DM, and returns a STABLE lexicographic ordering so that
+// (A,B) and (B,A) always resolve to the same DM Room. Returns a discriminated
+// result; the caller maps the failure code to the API error convention.
+type DmPairNorm = { ok: true; personaLo: string; personaHi: string } | { ok: false; code: 'MISSING' | 'SELF' };
+
+function normalizeDmPersonaPair(personaA: unknown, personaB: unknown): DmPairNorm {
+	const a = typeof personaA === 'string' ? personaA.trim() : '';
+	const b = typeof personaB === 'string' ? personaB.trim() : '';
+	if (!a || !b) return { ok: false, code: 'MISSING' };
+	if (a === b) return { ok: false, code: 'SELF' };
+	const [personaLo, personaHi] = a < b ? [a, b] : [b, a];
+	return { ok: true, personaLo, personaHi };
+}
+
+// Full DM authorization check for a directional open request
+// (sourcePersona → targetPersona). Returns a discriminated result rather than
+// throwing so the endpoint can uniformly attach `Cache-Control: private, no-store`
+// and never leak raw Supabase/SQL errors. Enforces, in order:
+//   1. authentication (existing requireAuth / JWT sub)
+//   2. caller OWNS the source Persona (verifyPersonaOwnership — account/persona
+//      binding, NOT room membership)
+//   3. target Persona EXISTS (user_profiles row) — also the other_user summary
+//   4. CURRENT mutual Echo (both directional echoes rows present)
+//   5. NOT blocked in either direction (persona-to-persona)
+// Persona IDs are passed to PostgREST only via `.in([...])` (never string-
+// interpolated into `.or()`), so they cannot break the filter grammar.
+type DmPairAccess =
+	| {
+			ok: true;
+			userId: string;
+			personaLo: string;
+			personaHi: string;
+			source: string;
+			target: string;
+			otherUser: { author_id: string; display_name: string; avatar: string | null; teran_id: string | null };
+	  }
+	| { ok: false; status: 400 | 401 | 403 | 404 | 500; code: string; message: string };
+
+async function verifyDmPairAccess(
+	req: Request,
+	env: Env,
+	ctx: ExecutionContext,
+	sourcePersonaAuthorId: unknown,
+	targetPersonaAuthorId: unknown,
+): Promise<DmPairAccess> {
+	// 1. Authenticate (JWT sub = account/device identity).
+	let userId: string;
+	try {
+		userId = await requireAuth(req, env);
+	} catch {
+		return { ok: false, status: 401, code: 'AUTH_INVALID', message: 'Authentication required' };
+	}
+
+	// 2. Normalize + validate the pair (missing / malformed / self-DM).
+	const norm = normalizeDmPersonaPair(sourcePersonaAuthorId, targetPersonaAuthorId);
+	if (!norm.ok) {
+		if (norm.code === 'SELF') return { ok: false, status: 400, code: 'BAD_REQUEST', message: 'A Persona cannot DM itself' };
+		return { ok: false, status: 400, code: 'BAD_REQUEST', message: 'Both Persona IDs are required' };
+	}
+	const source = (sourcePersonaAuthorId as string).trim();
+	const target = (targetPersonaAuthorId as string).trim();
+
+	// 3. Caller must OWN the source Persona (account/persona binding — never room
+	//    membership or sibling inheritance).
+	let owns = false;
+	try {
+		owns = await verifyPersonaOwnership(env, ctx, userId, source);
+	} catch {
+		return { ok: false, status: 500, code: 'DB_ERROR', message: 'Unexpected error' };
+	}
+	if (!owns) return { ok: false, status: 403, code: 'FORBIDDEN', message: 'You do not own this persona' };
+
+	// 4. Target Persona must EXIST. The user_profiles row is also the ONLY thing
+	//    we expose about the other party (public summary fields).
+	const { data: targetProfile, error: profErr } = await sb(env)
+		.from('user_profiles')
+		.select('user_id, display_name, avatar, teran_id')
+		.eq('user_id', target)
+		.maybeSingle();
+	if (profErr) return { ok: false, status: 500, code: 'DB_ERROR', message: 'Unexpected error' };
+	if (!targetProfile) return { ok: false, status: 404, code: 'NOT_FOUND', message: 'User unavailable' };
+
+	// 5. CURRENT mutual Echo — both directional rows must exist right now.
+	const { data: echoRows, error: echoErr } = await sb(env)
+		.from('echoes')
+		.select('echoer_author_id, echoed_user_id')
+		.in('echoer_author_id', [source, target])
+		.in('echoed_user_id', [source, target]);
+	if (echoErr) return { ok: false, status: 500, code: 'DB_ERROR', message: 'Unexpected error' };
+	const rows = (echoRows ?? []) as Array<{ echoer_author_id: string; echoed_user_id: string }>;
+	const hasForward = rows.some((r) => r.echoer_author_id === source && r.echoed_user_id === target);
+	const hasBackward = rows.some((r) => r.echoer_author_id === target && r.echoed_user_id === source);
+	if (!hasForward || !hasBackward) return { ok: false, status: 403, code: 'FORBIDDEN', message: 'Not available' };
+
+	// 6. No block in either direction (persona-to-persona).
+	const { data: blockRows, error: blockErr } = await sb(env)
+		.from('blocks')
+		.select('blocker_user_id, blocked_user_id')
+		.in('blocker_user_id', [source, target])
+		.in('blocked_user_id', [source, target]);
+	if (blockErr) return { ok: false, status: 500, code: 'DB_ERROR', message: 'Unexpected error' };
+	if ((blockRows ?? []).length > 0) return { ok: false, status: 403, code: 'FORBIDDEN', message: 'Not available' };
+
+	return {
+		ok: true,
+		userId,
+		personaLo: norm.personaLo,
+		personaHi: norm.personaHi,
+		source,
+		target,
+		otherUser: {
+			author_id: target,
+			display_name: (targetProfile as any).display_name || 'Anonymous',
+			avatar: (targetProfile as any).avatar || null,
+			teran_id: (targetProfile as any).teran_id ?? null,
+		},
+	};
+}
+
+// ── DM-as-a-Room (Phase 3): DM comment (= message) access ───────────────
+// Cheap detector: is this post the internal DM host post? Used to route the
+// generic comment endpoints (GET/POST/like/delete/counts/preview) away from DM
+// content. A single PK lookup; false for any non-existent or ordinary post so
+// ordinary-comment behavior is never altered.
+async function isDmSystemPostId(env: Env, postId: number): Promise<boolean> {
+	if (!Number.isFinite(postId) || postId <= 0) return false;
+	const { data } = await sb(env).from('posts').select('post_type').eq('id', postId).maybeSingle();
+	return (data as any)?.post_type === DM_SYSTEM_POST_TYPE;
+}
+
+// Authorization for reading/sending DM messages, keyed by the DM host post_id.
+// This is the ONLY authority for DM comment read/send and is called by the
+// dm_system branch of GET/POST /api/comments — never by ordinary comments.
+// The other participant is DERIVED from the Room's canonical pair (never taken
+// from the client). Enforces, in order:
+//   1. authentication (requireAuth / JWT sub)
+//   2. source_persona_author_id present
+//   3. post exists AND post_type = 'dm_system'
+//   4. its Room exists AND room_type = 'dm'
+//   5. caller OWNS source Persona (verifyPersonaOwnership — account/persona
+//      binding; NEVER room_members, Room owner, account-wide or sibling inheritance)
+//   6. source is ONE of the Room's two canonical Personas (→ derive the other)
+//   7. CURRENT mutual Echo (both directions)
+//   8. no block in either direction
+// Returns a discriminated result; failures use generic messages so an outsider
+// cannot distinguish "no such post" from "DM you may not see".
+type DmCommentAccess =
+	| { ok: true; userId: string; roomId: string; source: string; other: string }
+	| { ok: false; status: 400 | 401 | 403 | 404 | 500; code: string; message: string };
+
+async function verifyDmRoomCommentAccess(
+	req: Request,
+	env: Env,
+	ctx: ExecutionContext,
+	postId: number,
+	sourcePersonaAuthorId: unknown,
+): Promise<DmCommentAccess> {
+	let userId: string;
+	try {
+		userId = await requireAuth(req, env);
+	} catch {
+		return { ok: false, status: 401, code: 'AUTH_INVALID', message: 'Authentication required' };
+	}
+
+	const source = typeof sourcePersonaAuthorId === 'string' ? sourcePersonaAuthorId.trim() : '';
+	if (!source) return { ok: false, status: 400, code: 'BAD_REQUEST', message: 'source_persona_author_id is required' };
+
+	// Post must exist and be the DM host post.
+	const { data: post, error: postErr } = await sb(env).from('posts').select('post_type, room_id').eq('id', postId).maybeSingle();
+	if (postErr) return { ok: false, status: 500, code: 'DB_ERROR', message: 'Unexpected error' };
+	if (!post || (post as any).post_type !== DM_SYSTEM_POST_TYPE || !(post as any).room_id) {
+		return { ok: false, status: 404, code: 'NOT_FOUND', message: 'Not found' };
+	}
+	const roomId = String((post as any).room_id);
+
+	// Its Room must exist and be a DM Room; read its canonical Persona pair.
+	const { data: room, error: roomErr } = await sb(env)
+		.from('rooms')
+		.select('room_type, dm_persona_lo, dm_persona_hi')
+		.eq('id', roomId)
+		.maybeSingle();
+	if (roomErr) return { ok: false, status: 500, code: 'DB_ERROR', message: 'Unexpected error' };
+	if (!room || (room as any).room_type !== DM_ROOM_TYPE) return { ok: false, status: 404, code: 'NOT_FOUND', message: 'Not found' };
+	const lo = (room as any).dm_persona_lo as string;
+	const hi = (room as any).dm_persona_hi as string;
+
+	// Caller must OWN the source Persona.
+	let owns = false;
+	try {
+		owns = await verifyPersonaOwnership(env, ctx, userId, source);
+	} catch {
+		return { ok: false, status: 500, code: 'DB_ERROR', message: 'Unexpected error' };
+	}
+	if (!owns) return { ok: false, status: 403, code: 'FORBIDDEN', message: 'Not available' };
+
+	// Source must be one of the two canonical participants; derive the other.
+	if (source !== lo && source !== hi) return { ok: false, status: 403, code: 'FORBIDDEN', message: 'Not available' };
+	const other = source === lo ? hi : lo;
+
+	// CURRENT mutual Echo — both directions.
+	const { data: echoRows, error: echoErr } = await sb(env)
+		.from('echoes')
+		.select('echoer_author_id, echoed_user_id')
+		.in('echoer_author_id', [source, other])
+		.in('echoed_user_id', [source, other]);
+	if (echoErr) return { ok: false, status: 500, code: 'DB_ERROR', message: 'Unexpected error' };
+	const rows = (echoRows ?? []) as Array<{ echoer_author_id: string; echoed_user_id: string }>;
+	const fwd = rows.some((r) => r.echoer_author_id === source && r.echoed_user_id === other);
+	const bwd = rows.some((r) => r.echoer_author_id === other && r.echoed_user_id === source);
+	if (!fwd || !bwd) return { ok: false, status: 403, code: 'FORBIDDEN', message: 'Not available' };
+
+	// No block in either direction.
+	const { data: blockRows, error: blockErr } = await sb(env)
+		.from('blocks')
+		.select('blocker_user_id, blocked_user_id')
+		.in('blocker_user_id', [source, other])
+		.in('blocked_user_id', [source, other]);
+	if (blockErr) return { ok: false, status: 500, code: 'DB_ERROR', message: 'Unexpected error' };
+	if ((blockRows ?? []).length > 0) return { ok: false, status: 403, code: 'FORBIDDEN', message: 'Not available' };
+
+	return { ok: true, userId, roomId, source, other };
 }
 
 // Resolve the account-level Teran ID (accounts.teran_handle) for an authenticated
@@ -1709,6 +2005,20 @@ export default {
 						if (catalogRoomIds.length > 0) {
 							q = q.not('room_id', 'in', `(${catalogRoomIds.map((cid) => `"${cid}"`).join(',')})`);
 						}
+					}
+
+					// ── DM Room posts: authoritative exclusion from EVERY post surface ──
+					// Unlike Catalog (which stays visible on its owner's profile/room
+					// surfaces), DM Rooms are fully private, so this exclusion is applied
+					// to ALL query modes — Wire, Main, room feeds, profile/author lists,
+					// and search — not just Wire. posts.room_id has no FK to rooms.id, so
+					// we filter with the authoritative DM room-id set. The single-post and
+					// reply DIRECT-fetch paths bypass this query builder, so they are also
+					// covered by a post-fetch filter at the convergence point below.
+					// Empty set in Phase 1 (no DM Rooms) → zero overhead.
+					const dmRoomIds = await getDmRoomIds(env, ctx);
+					if (dmRoomIds.length > 0) {
+						q = q.not('room_id', 'in', `(${dmRoomIds.map((cid) => `"${cid}"`).join(',')})`);
 					}
 					if (id_param) {
 						// Single post by ID
@@ -2130,6 +2440,16 @@ export default {
 					// Privacy filter removed: private Room posts are public content.
 					// Room membership is only required for write operations (post, comment).
 					const tPrivacy = performance.now();
+
+					// ── DM Room posts: authoritative private exclusion (all fetch paths) ──
+					// This convergence point runs regardless of how `posts` was populated
+					// (query builder, single-post direct fetch, or reply direct fetch), so
+					// it also protects direct/public Post Detail access — a DM post fetched
+					// by id is dropped here, yielding a neutral empty result rather than
+					// revealing the post or its DM Room. Empty set in Phase 1 → no-op.
+					if (dmRoomIds.length > 0 && Array.isArray(posts) && posts.length > 0) {
+						posts = posts.filter((p: any) => !(p.room_id && dmRoomIds.includes(p.room_id)));
+					}
 					const privacyMs = +(performance.now() - tPrivacy).toFixed(1);
 
 					// Compute postIds AFTER privacy filter so removed posts don't participate in downstream queries
@@ -2514,7 +2834,9 @@ export default {
 								// is not yet in that set. Gated to Wire discovery feeds so a user's
 								// own Catalog posts remain visible on profile/room-scoped surfaces.
 								if (isWireDiscoveryFeed) {
-									enrichedPosts = enrichedPosts.filter((p: any) => !(p.room && p.room.room_type === 'catalog'));
+									enrichedPosts = enrichedPosts.filter(
+										(p: any) => !(p.room && (p.room.room_type === 'catalog' || p.room.room_type === DM_ROOM_TYPE)),
+									);
 								}
 							} catch {
 								// non-fatal: fall back to posts without room metadata
@@ -4708,11 +5030,18 @@ export default {
 						// First check if the comment exists and belongs to the user
 						const { data: existingComment, error: fetchError } = await sb(env)
 							.from('comments')
-							.select('id, user_id')
+							.select('id, user_id, post_id')
 							.eq('id', commentId)
 							.single();
 
 						if (fetchError || !existingComment) {
+							throw new HttpError(404, 'NOT_FOUND', 'Comment not found');
+						}
+
+						// DM messages cannot be deleted through the generic path. Message
+						// deletion is intentionally not part of DM (Phase 3). Return the same
+						// generic 404 as an unknown comment so DM existence is not revealed.
+						if (await isDmSystemPostId(env, Number((existingComment as any).post_id))) {
 							throw new HttpError(404, 'NOT_FOUND', 'Comment not found');
 						}
 
@@ -4767,7 +5096,7 @@ export default {
 					let idsCount = 0;
 					try {
 						const postIdsParam = url.searchParams.get('post_ids') || '';
-						const postIds = [
+						let postIds = [
 							...new Set(
 								postIdsParam
 									.split(',')
@@ -4779,6 +5108,28 @@ export default {
 
 						if (postIds.length === 0) {
 							return ok(req, env, request_id, { counts: {} });
+						}
+
+						// ── DM Room posts: never expose comment counts for DM posts ──
+						// Public cards must not reveal DM activity. Drop any requested ids
+						// belonging to a DM Room. Gated on the DM set → no extra query in
+						// Phase 1 (no DM Rooms).
+						{
+							const dmRoomIds = await getDmRoomIds(env, ctx);
+							if (dmRoomIds.length > 0) {
+								const dmSet = new Set(dmRoomIds);
+								const { data: postRoomRows } = await sb(env).from('posts').select('id, room_id').in('id', postIds);
+								const dmPostIds = new Set(
+									(postRoomRows ?? []).filter((p: any) => p.room_id && dmSet.has(p.room_id)).map((p: any) => p.id),
+								);
+								if (dmPostIds.size > 0) {
+									postIds = postIds.filter((id) => !dmPostIds.has(id));
+									idsCount = postIds.length;
+									if (postIds.length === 0) {
+										return ok(req, env, request_id, { counts: {} });
+									}
+								}
+							}
 						}
 
 						// Stable cache key: sorted IDs → SHA-256 hash (short, deterministic URL)
@@ -4942,7 +5293,7 @@ export default {
 						const perPost = Math.min(3, Math.max(1, parseInt(perPostParam || '1', 10) || 1));
 						perPostUsed = perPost;
 
-						const postIds = [
+						let postIds = [
 							...new Set(
 								postIdsParam
 									.split(',')
@@ -4955,6 +5306,28 @@ export default {
 						if (postIds.length === 0) {
 							console.log(`[perf] comments/preview rid=${rid} cache=SKIP total=${Date.now() - t0}ms ids=0 per_post=${perPostUsed} error=0`);
 							return ok(req, env, request_id, { previews: {} });
+						}
+
+						// ── DM Room posts: never expose comment previews for DM posts ──
+						// Public card previews must not reveal DM message content. Drop any
+						// requested ids belonging to a DM Room. Gated on the DM set → no
+						// extra query in Phase 1 (no DM Rooms).
+						{
+							const dmRoomIds = await getDmRoomIds(env, ctx);
+							if (dmRoomIds.length > 0) {
+								const dmSet = new Set(dmRoomIds);
+								const { data: postRoomRows } = await sb(env).from('posts').select('id, room_id').in('id', postIds);
+								const dmPostIds = new Set(
+									(postRoomRows ?? []).filter((p: any) => p.room_id && dmSet.has(p.room_id)).map((p: any) => p.id),
+								);
+								if (dmPostIds.size > 0) {
+									postIds = postIds.filter((id) => !dmPostIds.has(id));
+									idsCount = postIds.length;
+									if (postIds.length === 0) {
+										return ok(req, env, request_id, { previews: {} });
+									}
+								}
+							}
 						}
 
 						// Stable cache key: sorted IDs → SHA-256 hash (short, deterministic URL)
@@ -5213,6 +5586,29 @@ export default {
 					const limit = clampPaginationLimit(url.searchParams.get('limit'), 20, 200);
 					const cursor = parseCursor(url.searchParams.get('cursor'));
 
+					// ── DM message read branch (Phase 3) ────────────────────────────
+					// If the target post is the internal DM host post, this is a DM
+					// message read: it requires full pair authorization and a 24h window.
+					// Ordinary posts skip this entirely and keep every existing behavior.
+					let dmRead = false;
+					let dmCutoffIso: string | null = null;
+					if (await isDmSystemPostId(env, post_id)) {
+						const source = (url.searchParams.get('source_persona_author_id') || '').trim();
+						const access = await verifyDmRoomCommentAccess(req, env, ctx, post_id, source);
+						// Uniform 404 on ANY DM read failure so an outsider cannot tell a
+						// non-existent post from a DM they may not see (never reveals the
+						// Room, participants, or messages).
+						if (!access.ok) {
+							const resp = fail(req, env, request_id, 404, 'NOT_FOUND', 'Not found');
+							resp.headers.set('Cache-Control', 'private, no-store');
+							return resp;
+						}
+						dmRead = true;
+						// Server-side 24h window: only messages newer than now-24h. Expired
+						// messages are hidden, never physically deleted.
+						dmCutoffIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+					}
+
 					// Try to get current user (optional auth for liked_by_me)
 					let current_user_id: string | null = null;
 					try {
@@ -5232,6 +5628,10 @@ export default {
 						.from('comments')
 						.select('id, post_id, user_id, content, parent_comment_id, author_id, author_name, author_avatar, created_at')
 						.eq('post_id', post_id);
+					// DM messages: apply the 24h window BEFORE pagination (AND-combined).
+					if (dmCutoffIso) {
+						commentsQuery = commentsQuery.gt('created_at', dmCutoffIso);
+					}
 					if (cursor) {
 						commentsQuery = commentsQuery.or(
 							`created_at.gt.${cursor.created_at},and(created_at.eq.${cursor.created_at},id.gt.${cursor.id})`,
@@ -5251,7 +5651,9 @@ export default {
 							`[perf] /api/comments`,
 							JSON.stringify({ rid: request_id, select_ms: selectMs, rows: 0, total_ms: totalMs, empty: true }),
 						);
-						return ok(req, env, request_id, { items: [], next_cursor: null });
+						const emptyResp = ok(req, env, request_id, { items: [], next_cursor: null });
+						if (dmRead) emptyResp.headers.set('Cache-Control', 'private, no-store');
+						return emptyResp;
 					}
 
 					const commentIds = commentList.map((c: any) => c.id);
@@ -5365,7 +5767,10 @@ export default {
 							total_ms: totalMs,
 						}),
 					);
-					return ok(req, env, request_id, { items: enrichedComments, next_cursor });
+					const listResp = ok(req, env, request_id, { items: enrichedComments, next_cursor });
+					// DM message reads are private per-user — never store or share across edges.
+					if (dmRead) listResp.headers.set('Cache-Control', 'private, no-store');
+					return listResp;
 				}
 
 				// /api/comments (POST) -> { post_id, content, author_id, author_name, author_avatar, media? }
@@ -5382,6 +5787,65 @@ export default {
 
 					if (!post_id) {
 						throw new HttpError(422, 'VALIDATION_ERROR', 'post_id required');
+					}
+
+					// ── DM message send branch (Phase 3) ────────────────────────────
+					// Gated on source_persona_author_id: ordinary comments never send it,
+					// so the normal path below runs with ZERO added work. A DM client
+					// always sends it. (If the param is sent for an ordinary post it is
+					// ignored and the normal path runs unchanged; if it is sent for a DM
+					// post without valid access, we reject here — and even omitting it on
+					// a DM post is still blocked downstream by the room-membership gate.)
+					const dm_source_persona = typeof body?.source_persona_author_id === 'string' ? body.source_persona_author_id.trim() : '';
+					if (dm_source_persona && (await isDmSystemPostId(env, post_id))) {
+						const dmFailSend = (status: number, code: string, message: string) => {
+							const r = fail(req, env, request_id, status, code, message);
+							r.headers.set('Cache-Control', 'private, no-store');
+							return r;
+						};
+
+						const access = await verifyDmRoomCommentAccess(req, env, ctx, post_id, dm_source_persona);
+						if (!access.ok) return dmFailSend(access.status, access.code, access.message);
+
+						// Text-only: reject media and replies; reject blank content.
+						if (mediaInput.length > 0) return dmFailSend(400, 'BAD_REQUEST', 'Media is not supported in direct messages');
+						if (parent_comment_id != null) return dmFailSend(400, 'BAD_REQUEST', 'Replies are not supported in direct messages');
+						if (!content) return dmFailSend(400, 'BAD_REQUEST', 'Message must have text');
+						const LIMIT_DM_COMMENT = 600; // matches ordinary comment text limit
+						if (content.length > LIMIT_DM_COMMENT) return dmFailSend(400, 'TEXT_TOO_LONG', `Max ${LIMIT_DM_COMMENT} characters`);
+
+						// Resolve the sending Persona's display identity SERVER-SIDE.
+						// Client-supplied author_name/author_avatar are never trusted for DM.
+						const { data: dmProf } = await sb(env)
+							.from('user_profiles')
+							.select('display_name, avatar')
+							.eq('user_id', access.source)
+							.maybeSingle();
+
+						// Insert as an ordinary comments row. Identity:
+						//   user_id   = authenticated technical account/device id (caller)
+						//   author_id = verified source Persona author_id (the sender)
+						const { data: dmData, error: dmErr } = await sb(env)
+							.from('comments')
+							.insert({
+								post_id,
+								user_id: access.userId,
+								content,
+								parent_comment_id: null,
+								author_id: access.source,
+								author_name: (dmProf as any)?.display_name ?? null,
+								author_avatar: (dmProf as any)?.avatar ?? null,
+							} as any)
+							.select('*')
+							.single();
+						if (dmErr) return dmFailSend(500, 'DB_ERROR', 'Unexpected error');
+
+						// DM sends produce NONE of the normal side effects: no comment media,
+						// no notifications, no last_activity_at bump, no Wire/Main/feed activity,
+						// no previews/counters, no video processing.
+						const resp = ok(req, env, request_id, { comment: { ...(dmData as any), media: [] } }, 201);
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
 					}
 
 					// Require either content OR media
@@ -5705,6 +6169,16 @@ export default {
 
 						if (!Number.isFinite(comment_id)) {
 							throw new HttpError(400, 'BAD_REQUEST', 'invalid comment_id');
+						}
+
+						// DM messages do not support likes (Phase 3). Resolve the comment's
+						// host post and reject like/unlike on DM messages with a generic 404
+						// so DM existence is never revealed through the like endpoint.
+						{
+							const { data: likeTarget } = await sb(env).from('comments').select('post_id').eq('id', comment_id).maybeSingle();
+							if (likeTarget && (await isDmSystemPostId(env, Number((likeTarget as any).post_id)))) {
+								throw new HttpError(404, 'NOT_FOUND', 'Comment not found');
+							}
 						}
 
 						// POST = ensure liked (idempotent)
@@ -7268,6 +7742,195 @@ export default {
 					);
 
 					return response;
+				}
+
+				// =====================================================
+				// DM-as-a-Room API (Phase 2): resolve-or-create a DM Room
+				// =====================================================
+
+				// POST /api/dm/open — authenticated resolve-or-create for a two-Persona DM.
+				// Idempotent: the first valid call from EITHER direction creates the single
+				// DM Room + its single canonical system post; every later call returns the
+				// SAME { room_id, post_id }. Access is defined solely by the canonical
+				// Persona pair (mutual Echo + no block + source ownership) — never by
+				// account, device, or room membership. All responses AND errors are
+				// `Cache-Control: private, no-store` and never expose canonical pair fields,
+				// technical owner, account linkage, block direction, or system-post content.
+				if (path === '/api/dm/open' && req.method === 'POST') {
+					// Local wrapper so EVERY exit (success or error) carries private no-store
+					// and a structured error body (raw Supabase/SQL errors are never surfaced).
+					const dmFail = (status: number, code: string, message: string) => {
+						const resp = fail(req, env, request_id, status, code, message);
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					};
+
+					try {
+						const body = (await req.json().catch(() => null)) as any;
+						const sourcePersona = body?.source_persona_author_id;
+						const targetPersona = body?.target_persona_author_id;
+
+						// Full authorization: auth → source ownership → target exists →
+						// current mutual Echo → not blocked. Returns the normalized pair +
+						// target summary, or a structured failure.
+						const access = await verifyDmPairAccess(req, env, ctx, sourcePersona, targetPersona);
+						if (!access.ok) {
+							return dmFail(access.status, access.code, access.message);
+						}
+						const { userId, personaLo, personaHi, otherUser } = access;
+
+						// ── Resolve-or-create the DM Room ────────────────────────────────
+						// The partial unique index on (dm_persona_lo, dm_persona_hi) WHERE
+						// room_type='dm' (Phase 1) is the authoritative serialization point:
+						// exactly one INSERT can win for a given canonical pair.
+						let roomId: string | null = null;
+						let created = false;
+
+						const { data: existingRoom, error: findErr } = await sb(env)
+							.from('rooms')
+							.select('id')
+							.eq('room_type', DM_ROOM_TYPE)
+							.eq('dm_persona_lo', personaLo)
+							.eq('dm_persona_hi', personaHi)
+							.maybeSingle();
+						if (findErr) return dmFail(500, 'DB_ERROR', 'Unexpected error');
+
+						if (existingRoom) {
+							roomId = (existingRoom as any).id;
+						} else {
+							// Create the DM Room with NO generic side effects: no room_members,
+							// no invites, no notifications, no RoomFeed/activity, no user-facing
+							// design. Technical owner_id = creator (schema requires NOT NULL) but
+							// it does NOT govern DM access — the Persona pair does.
+							const { data: newRoom, error: insErr } = await sb(env)
+								.from('rooms')
+								.insert({
+									name: 'Direct Message',
+									owner_id: userId,
+									visibility: 'private_invite_only',
+									read_policy: 'members_only',
+									post_policy: 'members_only',
+									room_type: DM_ROOM_TYPE,
+									dm_persona_lo: personaLo,
+									dm_persona_hi: personaHi,
+								} as any)
+								.select('id')
+								.maybeSingle();
+
+							if (insErr) {
+								// Concurrent first-open race: the partial unique index rejected our
+								// INSERT because the other direction won. Reselect the winner's Room.
+								if ((insErr as any).code === '23505') {
+									const { data: raceRoom, error: raceErr } = await sb(env)
+										.from('rooms')
+										.select('id')
+										.eq('room_type', DM_ROOM_TYPE)
+										.eq('dm_persona_lo', personaLo)
+										.eq('dm_persona_hi', personaHi)
+										.maybeSingle();
+									if (raceErr || !raceRoom) return dmFail(500, 'DB_ERROR', 'Unexpected error');
+									roomId = (raceRoom as any).id;
+								} else {
+									return dmFail(500, 'DB_ERROR', 'Unexpected error');
+								}
+							} else if (newRoom) {
+								roomId = (newRoom as any).id;
+								created = true;
+								// Purge the DM exclusion-set cache so the new Room's posts can never
+								// leak on a public surface during the short getDmRoomIds TTL window.
+								ctx.waitUntil(
+									caches.default
+										.delete(new Request('https://cache.internal/dm-room-ids/v1', { method: 'GET' }))
+										.catch(() => {}),
+								);
+							} else {
+								return dmFail(500, 'DB_ERROR', 'Unexpected error');
+							}
+						}
+
+						if (!roomId) return dmFail(500, 'DB_ERROR', 'Unexpected error');
+
+						// ── Ensure EXACTLY ONE canonical system post ─────────────────────
+						// Look up the DM Room's system post (post_type='dm_system'). Only the
+						// Room-creation winner reaches the insert on the normal path; the
+						// recovery path (Room created but its post insert previously failed)
+						// re-selects deterministically. The partial unique index
+						// posts(room_id) WHERE post_type='dm_system' (sql/dm_system_post.sql)
+						// hard-guarantees at most one even under a partial-failure retry race;
+						// selecting the lowest id keeps a stable answer if the index is absent.
+						let postId: number | null = null;
+						const { data: sysRows, error: selErr } = await sb(env)
+							.from('posts')
+							.select('id')
+							.eq('room_id', roomId)
+							.eq('post_type', DM_SYSTEM_POST_TYPE)
+							.order('id', { ascending: true })
+							.limit(1);
+						if (selErr) return dmFail(500, 'DB_ERROR', 'Unexpected error');
+
+						if (sysRows && sysRows.length > 0) {
+							postId = (sysRows[0] as any).id;
+						} else {
+							// Create the single internal host post. No user-facing content, never
+							// in any feed, dedicated post_type so it can never render as an
+							// ordinary post or emit normal post notifications/feed activity.
+							const { data: newPost, error: postErr } = await sb(env)
+								.from('posts')
+								.insert({
+									user_id: userId,
+									author_id: null,
+									content: '',
+									title: null,
+									room_id: roomId,
+									parent_post_id: null,
+									post_type: DM_SYSTEM_POST_TYPE,
+									mode: 'Discuss',
+									show_in_feed: false,
+								} as any)
+								.select('id')
+								.maybeSingle();
+
+							if (postErr) {
+								// Unique-index race (index present) or transient failure: reselect.
+								const { data: raceRows } = await sb(env)
+									.from('posts')
+									.select('id')
+									.eq('room_id', roomId)
+									.eq('post_type', DM_SYSTEM_POST_TYPE)
+									.order('id', { ascending: true })
+									.limit(1);
+								if (raceRows && raceRows.length > 0) postId = (raceRows[0] as any).id;
+								else return dmFail(500, 'DB_ERROR', 'Unexpected error');
+							} else if (newPost) {
+								postId = (newPost as any).id;
+							} else {
+								return dmFail(500, 'DB_ERROR', 'Unexpected error');
+							}
+
+							// Root post → root_post_id = own id, so the Phase 3 comment stream
+							// (which threads by root_post_id) resolves correctly. Fire-and-forget.
+							if (postId) {
+								const pid = postId;
+								ctx.waitUntil(
+									Promise.resolve((sb(env).from('posts') as any).update({ root_post_id: pid }).eq('id', pid)).catch(() => {}),
+								);
+							}
+						}
+
+						if (!postId) return dmFail(500, 'DB_ERROR', 'Unexpected error');
+
+						const resp = ok(req, env, request_id, {
+							room_id: roomId,
+							post_id: postId,
+							created,
+							other_user: otherUser,
+						});
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					} catch {
+						// Never leak raw Supabase/SQL error text.
+						return dmFail(500, 'DB_ERROR', 'Unexpected error');
+					}
 				}
 
 				// =====================================================
@@ -10197,6 +10860,38 @@ export default {
 				// ROOMS API
 				// ═══════════════════════════════════════════
 
+				// ── DM Room isolation guard (Phase 1) ────────────────────────────────
+				// DM Rooms (room_type='dm') are managed ONLY by the dedicated DM lifecycle
+				// (Phase 2). No generic Room endpoint may read or mutate them. This guard
+				// intercepts every `/api/rooms/:id` and `/api/rooms/:id/<subpath>` route
+				// (join, join_by_invite, leave, kick, members, invite, invite/new,
+				// invite/revoke, avatar-choice, links, catalog, PATCH, DELETE, …) and
+				// returns a NEUTRAL 404 for DM Rooms so callers cannot probe a DM Room's
+				// existence, its Persona pair, its technical owner, its metadata, or the
+				// posts inside it. Two intentional exclusions:
+				//   • the bare `GET /api/rooms/:id` (room detail) is checked inline in its
+				//     handler against the row it already fetches — avoids an extra query on
+				//     that hot path;
+				//   • the `lookup` / `mine` pseudo-routes are handled inside their own
+				//     handlers (they are not room IDs).
+				// A direct (uncached) room_type read is used here so freshly-created DM
+				// Rooms cannot be mutated during any cache TTL window. These are cold
+				// paths, so the extra lookup is acceptable.
+				{
+					const dmGuardMatch = path.match(/^\/api\/rooms\/([^/]+)(\/[^?]*)?$/);
+					if (dmGuardMatch) {
+						const guardRoomId = dmGuardMatch[1];
+						const guardHasSubpath = !!dmGuardMatch[2];
+						const guardIsBareGet = !guardHasSubpath && req.method === 'GET';
+						if (guardRoomId !== 'lookup' && guardRoomId !== 'mine' && !guardIsBareGet) {
+							const { data: dmGuardRow } = await sb(env).from('rooms').select('room_type').eq('id', guardRoomId).maybeSingle();
+							if ((dmGuardRow as any)?.room_type === DM_ROOM_TYPE) {
+								throw new HttpError(404, 'NOT_FOUND', 'Room not found');
+							}
+						}
+					}
+				}
+
 				// GET /api/rooms — list public rooms, or rooms by owner_id
 				if (path === '/api/rooms' && req.method === 'GET') {
 					const tListTotal = performance.now();
@@ -10261,6 +10956,13 @@ export default {
 						q = q.or('room_type.is.null,room_type.neq.catalog');
 					}
 
+					// ── DM Rooms are never listed on ANY /api/rooms branch ──────────────
+					// Applied to owner_id=me, explicit owner_id, AND the public listing so
+					// that neither the technical owner, sibling-account Personas, nor the
+					// public can ever discover a DM Room here. NULL room_type is preserved
+					// (legacy rooms), matching the Catalog exclusion style above.
+					q = q.or(`room_type.is.null,room_type.neq.${DM_ROOM_TYPE}`);
+
 					const paramsMs = performance.now() - tListTotal;
 
 					const tDbRooms = performance.now();
@@ -10322,7 +11024,7 @@ export default {
 					if (!key) throw new HttpError(400, 'VALIDATION_ERROR', 'key is required');
 					const { data, error } = await sb(env)
 						.from('rooms')
-						.select('id,room_key,name,description,icon_key')
+						.select('id,room_key,name,description,icon_key,room_type')
 						.eq('room_key', key)
 						.maybeSingle();
 					if (error) {
@@ -10333,6 +11035,13 @@ export default {
 						console.log('[ROOM_LOOKUP] not_found', { key });
 						throw new HttpError(404, 'NOT_FOUND', 'Room not found');
 					}
+					// DM Rooms are never discoverable by room_key — neutral 404.
+					if ((data as any).room_type === DM_ROOM_TYPE) {
+						console.log('[ROOM_LOOKUP] not_found_dm', { key });
+						throw new HttpError(404, 'NOT_FOUND', 'Room not found');
+					}
+					// room_type was selected only for the DM guard; do not leak it in the response.
+					delete (data as any).room_type;
 					console.log('[ROOM_LOOKUP] found', { id: (data as any).id, room_key: (data as any).room_key, name: (data as any).name });
 					return ok(req, env, request_id, { room: data });
 				}
@@ -10396,6 +11105,10 @@ export default {
 
 					for (const m of (memberships || []) as any[]) {
 						if (!m.rooms) continue; // room was deleted
+						// DM Rooms never appear in a user's Room list, even if a membership row
+						// exists. This also prevents a sibling-account Persona from discovering
+						// a DM Room via account-wide membership expansion above.
+						if (m.rooms.room_type === DM_ROOM_TYPE) continue;
 						const roomId = m.rooms.id;
 						const existing = bestByRoomId.get(roomId);
 						const mRank = ROLE_RANK[m.role] ?? 0;
@@ -10493,6 +11206,16 @@ export default {
 										.catch((err: any) => console.warn(`[perf] /api/rooms/:id cache put failed rid=${request_id}`, err)),
 								);
 							}
+						}
+
+						// ── DM Room direct-access guard (inline, no extra query) ──────────
+						// The `room` row is already resolved (from edge cache or DB) above, so
+						// the DM check is free here. A DM Room must never be revealed through
+						// generic room detail — return a neutral 404 so callers cannot inspect
+						// its existence, Persona pair, owner, or metadata. Covers all fast
+						// paths (design/membership) and the full path below.
+						if ((room as any)?.room_type === DM_ROOM_TYPE) {
+							throw new HttpError(404, 'NOT_FOUND', 'Room not found');
 						}
 
 						// ── Fast-path: ?fields=design ──────────────────────────────────
@@ -10899,6 +11622,14 @@ export default {
 						typeof design.detailReplyBadgeGlassEnabled === 'boolean' ? design.detailReplyBadgeGlassEnabled : null;
 
 					// ── Room content type (top-level, not inside design) ──
+					// DM Rooms are NOT creatable through the generic Room-create endpoint;
+					// they are provisioned exclusively by the DM lifecycle (Phase 2). Reject
+					// explicitly so the attempt fails loudly rather than being silently
+					// coerced to a 'post' Room. DM_ROOM_TYPE is intentionally excluded from
+					// VALID_ROOM_TYPES.
+					if (body?.room_type === DM_ROOM_TYPE) {
+						throw new HttpError(403, 'FORBIDDEN', 'DM Rooms cannot be created through this endpoint');
+					}
 					const VALID_ROOM_TYPES = ['post', 'thread', CATALOG_ROOM_TYPE];
 					const VALID_CARD_STYLES = ['standard', 'teran', 'social'];
 					const VALID_SOCIAL_REPLY_MODES = ['x', 'reddit'];
@@ -11575,6 +12306,13 @@ export default {
 							updates.detail_reply_badge_glass_enabled = design.detail_reply_badge_glass_enabled;
 
 						// ── Room content type (top-level fields) ──
+						// A room can never be converted INTO a DM Room via generic update
+						// (and the DM guard above already blocks PATCH on an existing DM Room).
+						// Reject explicitly rather than silently ignoring. DM_ROOM_TYPE is
+						// intentionally excluded from VALID_ROOM_TYPES.
+						if (body?.room_type === DM_ROOM_TYPE) {
+							throw new HttpError(403, 'FORBIDDEN', 'Rooms cannot be converted to DM Rooms');
+						}
 						const VALID_ROOM_TYPES = ['post', 'thread', CATALOG_ROOM_TYPE];
 						const VALID_CARD_STYLES = ['standard', 'teran', 'social'];
 						const VALID_SOCIAL_REPLY_MODES = ['x', 'reddit'];
