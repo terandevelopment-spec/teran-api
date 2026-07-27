@@ -68,6 +68,12 @@ CREATE INDEX IF NOT EXISTS echoes_outgoing_idx ON public.echoes (echoer_author_i
 
 COMMIT;
 
+-- 8) Force PostgREST (Supabase REST layer used by the Worker) to reload its schema
+--    cache so `echoer_author_id` is recognized immediately. Without this the Worker
+--    can keep returning "Could not find the 'echoer_author_id' column ... in the
+--    schema cache" until the cache refreshes on its own.
+NOTIFY pgrst, 'reload schema';
+
 -- Report: number of legacy rows that could not be attributed to a source Persona.
 -- Run AFTER the migration; expected 0 on reruns (rows were discarded in step 2).
 -- SELECT COUNT(*) AS remaining_unattributed FROM public.echoes WHERE echoer_author_id IS NULL;
