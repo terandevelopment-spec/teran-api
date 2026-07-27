@@ -7577,6 +7577,178 @@ export default {
 					return resp;
 				}
 
+				// GET /api/dm/mutuals?persona_author_id=<active Persona>&limit=&cursor=
+				// Private, authenticated, OWNER-ONLY foundation for the future lightweight DM
+				// feature. Returns every Persona with a MUTUAL Echo relationship with the active
+				// Persona (active → other AND other → active). Read-only. Returns only public
+				// profile-summary fields plus mutual_since — NEVER account/device IDs, ownership
+				// records, or any conversation/message/unread data (none exists yet).
+				if (path === '/api/dm/mutuals' && req.method === 'GET') {
+					const handlerStart = Date.now();
+
+					// Authenticated account/device identity (JWT sub). NEVER accepted from the client.
+					const authedAccountId = await requireAuth(req, env);
+
+					// Active SOURCE Persona. UNTRUSTED input — ownership is verified below.
+					const persona_author_id = (url.searchParams.get('persona_author_id') || '').trim();
+					if (!persona_author_id) {
+						throw new HttpError(400, 'BAD_REQUEST', 'persona_author_id is required');
+					}
+					// Ownership: the caller may read mutuals ONLY for its own Personas. This is the
+					// security boundary — a sibling Persona or another account cannot be spoofed via
+					// the query parameter.
+					if (!(await verifyPersonaOwnership(env, ctx, authedAccountId, persona_author_id))) {
+						throw new HttpError(403, 'FORBIDDEN', 'You do not own this persona');
+					}
+
+					const limitParam = parseInt(url.searchParams.get('limit') || '30', 10);
+					const limit = Math.min(50, Math.max(1, Number.isFinite(limitParam) ? limitParam : 30));
+					// Cursor encodes "<mutual_since_iso>|<author_id>" of the last returned row.
+					const cursor = (url.searchParams.get('cursor') || '').trim() || null;
+
+					// Two bounded server-side scans (never client-side). SCAN_CAP bounds the Echo
+					// read so a Persona with a very large Echo graph never triggers an unbounded scan.
+					const SCAN_CAP = 1000;
+					const [outRes, inRes] = await Promise.all([
+						// Outgoing: Personas the active Persona echoes.
+						sb(env)
+							.from('echoes')
+							.select('echoed_user_id, created_at')
+							.eq('echoer_author_id', persona_author_id)
+							.order('created_at', { ascending: false })
+							.limit(SCAN_CAP),
+						// Incoming: Personas that echo the active Persona.
+						sb(env)
+							.from('echoes')
+							.select('echoer_author_id, created_at')
+							.eq('echoed_user_id', persona_author_id)
+							.order('created_at', { ascending: false })
+							.limit(SCAN_CAP),
+					]);
+					if (outRes.error) throw outRes.error;
+					if (inRes.error) throw inRes.error;
+
+					const outgoing = (outRes.data ?? []) as Array<{ echoed_user_id: string; created_at: string }>;
+					const incoming = (inRes.data ?? []) as Array<{ echoer_author_id: string; created_at: string }>;
+
+					// Incoming direction map: other Persona → timestamp of THEIR echo to me.
+					const incomingAt = new Map<string, string>();
+					for (const r of incoming) {
+						if (!incomingAt.has(r.echoer_author_id)) incomingAt.set(r.echoer_author_id, r.created_at);
+					}
+
+					// Server-side intersection. A mutual exists only when BOTH directional Echoes
+					// exist; mutual_since = the LATER of the two timestamps (mutual access begins
+					// only once the second Echo is created).
+					const mutualsMap = new Map<string, { author_id: string; mutual_since: string }>();
+					for (const r of outgoing) {
+						const other = r.echoed_user_id;
+						if (other === persona_author_id) continue; // defensive (DB CHECK prevents self)
+						const inAt = incomingAt.get(other);
+						if (!inAt) continue;
+						const mutual_since = r.created_at > inAt ? r.created_at : inAt;
+						const existing = mutualsMap.get(other);
+						if (!existing || mutual_since > existing.mutual_since) {
+							mutualsMap.set(other, { author_id: other, mutual_since });
+						}
+					}
+					let mutuals = Array.from(mutualsMap.values());
+
+					// Block exclusion (batch, no N+1). Mirrors GET /api/blocks/relations: the caller's
+					// account/device identity vs the other Persona author_ids, both directions. A
+					// blocked pair must never surface as a usable DM relationship even when mutual.
+					// LIMITATION: the blocks table stores the caller side as an account/device identity
+					// (blocker_user_id = JWT sub); a fully Persona-scoped REVERSE block cannot be
+					// resolved from the other Persona's author_id alone in this phase. DM send
+					// authorization will independently re-check blocks in a later phase.
+					if (mutuals.length > 0) {
+						const otherIds = mutuals.map((m) => m.author_id);
+						const [b1, b2] = await Promise.all([
+							sb(env).from('blocks').select('blocked_user_id').eq('blocker_user_id', authedAccountId).in('blocked_user_id', otherIds),
+							sb(env).from('blocks').select('blocker_user_id').eq('blocked_user_id', authedAccountId).in('blocker_user_id', otherIds),
+						]);
+						if (b1.error) throw b1.error;
+						if (b2.error) throw b2.error;
+						const blocked = new Set<string>();
+						for (const r of b1.data ?? []) blocked.add((r as any).blocked_user_id);
+						for (const r of b2.data ?? []) blocked.add((r as any).blocker_user_id);
+						if (blocked.size > 0) mutuals = mutuals.filter((m) => !blocked.has(m.author_id));
+					}
+
+					// Batch-resolve profile summaries in ONE query (no N+1). Relationships whose other
+					// Persona no longer resolves (deleted/unavailable) are excluded from BOTH the rows
+					// and the count, so the count can never include a Persona the list cannot show.
+					let resolved: Array<{
+						author_id: string;
+						display_name: string;
+						avatar: string | null;
+						teran_id: string | null;
+						mutual_since: string;
+					}> = [];
+					if (mutuals.length > 0) {
+						const ids = mutuals.map((m) => m.author_id);
+						const { data: profs, error: pErr } = await sb(env)
+							.from('user_profiles')
+							.select('user_id, display_name, avatar, teran_id')
+							.in('user_id', ids);
+						if (pErr) throw pErr;
+						const profileMap = new Map((profs ?? []).map((p: any) => [p.user_id, p]));
+						resolved = mutuals
+							.filter((m) => profileMap.has(m.author_id))
+							.map((m) => {
+								const p: any = profileMap.get(m.author_id);
+								return {
+									author_id: m.author_id, // exact OTHER Persona author_id
+									display_name: p?.display_name || 'Anonymous',
+									avatar: p?.avatar || null, // raw avatar key/url (UI normalizes, as elsewhere)
+									teran_id: p?.teran_id ?? null,
+									mutual_since: m.mutual_since,
+								};
+							});
+					}
+
+					// Stable ordering: mutual_since DESC, then author_id ASC (deterministic tie-break).
+					resolved.sort((a, b) => {
+						if (a.mutual_since !== b.mutual_since) return a.mutual_since < b.mutual_since ? 1 : -1;
+						return a.author_id < b.author_id ? -1 : a.author_id > b.author_id ? 1 : 0;
+					});
+
+					// Complete valid mutual count (after block + profile-validity filtering), page-independent.
+					const count = resolved.length;
+
+					// Cursor pagination over the stable ordering. The next page starts at the first row
+					// strictly AFTER the cursor row under (mutual_since DESC, author_id ASC).
+					let startIdx = 0;
+					if (cursor) {
+						const sep = cursor.lastIndexOf('|');
+						if (sep === -1) {
+							throw new HttpError(400, 'BAD_REQUEST', 'Invalid cursor');
+						}
+						const cSince = cursor.slice(0, sep);
+						const cAuthor = cursor.slice(sep + 1);
+						const idx = resolved.findIndex(
+							(r) => r.mutual_since < cSince || (r.mutual_since === cSince && r.author_id > cAuthor),
+						);
+						startIdx = idx === -1 ? resolved.length : idx;
+					}
+					const page = resolved.slice(startIdx, startIdx + limit);
+					const next_cursor =
+						startIdx + page.length < resolved.length && page.length > 0
+							? `${page[page.length - 1].mutual_since}|${page[page.length - 1].author_id}`
+							: null;
+
+					console.log(`[perf] /api/dm/mutuals rid=${request_id} t=${Date.now() - handlerStart}ms`, {
+						scanned_out: outgoing.length,
+						scanned_in: incoming.length,
+						mutual: count,
+						returned: page.length,
+					});
+
+					const resp = ok(req, env, request_id, { users: page, count, next_cursor });
+					resp.headers.set('Cache-Control', 'private, no-store');
+					return resp;
+				}
+
 				// GET /api/echoes/incoming_counts?user_ids=a,b,c — How many users echo each target
 				if (path === '/api/echoes/incoming_counts' && req.method === 'GET') {
 					const handlerStart = Date.now();
