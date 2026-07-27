@@ -7286,6 +7286,172 @@ export default {
 					return !error && (count ?? 0) > 0;
 				}
 
+				// ═════════════════════════════════════════════════════════════════
+				// Shared DM (Persona-to-Persona direct message) helpers
+				// Every private DM action is gated by: authenticated account + owned
+				// source Persona + valid other Persona + mutual Echo + no block. All
+				// participants are Persona author_ids (never account/device IDs).
+				// ═════════════════════════════════════════════════════════════════
+
+				// Canonical lexicographic Persona pair. Guarantees A↔B resolve to one row.
+				function normalizePersonaPair(a: string, b: string): { personaLo: string; personaHi: string } {
+					const x = typeof a === 'string' ? a.trim() : '';
+					const y = typeof b === 'string' ? b.trim() : '';
+					if (!x || !y) throw new HttpError(400, 'BAD_REQUEST', 'Both Persona author_ids are required');
+					if (x === y) throw new HttpError(400, 'BAD_REQUEST', 'A Persona cannot DM itself');
+					return x < y ? { personaLo: x, personaHi: y } : { personaLo: y, personaHi: x };
+				}
+
+				// Mutual Echo: BOTH directional Persona-to-Persona rows must exist. Uses only
+				// echoer_author_id/echoed_user_id — never echoes.user_id or account/device IDs.
+				async function checkMutualEcho(source: string, other: string): Promise<boolean> {
+					const [outRes, inRes] = await Promise.all([
+						sb(env).from('echoes').select('id', { count: 'exact', head: true }).eq('echoer_author_id', source).eq('echoed_user_id', other).limit(1),
+						sb(env).from('echoes').select('id', { count: 'exact', head: true }).eq('echoer_author_id', other).eq('echoed_user_id', source).limit(1),
+					]);
+					if (outRes.error) throw outRes.error;
+					if (inRes.error) throw inRes.error;
+					return (outRes.count ?? 0) > 0 && (inRes.count ?? 0) > 0;
+				}
+
+				// Read-only canonical conversation lookup. NEVER creates a conversation.
+				async function resolveDmConversation(
+					source: string,
+					other: string,
+				): Promise<{ id: number; persona_lo: string; persona_hi: string; last_message_at: string | null } | null> {
+					const { personaLo, personaHi } = normalizePersonaPair(source, other);
+					const { data, error } = await sb(env)
+						.from('dm_conversations')
+						.select('id, persona_lo, persona_hi, last_message_at')
+						.eq('persona_lo', personaLo)
+						.eq('persona_hi', personaHi)
+						.maybeSingle();
+					if (error) throw error;
+					return (data as any) ?? null;
+				}
+
+				// Full DM authorization gate applied on EVERY private DM action.
+				// Throws structured HttpErrors: 401 (auth), 403 (ownership/not-mutual/blocked),
+				// 404 (other Persona unavailable), 400 (missing/identical IDs).
+				async function verifyDmPersonaAccess(source: string, other: string): Promise<{ authedAccountId: string }> {
+					const authedAccountId = await requireAuth(req, env);
+					normalizePersonaPair(source, other); // 400 on missing/identical
+					if (!(await verifyPersonaOwnership(env, ctx, authedAccountId, source))) {
+						throw new HttpError(403, 'FORBIDDEN', 'You do not own this persona');
+					}
+					const { data: prof, error: perr } = await sb(env).from('user_profiles').select('user_id').eq('user_id', other).maybeSingle();
+					if (perr) throw perr;
+					if (!prof) throw new HttpError(404, 'NOT_FOUND', 'Persona not available');
+					if (!(await checkMutualEcho(source, other))) {
+						throw new HttpError(403, 'NOT_MUTUAL', 'No mutual Echo relationship with this Persona');
+					}
+					// Block enforcement reuses the existing account/device↔Persona helper (same
+					// mapping as POST /api/echoes). A blocked pair is never DM-capable.
+					if (await isMutuallyBlocked(authedAccountId, other)) {
+						throw new HttpError(403, 'BLOCKED', 'Cannot DM a blocked Persona');
+					}
+					return { authedAccountId };
+				}
+
+				// Lazily resolve or create the canonical conversation for a valid send.
+				// Race-safe via the UNIQUE (persona_lo, persona_hi) constraint.
+				async function resolveOrCreateDmConversation(source: string, other: string): Promise<number> {
+					const { personaLo, personaHi } = normalizePersonaPair(source, other);
+					const existing = await sb(env).from('dm_conversations').select('id').eq('persona_lo', personaLo).eq('persona_hi', personaHi).maybeSingle();
+					if (existing.error) throw existing.error;
+					if (existing.data) return (existing.data as any).id;
+					const ins = await sb(env)
+						.from('dm_conversations')
+						.upsert({ persona_lo: personaLo, persona_hi: personaHi }, { onConflict: 'persona_lo,persona_hi', ignoreDuplicates: true })
+						.select('id');
+					if (ins.error) throw ins.error;
+					if (ins.data && ins.data.length > 0) return (ins.data as any)[0].id;
+					// A concurrent first send won the race — re-select the now-existing row.
+					const again = await sb(env).from('dm_conversations').select('id').eq('persona_lo', personaLo).eq('persona_hi', personaHi).maybeSingle();
+					if (again.error) throw again.error;
+					if (!again.data) throw new HttpError(500, 'INTERNAL_ERROR', 'Failed to resolve conversation');
+					return (again.data as any).id;
+				}
+
+				// Best-effort per-source-Persona send throttle (KV, non-atomic; Cloudflare edge
+				// limits remain the outer protection). 20 sends / rolling minute.
+				async function dmSendWithinRateLimit(sourcePersona: string): Promise<boolean> {
+					const windowMin = Math.floor(Date.now() / 60000);
+					const key = `dm-send:${sourcePersona}:${windowMin}`;
+					const raw = await env.UNREAD_KV.get(key).catch(() => null);
+					const count = raw ? parseInt(raw, 10) || 0 : 0;
+					if (count >= 20) return false;
+					ctx.waitUntil(env.UNREAD_KV.put(key, String(count + 1), { expirationTtl: 120 }).catch(() => {}));
+					return true;
+				}
+
+				// DM responses are private relationship data: always private/no-store and never
+				// leak raw SQL/Supabase details to the client.
+				function dmResponse(data: any, status = 200): Response {
+					return new Response(JSON.stringify({ ...data, request_id }), {
+						status,
+						headers: { 'Content-Type': 'application/json', 'X-Request-Id': request_id, 'Cache-Control': 'private, no-store', ...corsHeaders(req, env) },
+					});
+				}
+				function dmError(status: number, code: string, message: string): Response {
+					return new Response(JSON.stringify({ error: { code, message }, request_id }), {
+						status,
+						headers: { 'Content-Type': 'application/json', 'X-Request-Id': request_id, 'Cache-Control': 'private, no-store', ...corsHeaders(req, env) },
+					});
+				}
+				async function runDm(fn: () => Promise<Response>): Promise<Response> {
+					try {
+						return await fn();
+					} catch (e: any) {
+						if (e instanceof HttpError) return dmError(e.status, e.code, e.message);
+						console.error('[DM_INTERNAL]', request_id, e?.message);
+						return dmError(500, 'INTERNAL_ERROR', 'Internal error');
+					}
+				}
+
+				// DM-card sort tuple + comparator: unread first, newest unexpired activity,
+				// newest mutual, author_id ASC. '' last_message_at means "no unexpired message".
+				function dmSortTuple(c: { unread_count: number; last_message_at: string | null; mutual_since: string; author_id: string }): [number, string, string, string] {
+					return [c.unread_count > 0 ? 1 : 0, c.last_message_at ?? '', c.mutual_since ?? '', c.author_id];
+				}
+				function dmTupleCmp(A: [number, string, string, string], B: [number, string, string, string]): number {
+					if (A[0] !== B[0]) return B[0] - A[0]; // unread first (1 before 0)
+					if (A[1] !== B[1]) {
+						if (A[1] === '') return 1; // NULLS LAST
+						if (B[1] === '') return -1;
+						return A[1] < B[1] ? 1 : -1; // last_message_at DESC
+					}
+					if (A[2] !== B[2]) return A[2] < B[2] ? 1 : -1; // mutual_since DESC
+					return A[3] < B[3] ? -1 : A[3] > B[3] ? 1 : 0; // author_id ASC
+				}
+				function encodeDmCardCursor(c: { unread_count: number; last_message_at: string | null; mutual_since: string; author_id: string }): string {
+					return 'v2:' + b64urlEncodeStr(JSON.stringify(dmSortTuple(c)));
+				}
+				function decodeDmCardCursor(s: string): { u: number; l: string; m: string; a: string } {
+					if (!s.startsWith('v2:')) throw new HttpError(400, 'BAD_REQUEST', 'Invalid cursor');
+					try {
+						const t = JSON.parse(new TextDecoder().decode(b64urlDecodeToBytes(s.slice(3))));
+						if (!Array.isArray(t) || t.length !== 4) throw new Error('bad');
+						return { u: t[0] ? 1 : 0, l: String(t[1] ?? ''), m: String(t[2] ?? ''), a: String(t[3] ?? '') };
+					} catch {
+						throw new HttpError(400, 'BAD_REQUEST', 'Invalid cursor');
+					}
+				}
+				// Message-history cursor (DB-descending): created_at DESC, id DESC.
+				function encodeDmMessageCursor(m: { created_at: string; id: number }): string {
+					return 'm1:' + b64urlEncodeStr(JSON.stringify([m.created_at, m.id]));
+				}
+				function decodeDmMessageCursor(s: string): { ts: string; id: number } {
+					if (!s.startsWith('m1:')) throw new HttpError(400, 'BAD_REQUEST', 'Invalid cursor');
+					try {
+						const t = JSON.parse(new TextDecoder().decode(b64urlDecodeToBytes(s.slice(3))));
+						if (!Array.isArray(t) || t.length !== 2) throw new Error('bad');
+						return { ts: String(t[0]), id: Number(t[1]) };
+					} catch {
+						throw new HttpError(400, 'BAD_REQUEST', 'Invalid cursor');
+					}
+				}
+
 				// POST /api/echoes - Echo a target Persona AS a source Persona (Persona-to-Persona)
 				if (path === '/api/echoes' && req.method === 'POST') {
 					const handlerStart = Date.now();
@@ -7707,46 +7873,282 @@ export default {
 							});
 					}
 
-					// Stable ordering: mutual_since DESC, then author_id ASC (deterministic tie-break).
-					resolved.sort((a, b) => {
-						if (a.mutual_since !== b.mutual_since) return a.mutual_since < b.mutual_since ? 1 : -1;
-						return a.author_id < b.author_id ? -1 : a.author_id > b.author_id ? 1 : 0;
+					// ── DM enrichment (batch, no N+1) ──────────────────────────────────
+					// Load every conversation involving the active Persona, plus its unexpired
+					// incoming messages and its own read state, then compute each card's
+					// conversation_id / last_message_at (newest UNEXPIRED) / private unread_count
+					// entirely server-side. The browser receives complete cards in one request.
+					const nowIso = new Date().toISOString();
+					const convByOther = new Map<string, { id: number }>();
+					{
+						const { data: convRows, error: convErr } = await sb(env)
+							.from('dm_conversations')
+							.select('id, persona_lo, persona_hi')
+							.or(`persona_lo.eq.${persona_author_id},persona_hi.eq.${persona_author_id}`);
+						if (convErr) throw convErr;
+						for (const c of (convRows ?? []) as any[]) {
+							const other = c.persona_lo === persona_author_id ? c.persona_hi : c.persona_lo;
+							convByOther.set(other, { id: c.id });
+						}
+					}
+
+					const lastMsgAtByConv = new Map<number, string>();
+					const unreadByConv = new Map<number, number>();
+					const convIds = Array.from(convByOther.values()).map((c) => c.id);
+					if (convIds.length > 0) {
+						const [msgRes, readRes] = await Promise.all([
+							sb(env)
+								.from('dm_messages')
+								.select('conversation_id, recipient_author_id, created_at')
+								.in('conversation_id', convIds)
+								.gt('expires_at', nowIso)
+								.order('created_at', { ascending: false })
+								.limit(5000),
+							sb(env).from('dm_reads').select('conversation_id, last_opened_at').eq('persona_author_id', persona_author_id).in('conversation_id', convIds),
+						]);
+						if (msgRes.error) throw msgRes.error;
+						if (readRes.error) throw readRes.error;
+
+						const lastOpenedByConv = new Map<number, string>();
+						for (const r of (readRes.data ?? []) as any[]) lastOpenedByConv.set(r.conversation_id, r.last_opened_at);
+
+						for (const m of (msgRes.data ?? []) as any[]) {
+							// newest UNEXPIRED message time per conversation (dm_conversations.last_message_at
+							// is intentionally NOT trusted — it may point at an expired message).
+							const prev = lastMsgAtByConv.get(m.conversation_id);
+							if (!prev || m.created_at > prev) lastMsgAtByConv.set(m.conversation_id, m.created_at);
+							// unread = unexpired incoming to the active Persona after its last open.
+							// recipient === active implies sender === other (participant trigger).
+							if (m.recipient_author_id === persona_author_id) {
+								const lo = lastOpenedByConv.get(m.conversation_id) ?? null;
+								if (lo === null || m.created_at > lo) {
+									unreadByConv.set(m.conversation_id, (unreadByConv.get(m.conversation_id) ?? 0) + 1);
+								}
+							}
+						}
+					}
+
+					// Attach DM metadata to every mutual card. Mutual Personas WITHOUT a
+					// conversation stay visible with null/0 DM fields (relationship-driven list).
+					const cards = resolved.map((r) => {
+						const conv = convByOther.get(r.author_id) ?? null;
+						return {
+							author_id: r.author_id,
+							display_name: r.display_name,
+							avatar: r.avatar,
+							teran_id: r.teran_id,
+							mutual_since: r.mutual_since, // internal sort key (not returned)
+							conversation_id: conv ? conv.id : null,
+							last_message_at: conv ? (lastMsgAtByConv.get(conv.id) ?? null) : null,
+							unread_count: conv ? (unreadByConv.get(conv.id) ?? 0) : 0,
+						};
 					});
 
-					// Complete valid mutual count (after block + profile-validity filtering), page-independent.
-					const count = resolved.length;
+					// Sort: unread first, then newest unexpired activity, then newest mutual,
+					// then author_id ASC. No-conversation mutuals sort last.
+					cards.sort((a, b) => dmTupleCmp(dmSortTuple(a), dmSortTuple(b)));
 
-					// Cursor pagination over the stable ordering. The next page starts at the first row
-					// strictly AFTER the cursor row under (mutual_since DESC, author_id ASC).
+					// Complete valid mutual count (after block + profile-validity filtering), page-independent.
+					const count = cards.length;
+
+					// Versioned (v2) cursor over the FULL sort tuple. Phase-1 "<since>|<author>"
+					// cursors are rejected (400) rather than silently reused under the new sort.
+					// NOTE: unread_count/last_message_at are volatile, so pagination reflects the
+					// snapshot at request time; the complete `count` and bounded first page are
+					// always correct (correctness over decorative pagination).
 					let startIdx = 0;
 					if (cursor) {
-						const sep = cursor.lastIndexOf('|');
-						if (sep === -1) {
-							throw new HttpError(400, 'BAD_REQUEST', 'Invalid cursor');
-						}
-						const cSince = cursor.slice(0, sep);
-						const cAuthor = cursor.slice(sep + 1);
-						const idx = resolved.findIndex(
-							(r) => r.mutual_since < cSince || (r.mutual_since === cSince && r.author_id > cAuthor),
-						);
-						startIdx = idx === -1 ? resolved.length : idx;
+						const cur = decodeDmCardCursor(cursor); // throws 400 on non-v2/malformed
+						const curTuple: [number, string, string, string] = [cur.u, cur.l, cur.m, cur.a];
+						const idx = cards.findIndex((c) => dmTupleCmp(dmSortTuple(c), curTuple) > 0);
+						startIdx = idx === -1 ? cards.length : idx;
 					}
-					const page = resolved.slice(startIdx, startIdx + limit);
-					const next_cursor =
-						startIdx + page.length < resolved.length && page.length > 0
-							? `${page[page.length - 1].mutual_since}|${page[page.length - 1].author_id}`
-							: null;
+					const page = cards.slice(startIdx, startIdx + limit);
+					const next_cursor = startIdx + page.length < cards.length && page.length > 0 ? encodeDmCardCursor(page[page.length - 1]) : null;
+
+					// Return only the DM-card fields (mutual_since is an internal sort key, omitted).
+					const users = page.map((c) => ({
+						author_id: c.author_id,
+						display_name: c.display_name,
+						avatar: c.avatar,
+						teran_id: c.teran_id,
+						conversation_id: c.conversation_id,
+						last_message_at: c.last_message_at,
+						unread_count: c.unread_count,
+					}));
 
 					console.log(`[perf] /api/dm/mutuals rid=${request_id} t=${Date.now() - handlerStart}ms`, {
 						scanned_out: outgoing.length,
 						scanned_in: incoming.length,
 						mutual: count,
-						returned: page.length,
+						conversations: convByOther.size,
+						returned: users.length,
 					});
 
-					const resp = ok(req, env, request_id, { users: page, count, next_cursor });
+					const resp = ok(req, env, request_id, { users, count, next_cursor });
 					resp.headers.set('Cache-Control', 'private, no-store');
 					return resp;
+				}
+
+				// GET /api/dm/messages?source_persona_author_id=&other_persona_author_id=&cursor=&limit=
+				// Private one-to-one message history. READ-ONLY: never creates a conversation.
+				// Returns only UNEXPIRED messages; no read/receipt data of any kind.
+				if (path === '/api/dm/messages' && req.method === 'GET') {
+					return runDm(async () => {
+						const source = (url.searchParams.get('source_persona_author_id') || '').trim();
+						const other = (url.searchParams.get('other_persona_author_id') || '').trim();
+						// Full gate: auth + ownership + other-exists + mutual + block (throws 400/401/403/404).
+						await verifyDmPersonaAccess(source, other);
+
+						// Other Persona summary (single lookup; fields the future DM screen needs).
+						const { data: op, error: opErr } = await sb(env)
+							.from('user_profiles')
+							.select('user_id, display_name, avatar, teran_id')
+							.eq('user_id', other)
+							.maybeSingle();
+						if (opErr) throw opErr;
+						const other_user = {
+							author_id: other,
+							display_name: (op as any)?.display_name || 'Anonymous',
+							avatar: (op as any)?.avatar || null,
+							teran_id: (op as any)?.teran_id ?? null,
+						};
+
+						const conv = await resolveDmConversation(source, other);
+						if (!conv) {
+							// No conversation yet — valid empty response, never created here.
+							return dmResponse({ conversation_id: null, other_user, messages: [], next_cursor: null });
+						}
+
+						const limitParam = parseInt(url.searchParams.get('limit') || '30', 10);
+						const limit = Math.min(50, Math.max(1, Number.isFinite(limitParam) ? limitParam : 30));
+						const cursor = (url.searchParams.get('cursor') || '').trim() || null;
+						const nowIso = new Date().toISOString();
+
+						let q = sb(env)
+							.from('dm_messages')
+							.select('id, sender_author_id, recipient_author_id, body, created_at, expires_at')
+							.eq('conversation_id', conv.id)
+							.gt('expires_at', nowIso) // NEVER return expired messages
+							.order('created_at', { ascending: false })
+							.order('id', { ascending: false })
+							.limit(limit + 1);
+						if (cursor) {
+							const dec = decodeDmMessageCursor(cursor); // { ts, id } or 400
+							q = q.or(`created_at.lt.${dec.ts},and(created_at.eq.${dec.ts},id.lt.${dec.id})`);
+						}
+						const { data: rows, error: mErr } = await q;
+						if (mErr) throw mErr;
+
+						const desc = (rows ?? []) as any[];
+						const hasMore = desc.length > limit;
+						const pageDesc = hasMore ? desc.slice(0, limit) : desc;
+						const next_cursor = hasMore ? encodeDmMessageCursor(pageDesc[pageDesc.length - 1]) : null;
+
+						// Return chronological (ascending) for display; cursor stays DB-descending.
+						const messages = pageDesc
+							.slice()
+							.reverse()
+							.map((m) => ({
+								id: m.id,
+								sender_author_id: m.sender_author_id,
+								recipient_author_id: m.recipient_author_id,
+								body: m.body,
+								created_at: m.created_at,
+								expires_at: m.expires_at,
+							}));
+
+						return dmResponse({ conversation_id: conv.id, other_user, messages, next_cursor });
+					});
+				}
+
+				// POST /api/dm/messages  { source_persona_author_id, recipient_persona_author_id, body }
+				// Send a text DM. Lazily creates the canonical conversation on the first message.
+				if (path === '/api/dm/messages' && req.method === 'POST') {
+					return runDm(async () => {
+						const raw = await req.text();
+						if (raw.length > 4000) throw new HttpError(400, 'BAD_REQUEST', 'Request body too large');
+						let parsed: any = null;
+						try {
+							parsed = raw ? JSON.parse(raw) : null;
+						} catch {
+							throw new HttpError(400, 'BAD_REQUEST', 'Invalid JSON body');
+						}
+						const source = typeof parsed?.source_persona_author_id === 'string' ? parsed.source_persona_author_id.trim() : '';
+						const recipient = typeof parsed?.recipient_persona_author_id === 'string' ? parsed.recipient_persona_author_id.trim() : '';
+						const text = typeof parsed?.body === 'string' ? parsed.body.trim() : '';
+						if (!text) throw new HttpError(400, 'BAD_REQUEST', 'Message body is required');
+						if (text.length > 1000) throw new HttpError(400, 'BAD_REQUEST', 'Message exceeds 1000 characters');
+
+						// Full gate: ownership + recipient exists + mutual + block (+ 400 self/missing).
+						await verifyDmPersonaAccess(source, recipient);
+
+						// Best-effort rate limit BEFORE creating a conversation or message.
+						if (!(await dmSendWithinRateLimit(source))) {
+							throw new HttpError(429, 'RATE_LIMITED', 'Too many messages, slow down');
+						}
+
+						const conversationId = await resolveOrCreateDmConversation(source, recipient);
+
+						// created_at/expires_at are SERVER-controlled by DB triggers — the client
+						// never supplies them. Return the actual inserted, trigger-set row.
+						const ins = await sb(env)
+							.from('dm_messages')
+							.insert({ conversation_id: conversationId, sender_author_id: source, recipient_author_id: recipient, body: text })
+							.select('id, sender_author_id, recipient_author_id, body, created_at, expires_at')
+							.single();
+						if (ins.error) throw ins.error;
+						const m = ins.data as any;
+						console.log(`[dm] send rid=${request_id} conv=${conversationId} len=${text.length}`); // never log body
+						return dmResponse(
+							{
+								conversation_id: conversationId,
+								message: {
+									id: m.id,
+									sender_author_id: m.sender_author_id,
+									recipient_author_id: m.recipient_author_id,
+									body: m.body,
+									created_at: m.created_at,
+									expires_at: m.expires_at,
+								},
+							},
+							201,
+						);
+					});
+				}
+
+				// POST /api/dm/read  { source_persona_author_id, other_persona_author_id }
+				// Mark the caller's side of a conversation opened (recipient-only unread reset).
+				// Never creates a conversation and never notifies or exposes the other side.
+				if (path === '/api/dm/read' && req.method === 'POST') {
+					return runDm(async () => {
+						const raw = await req.text();
+						if (raw.length > 2000) throw new HttpError(400, 'BAD_REQUEST', 'Request body too large');
+						let parsed: any = null;
+						try {
+							parsed = raw ? JSON.parse(raw) : null;
+						} catch {
+							throw new HttpError(400, 'BAD_REQUEST', 'Invalid JSON body');
+						}
+						const source = typeof parsed?.source_persona_author_id === 'string' ? parsed.source_persona_author_id.trim() : '';
+						const other = typeof parsed?.other_persona_author_id === 'string' ? parsed.other_persona_author_id.trim() : '';
+
+						await verifyDmPersonaAccess(source, other);
+
+						const conv = await resolveDmConversation(source, other);
+						if (!conv) {
+							// Safe no-op: never create an empty conversation just to mark it opened.
+							return dmResponse({ ok: true, conversation_id: null });
+						}
+						const up = await sb(env)
+							.from('dm_reads')
+							.upsert(
+								{ conversation_id: conv.id, persona_author_id: source, last_opened_at: new Date().toISOString() },
+								{ onConflict: 'conversation_id,persona_author_id' },
+							);
+						if (up.error) throw up.error;
+						return dmResponse({ ok: true, conversation_id: conv.id });
+					});
 				}
 
 				// GET /api/echoes/incoming_counts?user_ids=a,b,c — How many users echo each target
