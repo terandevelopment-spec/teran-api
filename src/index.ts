@@ -7305,9 +7305,9 @@ export default {
 					const user_id = await requireAuth(req, env);
 					const authMs = Date.now() - handlerStart;
 
-					// Run BOTH queries in parallel (saves ~150ms)
+					// Run ALL queries in parallel (saves ~150ms)
 					const t1 = Date.now();
-					const [echoesResult, blocksResult] = await Promise.all([
+					const [echoesResult, blocksResult, incomingCountResult] = await Promise.all([
 						// Query 1: Get echoed users (minimal columns)
 						sb(env)
 							.from('echoes')
@@ -7320,6 +7320,11 @@ export default {
 							.from('blocks')
 							.select('blocker_user_id, blocked_user_id')
 							.or(`blocker_user_id.eq.${user_id},blocked_user_id.eq.${user_id}`),
+						// Query 3: Count users echoing me (private, caller-scoped only)
+						sb(env)
+							.from('echoes')
+							.select('id', { count: 'exact', head: true })
+							.eq('echoed_user_id', user_id),
 					]);
 					const dbMs = Date.now() - t1;
 					console.log(`[perf] /api/echoes rid=${request_id} auth=${authMs}ms db=${dbMs}ms`, {
@@ -7329,10 +7334,12 @@ export default {
 
 					if (echoesResult.error) throw echoesResult.error;
 
+					const incoming_count = Math.max(0, incomingCountResult.count ?? 0);
+
 					const rows = echoesResult.data ?? [];
 					if (rows.length === 0) {
 						console.log(`[perf] /api/echoes total ${Date.now() - handlerStart}ms (empty)`);
-						return ok(req, env, request_id, { echoed: [] });
+						return ok(req, env, request_id, { echoed: [], incoming_count });
 					}
 
 					// Split block results: users I blocked + users who blocked me
@@ -7353,7 +7360,7 @@ export default {
 						}));
 
 					console.log(`[perf] /api/echoes total ${Date.now() - handlerStart}ms`, { echoed: echoed.length });
-					return ok(req, env, request_id, { echoed });
+					return ok(req, env, request_id, { echoed, incoming_count });
 				}
 
 				// GET /api/echoes/relations?user_ids=a,b,c - Check which of these I echo
