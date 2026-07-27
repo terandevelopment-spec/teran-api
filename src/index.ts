@@ -391,6 +391,51 @@ async function requireAuth(req: Request, env: Env): Promise<string> {
 	return userId;
 }
 
+// Verify that `persona_author_id` belongs to the account owning `device_id`.
+// Mirrors the persona-ownership convention used by POST /api/posts:
+//   device_id → account_devices.account_id → account_personas.persona_author_id
+// Reuses the same shared KV cache keys (`acct:dev:*`, `persona:dev:*`).
+// Returns true when the persona is owned (or when the device is unclaimed and has
+// no server-side account binding — pre-claim personas are client-trusted, exactly
+// as in POST /api/posts) and false when a claimed account does not own the persona.
+async function verifyPersonaOwnership(env: Env, ctx: ExecutionContext, device_id: string, persona_author_id: string): Promise<boolean> {
+	const ACCT_CACHE_TTL = 86400; // 24h — device→account bindings are permanent
+	const PERSONA_CACHE_TTL = 3600; // 1h — persona bindings are permanent
+
+	// Resolve device → account (KV-cached, shared with /api/posts)
+	const acctKvKey = `acct:dev:${device_id}`;
+	let accountId: string | null = null;
+	const acctRaw = await env.PROFILE_KV.get(acctKvKey).catch(() => null);
+	if (acctRaw !== null) {
+		accountId = acctRaw === '__null__' ? null : acctRaw;
+	} else {
+		const { data } = await sb(env).from('account_devices').select('account_id').eq('device_id', device_id).maybeSingle();
+		accountId = (data as any)?.account_id ?? null;
+		ctx.waitUntil(env.PROFILE_KV.put(acctKvKey, accountId ?? '__null__', { expirationTtl: ACCT_CACHE_TTL }).catch(() => {}));
+	}
+
+	// Unclaimed device: no server-side account binding exists. Persona attribution
+	// is client-trusted pre-claim (identical to the POST /api/posts convention).
+	if (!accountId) return true;
+
+	// Claimed account: verify persona ownership (KV-cached, shared with /api/posts)
+	const personaKvKey = `persona:dev:${device_id}:${persona_author_id}`;
+	const personaRaw = await env.PROFILE_KV.get(personaKvKey).catch(() => null);
+	if (personaRaw === '1') return true;
+
+	const { data: binding } = await sb(env)
+		.from('account_personas')
+		.select('persona_author_id')
+		.eq('account_id', accountId)
+		.eq('persona_author_id', persona_author_id)
+		.maybeSingle();
+	if (binding) {
+		ctx.waitUntil(env.PROFILE_KV.put(personaKvKey, '1', { expirationTtl: PERSONA_CACHE_TTL }).catch(() => {}));
+		return true;
+	}
+	return false;
+}
+
 // --------- Supabase client (singleton per isolate) ----------
 let _sbClient: ReturnType<typeof createClient> | null = null;
 let _sbUrl: string | null = null;
@@ -7241,105 +7286,148 @@ export default {
 					return !error && (count ?? 0) > 0;
 				}
 
-				// POST /api/echoes - Echo a user - OPTIMIZED
+				// POST /api/echoes - Echo a target Persona AS a source Persona (Persona-to-Persona)
 				if (path === '/api/echoes' && req.method === 'POST') {
 					const handlerStart = Date.now();
 
-					let t1 = Date.now();
-					const user_id = await requireAuth(req, env);
-					console.log(`[perf] POST /api/echoes auth ${Date.now() - t1}ms`);
+					// Authenticated account/device identity (JWT sub). NEVER accepted from the client.
+					const authedAccountId = await requireAuth(req, env);
 
-					t1 = Date.now();
 					const body = (await req.json().catch(() => null)) as any;
-					const echoed_user_id = body?.user_id;
-					console.log(`[perf] POST /api/echoes parse ${Date.now() - t1}ms`);
+					// Source = the Persona performing the Echo (must be owned by the caller).
+					const sourcePersonaAuthorId = typeof body?.source_persona_author_id === 'string' ? body.source_persona_author_id.trim() : '';
+					// Target = the Persona being echoed. Accept the new field; fall back to the
+					// legacy `user_id` property for compatibility during rollout.
+					const targetPersonaAuthorId =
+						(typeof body?.target_persona_author_id === 'string' ? body.target_persona_author_id.trim() : '') ||
+						(typeof body?.user_id === 'string' ? body.user_id.trim() : '');
 
-					if (!echoed_user_id || typeof echoed_user_id !== 'string') {
-						throw new HttpError(400, 'BAD_REQUEST', 'user_id is required');
+					if (!sourcePersonaAuthorId) {
+						throw new HttpError(400, 'BAD_REQUEST', 'source_persona_author_id is required');
 					}
-					if (echoed_user_id === user_id) {
-						throw new HttpError(400, 'BAD_REQUEST', 'Cannot echo yourself');
+					if (!targetPersonaAuthorId) {
+						throw new HttpError(400, 'BAD_REQUEST', 'target_persona_author_id is required');
+					}
+					// Persona-level self-echo guard (also enforced by DB CHECK).
+					if (sourcePersonaAuthorId === targetPersonaAuthorId) {
+						throw new HttpError(400, 'BAD_REQUEST', 'A Persona cannot echo itself');
 					}
 
-					// Block enforcement: check mutual block (required for safety)
-					t1 = Date.now();
-					if (await isMutuallyBlocked(user_id, echoed_user_id)) {
-						console.log(`[perf] POST /api/echoes block_check ${Date.now() - t1}ms (blocked)`);
+					// Ownership: the caller must own the source Persona it is echoing as.
+					if (!(await verifyPersonaOwnership(env, ctx, authedAccountId, sourcePersonaAuthorId))) {
+						throw new HttpError(403, 'FORBIDDEN', 'You do not own this persona');
+					}
+
+					// Block enforcement (unchanged semantics): account/device vs target.
+					if (await isMutuallyBlocked(authedAccountId, targetPersonaAuthorId)) {
 						throw new HttpError(403, 'BLOCKED', 'Cannot echo a blocked user');
 					}
-					console.log(`[perf] POST /api/echoes block_check ${Date.now() - t1}ms`);
 
-					// Upsert (idempotent - no-op if already echoing)
-					t1 = Date.now();
+					// Upsert the exact Persona-to-Persona relationship (idempotent).
 					const { data, error } = await sb(env)
 						.from('echoes')
-						.upsert({ user_id, echoed_user_id }, { onConflict: 'user_id,echoed_user_id', ignoreDuplicates: true })
+						.upsert(
+							{ user_id: authedAccountId, echoer_author_id: sourcePersonaAuthorId, echoed_user_id: targetPersonaAuthorId },
+							{ onConflict: 'echoer_author_id,echoed_user_id', ignoreDuplicates: true },
+						)
 						.select('echoed_user_id');
-					const wasInserted = (data?.length ?? 0) > 0;
-					console.log(`[perf] POST /api/echoes upsert ${Date.now() - t1}ms`, { wasInserted });
-
 					if (error) throw error;
+					const wasInserted = (data?.length ?? 0) > 0;
 
-					console.log(`[perf] POST /api/echoes total ${Date.now() - handlerStart}ms`);
+					console.log(`[perf] POST /api/echoes total ${Date.now() - handlerStart}ms`, { wasInserted });
 					return ok(req, env, request_id, { ok: true }, wasInserted ? 201 : 200);
 				}
 
-				// DELETE /api/echoes/:userId - Un-echo a user
+				// DELETE /api/echoes/:targetPersonaAuthorId?source_persona_author_id=... - Un-echo
+				// Removes ONLY the active source Persona's relationship to the target Persona.
 				{
 					const m = path.match(/^\/api\/echoes\/([^/]+)$/);
 					if (m && req.method === 'DELETE') {
-						const user_id = await requireAuth(req, env);
-						const echoed_user_id = m[1];
+						const authedAccountId = await requireAuth(req, env);
+						const targetPersonaAuthorId = decodeURIComponent(m[1]);
+						const sourcePersonaAuthorId = (url.searchParams.get('source_persona_author_id') || '').trim();
 
-						// Delete (idempotent - no error if not exists)
-						const { error } = await sb(env).from('echoes').delete().eq('user_id', user_id).eq('echoed_user_id', echoed_user_id);
+						if (!sourcePersonaAuthorId) {
+							throw new HttpError(400, 'BAD_REQUEST', 'source_persona_author_id is required');
+						}
+						// Ownership: caller must own the source Persona whose Echo is being removed.
+						if (!(await verifyPersonaOwnership(env, ctx, authedAccountId, sourcePersonaAuthorId))) {
+							throw new HttpError(403, 'FORBIDDEN', 'You do not own this persona');
+						}
+
+						// Delete only this source Persona's relationship (idempotent). Other
+						// Personas owned by the same account keep their own relationships.
+						const { error } = await sb(env)
+							.from('echoes')
+							.delete()
+							.eq('user_id', authedAccountId)
+							.eq('echoer_author_id', sourcePersonaAuthorId)
+							.eq('echoed_user_id', targetPersonaAuthorId);
 						if (error) throw error;
 
 						return ok(req, env, request_id, { ok: true });
 					}
 				}
 
-				// GET /api/echoes - List users I echo (private, newest first) - OPTIMIZED v2: PARALLEL
+				// GET /api/echoes - List users I echo (account-scoped, newest first) +
+				// private incoming Echo count for the previewed Persona (persona-scoped).
 				if (path === '/api/echoes' && req.method === 'GET') {
 					const handlerStart = Date.now();
 					const user_id = await requireAuth(req, env);
 					const authMs = Date.now() - handlerStart;
 
-					// Run ALL queries in parallel (saves ~150ms)
+					// Persona whose incoming count is requested. UNTRUSTED input — ownership
+					// is verified below. When absent (legacy / no active Persona), the count
+					// is omitted entirely so the client shows an unavailable state rather than
+					// a false confirmed zero. It is NEVER derived from the account device_id.
+					const persona_author_id = (url.searchParams.get('persona_author_id') || '').trim() || null;
+
+					// Run everything in parallel. The incoming-count query targets the supplied
+					// Persona's author_id (the identifier stored in echoes.echoed_user_id), and
+					// its result is only returned after ownership is confirmed below.
 					const t1 = Date.now();
-					const [echoesResult, blocksResult, incomingCountResult] = await Promise.all([
-						// Query 1: Get echoed users (minimal columns)
-						sb(env)
-							.from('echoes')
-							.select('echoed_user_id, created_at')
-							.eq('user_id', user_id)
-							.order('created_at', { ascending: false })
-							.limit(200),
+					const [echoesResult, blocksResult, ownsPersona, incomingCountResult] = await Promise.all([
+						// Query 1: Outgoing echoed targets — scoped to the active SOURCE Persona.
+						// (echoer_author_id = active Persona). Requires a persona; without one the
+						// list cannot be attributed to a Persona, so it resolves empty.
+						persona_author_id
+							? sb(env)
+									.from('echoes')
+									.select('echoed_user_id, created_at')
+									.eq('user_id', user_id)
+									.eq('echoer_author_id', persona_author_id)
+									.order('created_at', { ascending: false })
+									.limit(200)
+							: Promise.resolve(null),
 						// Query 2: All my block relations
 						sb(env)
 							.from('blocks')
 							.select('blocker_user_id, blocked_user_id')
 							.or(`blocker_user_id.eq.${user_id},blocked_user_id.eq.${user_id}`),
-						// Query 3: Count users echoing me (private, caller-scoped only)
-						sb(env)
-							.from('echoes')
-							.select('id', { count: 'exact', head: true })
-							.eq('echoed_user_id', user_id),
+						// Ownership verification for the previewed Persona
+						persona_author_id ? verifyPersonaOwnership(env, ctx, user_id, persona_author_id) : Promise.resolve(null),
+						// Incoming count targeting the previewed Persona (returned only if owned)
+						persona_author_id
+							? sb(env).from('echoes').select('id', { count: 'exact', head: true }).eq('echoed_user_id', persona_author_id)
+							: Promise.resolve(null),
 					]);
 					const dbMs = Date.now() - t1;
 					console.log(`[perf] /api/echoes rid=${request_id} auth=${authMs}ms db=${dbMs}ms`, {
-						echoes: echoesResult.data?.length,
+						echoes: (echoesResult as any)?.data?.length,
 						blocks: blocksResult.data?.length,
+						persona: persona_author_id ? 'scoped' : 'none',
 					});
 
-					if (echoesResult.error) throw echoesResult.error;
+					if ((echoesResult as any)?.error) throw (echoesResult as any).error;
 
-					const incoming_count = Math.max(0, incomingCountResult.count ?? 0);
-
-					const rows = echoesResult.data ?? [];
-					if (rows.length === 0) {
-						console.log(`[perf] /api/echoes total ${Date.now() - handlerStart}ms (empty)`);
-						return ok(req, env, request_id, { echoed: [], incoming_count });
+					// Persona-scoped incoming count. Only computed/returned for a Persona the
+					// caller owns; a not-owned Persona is rejected (never silently downgraded).
+					let incoming_count: number | undefined;
+					if (persona_author_id) {
+						if (ownsPersona === false) {
+							throw new HttpError(403, 'FORBIDDEN', 'You do not own this persona');
+						}
+						incoming_count = Math.max(0, (incomingCountResult as any)?.count ?? 0);
 					}
 
 					// Split block results: users I blocked + users who blocked me
@@ -7352,20 +7440,29 @@ export default {
 						}
 					}
 
-					const echoed = rows
-						.filter((r) => !blockedIds.has(r.echoed_user_id))
-						.map((r) => ({
+					const echoed = ((echoesResult as any)?.data ?? [])
+						.filter((r: any) => !blockedIds.has(r.echoed_user_id))
+						.map((r: any) => ({
 							user_id: r.echoed_user_id,
 							created_at: r.created_at,
 						}));
 
+					const payload: Record<string, unknown> = { echoed };
+					if (incoming_count !== undefined) payload.incoming_count = incoming_count;
+
 					console.log(`[perf] /api/echoes total ${Date.now() - handlerStart}ms`, { echoed: echoed.length });
-					return ok(req, env, request_id, { echoed, incoming_count });
+					const resp = ok(req, env, request_id, payload);
+					// Private, per-user data — never store or share across users/edges.
+					resp.headers.set('Cache-Control', 'private, no-store');
+					return resp;
 				}
 
-				// GET /api/echoes/relations?user_ids=a,b,c - Check which of these I echo
+				// GET /api/echoes/relations?user_ids=a,b,c&persona_author_id=... - Of these
+				// target Personas, which does my ACTIVE source Persona echo? Scoped per-Persona.
 				if (path === '/api/echoes/relations' && req.method === 'GET') {
 					const user_id = await requireAuth(req, env);
+
+					const persona_author_id = (url.searchParams.get('persona_author_id') || '').trim();
 
 					const userIdsParam = url.searchParams.get('user_ids') || '';
 					const userIds = userIdsParam
@@ -7374,20 +7471,110 @@ export default {
 						.filter((s) => s.length > 0)
 						.slice(0, 200);
 
-					if (userIds.length === 0) {
+					// Without an active source Persona the check is not attributable to one, so
+					// no relationships are reported (never all-Personas-combined).
+					if (userIds.length === 0 || !persona_author_id) {
 						return ok(req, env, request_id, { echoed_user_ids: [] });
+					}
+
+					// Ownership: only report the caller's own Persona's relationships.
+					if (!(await verifyPersonaOwnership(env, ctx, user_id, persona_author_id))) {
+						throw new HttpError(403, 'FORBIDDEN', 'You do not own this persona');
 					}
 
 					const { data: rows, error } = await sb(env)
 						.from('echoes')
 						.select('echoed_user_id')
 						.eq('user_id', user_id)
+						.eq('echoer_author_id', persona_author_id)
 						.in('echoed_user_id', userIds);
 					if (error) throw error;
 
 					const echoed_user_ids = (rows ?? []).map((r) => r.echoed_user_id);
 
 					return ok(req, env, request_id, { echoed_user_ids });
+				}
+
+				// GET /api/echoes/incoming?persona_author_id=<owned target>&limit=&cursor=
+				// Private, authenticated, OWNER-ONLY: the source Personas currently echoing an
+				// owned target Persona. Returns only public profile-summary fields — never
+				// account/device IDs, ownership records, or any other Echo relationships.
+				if (path === '/api/echoes/incoming' && req.method === 'GET') {
+					const handlerStart = Date.now();
+					const authedAccountId = await requireAuth(req, env);
+
+					const persona_author_id = (url.searchParams.get('persona_author_id') || '').trim();
+					if (!persona_author_id) {
+						throw new HttpError(400, 'BAD_REQUEST', 'persona_author_id is required');
+					}
+					// Ownership: the caller may read incoming lists ONLY for its own Personas.
+					if (!(await verifyPersonaOwnership(env, ctx, authedAccountId, persona_author_id))) {
+						throw new HttpError(403, 'FORBIDDEN', 'You do not own this persona');
+					}
+
+					const limitParam = parseInt(url.searchParams.get('limit') || '30', 10);
+					const limit = Math.min(50, Math.max(1, Number.isFinite(limitParam) ? limitParam : 30));
+					const cursor = (url.searchParams.get('cursor') || '').trim() || null; // created_at ISO
+
+					// Load incoming relationships newest-first. Bounded scan lets count and list
+					// use the SAME resolvable-source set (exact consistency) without N+1 lookups.
+					const SCAN_CAP = 500;
+					const { data: rows, error } = await sb(env)
+						.from('echoes')
+						.select('echoer_author_id, created_at')
+						.eq('echoed_user_id', persona_author_id)
+						.order('created_at', { ascending: false })
+						.limit(SCAN_CAP);
+					if (error) throw error;
+
+					const rel = (rows ?? []) as Array<{ echoer_author_id: string; created_at: string }>;
+					if (rel.length === 0) {
+						const resp = ok(req, env, request_id, { users: [], count: 0, next_cursor: null });
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					}
+
+					// Batch-resolve source Persona profiles in ONE query (no N+1).
+					const echoerIds = [...new Set(rel.map((r) => r.echoer_author_id))];
+					const { data: profs, error: pErr } = await sb(env)
+						.from('user_profiles')
+						.select('user_id, display_name, avatar, teran_id')
+						.in('user_id', echoerIds);
+					if (pErr) throw pErr;
+					const profileMap = new Map((profs ?? []).map((p: any) => [p.user_id, p]));
+
+					// Consistency rule: count and list ONLY relationships whose source Persona
+					// still resolves. Unresolved (deleted) source Personas are excluded from both,
+					// so the header count can never include rows the list cannot show.
+					const resolved = rel.filter((r) => profileMap.has(r.echoer_author_id));
+					const count = resolved.length;
+
+					// Cursor pagination over the resolved newest-first set (created_at cursor).
+					let startIdx = 0;
+					if (cursor) {
+						const idx = resolved.findIndex((r) => r.created_at < cursor);
+						startIdx = idx === -1 ? resolved.length : idx;
+					}
+					const page = resolved.slice(startIdx, startIdx + limit);
+					const users = page.map((r) => {
+						const p: any = profileMap.get(r.echoer_author_id);
+						return {
+							author_id: r.echoer_author_id, // exact SOURCE Persona that echoed
+							display_name: p?.display_name || 'Anonymous',
+							avatar: p?.avatar || null, // raw avatar key/url (UI normalizes, as elsewhere)
+							teran_id: p?.teran_id ?? null,
+						};
+					});
+					const next_cursor = startIdx + page.length < resolved.length ? page[page.length - 1].created_at : null;
+
+					console.log(`[perf] /api/echoes/incoming rid=${request_id} t=${Date.now() - handlerStart}ms`, {
+						scanned: rel.length,
+						resolved: count,
+						returned: users.length,
+					});
+					const resp = ok(req, env, request_id, { users, count, next_cursor });
+					resp.headers.set('Cache-Control', 'private, no-store');
+					return resp;
 				}
 
 				// GET /api/echoes/incoming_counts?user_ids=a,b,c — How many users echo each target
