@@ -7745,6 +7745,97 @@ export default {
 				}
 
 				// =====================================================
+				// DM-as-a-Room API (Phase 4): mutual-Echo Persona list
+				// =====================================================
+
+				// GET /api/dm/mutuals?source_persona_author_id=<active> — the active
+				// Persona's mutual-Echo Personas (each echoes the other), minus any blocked
+				// pair. This is a PURE READ used to populate the Profile → Echoes → DM tab:
+				// it NEVER opens or creates a DM Room. Exposes only public Persona summary
+				// fields (author_id, display_name, avatar, teran_id) — never account/device
+				// ids, Room ids, canonical pair fields, or private metadata. Always
+				// `Cache-Control: private, no-store`.
+				if (path === '/api/dm/mutuals' && req.method === 'GET') {
+					const mutFail = (status: number, code: string, message: string) => {
+						const resp = fail(req, env, request_id, status, code, message);
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					};
+					let userId: string;
+					try {
+						userId = await requireAuth(req, env);
+					} catch {
+						return mutFail(401, 'AUTH_INVALID', 'Authentication required');
+					}
+					const source = (url.searchParams.get('source_persona_author_id') || '').trim();
+					if (!source) return mutFail(400, 'BAD_REQUEST', 'source_persona_author_id is required');
+
+					// Ownership: only the caller's own Persona's mutuals are computed.
+					let owns = false;
+					try {
+						owns = await verifyPersonaOwnership(env, ctx, userId, source);
+					} catch {
+						return mutFail(500, 'DB_ERROR', 'Unexpected error');
+					}
+					if (!owns) return mutFail(403, 'FORBIDDEN', 'You do not own this persona');
+
+					try {
+						// Outgoing (source echoes X) and incoming (X echoes source), both
+						// scoped to the source Persona; mutual = intersection.
+						const [outRes, inRes, blkRes] = await Promise.all([
+							sb(env).from('echoes').select('echoed_user_id').eq('echoer_author_id', source),
+							sb(env).from('echoes').select('echoer_author_id').eq('echoed_user_id', source),
+							sb(env)
+								.from('blocks')
+								.select('blocker_user_id, blocked_user_id')
+								.or(`blocker_user_id.eq.${source},blocked_user_id.eq.${source}`),
+						]);
+						if ((outRes as any).error || (inRes as any).error || (blkRes as any).error) {
+							return mutFail(500, 'DB_ERROR', 'Unexpected error');
+						}
+						const outgoing = new Set<string>(((outRes as any).data ?? []).map((r: any) => r.echoed_user_id));
+						const blocked = new Set<string>();
+						for (const r of (blkRes as any).data ?? []) {
+							if (r.blocker_user_id === source) blocked.add(r.blocked_user_id);
+							else if (r.blocked_user_id === source) blocked.add(r.blocker_user_id);
+						}
+						const mutualIds = [];
+						for (const r of (inRes as any).data ?? []) {
+							const other = r.echoer_author_id;
+							if (other && other !== source && outgoing.has(other) && !blocked.has(other)) mutualIds.push(other);
+						}
+						const uniqueIds = [...new Set(mutualIds)].slice(0, 500);
+
+						let users: Array<{ author_id: string; display_name: string; avatar: string | null; teran_id: string | null }> = [];
+						if (uniqueIds.length > 0) {
+							const { data: profiles, error: profErr } = await sb(env)
+								.from('user_profiles')
+								.select('user_id, display_name, avatar, teran_id')
+								.in('user_id', uniqueIds);
+							if (profErr) return mutFail(500, 'DB_ERROR', 'Unexpected error');
+							const byId = new Map((profiles ?? []).map((p: any) => [p.user_id, p]));
+							users = uniqueIds
+								.filter((id) => byId.has(id))
+								.map((id) => {
+									const p: any = byId.get(id);
+									return {
+										author_id: id,
+										display_name: p.display_name || 'Anonymous',
+										avatar: p.avatar || null,
+										teran_id: p.teran_id ?? null,
+									};
+								});
+						}
+
+						const resp = ok(req, env, request_id, { users });
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					} catch {
+						return mutFail(500, 'DB_ERROR', 'Unexpected error');
+					}
+				}
+
+				// =====================================================
 				// DM-as-a-Room API (Phase 2): resolve-or-create a DM Room
 				// =====================================================
 
@@ -7802,11 +7893,16 @@ export default {
 							// no invites, no notifications, no RoomFeed/activity, no user-facing
 							// design. Technical owner_id = creator (schema requires NOT NULL) but
 							// it does NOT govern DM access — the Persona pair does.
+							// room_key is NOT NULL (mirrors the normal room-create path). DM
+							// Rooms are never discoverable by room_key (the lookup endpoint
+							// excludes room_type='dm'), but the column must still be populated.
+							const dmRoomKey = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
 							const { data: newRoom, error: insErr } = await sb(env)
 								.from('rooms')
 								.insert({
 									name: 'Direct Message',
 									owner_id: userId,
+									room_key: dmRoomKey,
 									visibility: 'private_invite_only',
 									read_policy: 'members_only',
 									post_policy: 'members_only',
