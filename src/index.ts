@@ -8058,6 +8058,220 @@ export default {
 					}
 				}
 
+				// GET /api/dm/inbox — Authenticated DM Inbox for the active source Persona.
+				// Returns one conversation entry per canonical DM Room that currently contains
+				// at least one non-expired (≤24h) DM message. Read-only; never creates Rooms,
+				// posts, or messages. Every response carries Cache-Control: private, no-store.
+				if (path === '/api/dm/inbox' && req.method === 'GET') {
+					type ConvCandidate = {
+						otherPersonaId: string;
+						msgCreatedAt: string;
+						msgId: number;
+						msgAuthorId: string;
+						msgContent: string;
+					};
+
+					const inboxFail = (status: number, code: string, message: string) => {
+						const resp = fail(req, env, request_id, status, code, message);
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					};
+					const inboxOk = (conversations: unknown[], next_cursor: string | null) => {
+						const resp = ok(req, env, request_id, { conversations, next_cursor });
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					};
+
+					try {
+						// 1. Authenticate (JWT sub = account/device identity).
+						let userId: string;
+						try {
+							userId = await requireAuth(req, env);
+						} catch {
+							return inboxFail(401, 'AUTH_INVALID', 'Authentication required');
+						}
+
+						// 2. Require source Persona (UNTRUSTED — ownership verified below).
+						const sourcePersona = (url.searchParams.get('source_persona_author_id') || '').trim();
+						if (!sourcePersona) return inboxFail(400, 'BAD_REQUEST', 'source_persona_author_id is required');
+
+						// 3. Caller must OWN the source Persona (account/persona binding; never room membership).
+						let owns = false;
+						try {
+							owns = await verifyPersonaOwnership(env, ctx, userId, sourcePersona);
+						} catch {
+							return inboxFail(500, 'DB_ERROR', 'Unexpected error');
+						}
+						if (!owns) return inboxFail(403, 'FORBIDDEN', 'You do not own this persona');
+
+						// 4. Pagination params (max 50 — DM Inbox lists are inherently short).
+						const limit = clampPaginationLimit(url.searchParams.get('limit'), 20, 50);
+						const rawCursor = url.searchParams.get('cursor');
+						const cursor = parseCursor(rawCursor);
+						if (rawCursor !== null && rawCursor !== '' && !cursor) {
+							return inboxFail(400, 'BAD_REQUEST', 'Invalid cursor');
+						}
+
+						// ── Stage A: DM Rooms containing the source Persona ──────────────────
+						const { data: roomRows, error: roomErr } = await sb(env)
+							.from('rooms')
+							.select('id, dm_persona_lo, dm_persona_hi')
+							.eq('room_type', DM_ROOM_TYPE)
+							.or(`dm_persona_lo.eq.${sourcePersona},dm_persona_hi.eq.${sourcePersona}`);
+						if (roomErr) return inboxFail(500, 'DB_ERROR', 'Unexpected error');
+						if (!roomRows || (roomRows as any[]).length === 0) return inboxOk([], null);
+
+						// Derive roomId → other persona.
+						const roomToOther = new Map<string, string>();
+						for (const row of roomRows as any[]) {
+							const other: string = row.dm_persona_lo === sourcePersona ? row.dm_persona_hi : row.dm_persona_lo;
+							if (other) roomToOther.set(String(row.id), other);
+						}
+						const allOtherIds = [...new Set(roomToOther.values())];
+
+						// ── Stage B: mutual-Echo + block filter ──────────────────────────────
+						// Reuses the exact two-query mutual-Echo pattern from GET /api/dm/mutuals.
+						const [outgoingRes, incomingRes] = await Promise.all([
+							sb(env).from('echoes').select('echoed_user_id').eq('echoer_author_id', sourcePersona),
+							sb(env).from('echoes').select('echoer_author_id').eq('echoed_user_id', sourcePersona),
+						]);
+						if ((outgoingRes as any).error || (incomingRes as any).error) return inboxFail(500, 'DB_ERROR', 'Unexpected error');
+						const outgoing = new Set<string>(((outgoingRes.data ?? []) as any[]).map((r) => r.echoed_user_id));
+						const incoming = new Set<string>(((incomingRes.data ?? []) as any[]).map((r) => r.echoer_author_id));
+						const mutualSet = new Set<string>(allOtherIds.filter((id) => id && id !== sourcePersona && outgoing.has(id) && incoming.has(id)));
+						if (mutualSet.size === 0) return inboxOk([], null);
+
+						const eligibleOthers = [...mutualSet];
+
+						// Block check — two directional .in() queries (no string interpolation on user IDs).
+						const [blk1, blk2] = await Promise.all([
+							sb(env).from('blocks').select('blocked_user_id').eq('blocker_user_id', sourcePersona).in('blocked_user_id', eligibleOthers),
+							sb(env).from('blocks').select('blocker_user_id').eq('blocked_user_id', sourcePersona).in('blocker_user_id', eligibleOthers),
+						]);
+						if (blk1.error || blk2.error) return inboxFail(500, 'DB_ERROR', 'Unexpected error');
+						const blockedOut = new Set<string>(((blk1.data ?? []) as any[]).map((r: any) => r.blocked_user_id));
+						const blockedIn  = new Set<string>(((blk2.data ?? []) as any[]).map((r: any) => r.blocker_user_id));
+						const allowedSet = new Set<string>(eligibleOthers.filter((id) => !blockedOut.has(id) && !blockedIn.has(id)));
+
+						const eligibleRoomEntries = [...roomToOther.entries()].filter(([, other]) => allowedSet.has(other));
+						if (eligibleRoomEntries.length === 0) return inboxOk([], null);
+						const eligibleRoomIds = eligibleRoomEntries.map(([roomId]) => roomId);
+
+						// ── Stage C: batch-resolve canonical dm_system posts ─────────────────
+						const { data: postRows, error: postErr } = await sb(env)
+							.from('posts')
+							.select('id, room_id')
+							.in('room_id', eligibleRoomIds)
+							.eq('post_type', DM_SYSTEM_POST_TYPE);
+						if (postErr) return inboxFail(500, 'DB_ERROR', 'Unexpected error');
+
+						const roomToPostId = new Map<string, number>();
+						for (const row of (postRows ?? []) as any[]) {
+							if (row.room_id && row.id) roomToPostId.set(String(row.room_id), Number(row.id));
+						}
+						const eligiblePostIds = eligibleRoomIds
+							.filter((r) => roomToPostId.has(r))
+							.map((r) => roomToPostId.get(r) as number);
+						if (eligiblePostIds.length === 0) return inboxOk([], null);
+
+						// ── Stage D: latest non-expired DM message per post (one batched query) ──
+						// Reuses the exact 24-hour cutoff semantics from the DM branch of GET /api/comments.
+						const dmCutoffIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+						const { data: commentRows, error: commentErr } = await sb(env)
+							.from('comments')
+							.select('id, post_id, author_id, content, created_at')
+							.in('post_id', eligiblePostIds)
+							.gt('created_at', dmCutoffIso)
+							.order('created_at', { ascending: false })
+							.order('id', { ascending: false })
+							.limit(1000);
+						if (commentErr) return inboxFail(500, 'DB_ERROR', 'Unexpected error');
+
+						// JS-side grouping: first encountered per post_id = newest (DESC order).
+						const latestByPostId = new Map<number, any>();
+						for (const c of (commentRows ?? []) as any[]) {
+							const pid = Number(c.post_id);
+							if (!latestByPostId.has(pid)) latestByPostId.set(pid, c);
+						}
+
+						// Build conversation candidates (one per Room with a valid latest message).
+						const candidates: ConvCandidate[] = [];
+						for (const [roomId, other] of eligibleRoomEntries) {
+							const postId = roomToPostId.get(roomId);
+							if (!postId) continue;
+							const msg = latestByPostId.get(postId);
+							if (!msg) continue; // No non-expired message → omit this Room.
+							candidates.push({
+								otherPersonaId: other,
+								msgCreatedAt: String(msg.created_at),
+								msgId: Number(msg.id),
+								msgAuthorId: String(msg.author_id || ''),
+								msgContent: String(msg.content || ''),
+							});
+						}
+						if (candidates.length === 0) return inboxOk([], null);
+
+						// Sort newest-first (latest_message.created_at DESC, id DESC for ties).
+						candidates.sort((a, b) => {
+							const dt = new Date(b.msgCreatedAt).getTime() - new Date(a.msgCreatedAt).getTime();
+							return dt !== 0 ? dt : b.msgId - a.msgId;
+						});
+
+						// Cursor-based pagination: exclude items at or before the cursor position.
+						const paged = cursor
+							? candidates.filter((c) => {
+								const ct = new Date(cursor.created_at).getTime();
+								const mt = new Date(c.msgCreatedAt).getTime();
+								return mt !== ct ? mt < ct : c.msgId < cursor.id;
+							  })
+							: candidates;
+						const pageItems = paged.slice(0, limit);
+						const hasMore = paged.length > limit;
+
+						if (pageItems.length === 0) return inboxOk([], null);
+
+						// ── Stage E: batch-resolve other Persona profiles (page only) ────────
+						const pageOtherIds = [...new Set(pageItems.map((c) => c.otherPersonaId))];
+						const { data: profileRows, error: profErr } = await sb(env)
+							.from('user_profiles')
+							.select('user_id, display_name, avatar, teran_id')
+							.in('user_id', pageOtherIds);
+						if (profErr) return inboxFail(500, 'DB_ERROR', 'Unexpected error');
+						const profileById = new Map<string, any>(((profileRows ?? []) as any[]).map((p) => [p.user_id, p]));
+
+						// Shape response. Conversations where the other Persona has no resolvable
+						// profile row are silently omitted — deleted Personas never surface raw IDs.
+						const conversations = pageItems.flatMap((c) => {
+							const prof = profileById.get(c.otherPersonaId);
+							if (!prof) return [];
+							return [{
+								other_user: {
+									author_id:    String(prof.user_id),
+									display_name: String(prof.display_name || 'Anonymous'),
+									avatar:       prof.avatar || null,
+									teran_id:     prof.teran_id ?? null,
+								},
+								latest_message: {
+									id:         c.msgId,
+									author_id:  c.msgAuthorId,
+									content:    c.msgContent,
+									created_at: c.msgCreatedAt,
+								},
+							}];
+						});
+
+						const next_cursor: string | null = hasMore
+							? `${pageItems[pageItems.length - 1].msgCreatedAt}:${pageItems[pageItems.length - 1].msgId}`
+							: null;
+
+						return inboxOk(conversations, next_cursor);
+					} catch {
+						const resp = fail(req, env, request_id, 500, 'DB_ERROR', 'Unexpected error');
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					}
+				}
+
 				// POST /api/echoes - Echo a target Persona AS a source Persona (Persona-to-Persona)
 				if (path === '/api/echoes' && req.method === 'POST') {
 					const handlerStart = Date.now();
