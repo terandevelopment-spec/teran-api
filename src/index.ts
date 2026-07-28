@@ -8064,6 +8064,7 @@ export default {
 				// posts, or messages. Every response carries Cache-Control: private, no-store.
 				if (path === '/api/dm/inbox' && req.method === 'GET') {
 					type ConvCandidate = {
+						roomId: string;
 						otherPersonaId: string;
 						msgCreatedAt: string;
 						msgId: number;
@@ -8076,8 +8077,8 @@ export default {
 						resp.headers.set('Cache-Control', 'private, no-store');
 						return resp;
 					};
-					const inboxOk = (conversations: unknown[], next_cursor: string | null) => {
-						const resp = ok(req, env, request_id, { conversations, next_cursor });
+					const inboxOk = (conversations: unknown[], next_cursor: string | null, unread_conversation_count = 0) => {
+						const resp = ok(req, env, request_id, { conversations, next_cursor, unread_conversation_count });
 						resp.headers.set('Cache-Control', 'private, no-store');
 						return resp;
 					};
@@ -8202,6 +8203,7 @@ export default {
 							const msg = latestByPostId.get(postId);
 							if (!msg) continue; // No non-expired message → omit this Room.
 							candidates.push({
+								roomId,
 								otherPersonaId: other,
 								msgCreatedAt: String(msg.created_at),
 								msgId: Number(msg.id),
@@ -8210,6 +8212,34 @@ export default {
 							});
 						}
 						if (candidates.length === 0) return inboxOk([], null);
+
+						// ── Stage D2: Persona-wide unread counts (FULL Inbox, not this page) ──
+						// Count incoming-unread per Room in SQL over every eligible conversation
+						// (all candidates = all cards across all pages). unread_conversation_count
+						// therefore reflects the whole Persona, independent of pagination. The
+						// same 24h cutoff (dmCutoffIso) is reused so expired messages drop out
+						// automatically. Reader-authored messages never count (author_id = other).
+						const unreadByRoom = new Map<string, number>();
+						let unreadConversationCount = 0;
+						const unreadTuples = candidates.map((c) => ({
+							room_id: c.roomId,
+							post_id: roomToPostId.get(c.roomId) as number,
+							other: c.otherPersonaId,
+						}));
+						if (unreadTuples.length > 0) {
+							const { data: unreadRows, error: unreadErr } = await (sb(env) as any).rpc('get_dm_unread_counts', {
+								p_reader: sourcePersona,
+								p_cutoff: dmCutoffIso,
+								p_convos: unreadTuples,
+							});
+							if (unreadErr) return inboxFail(500, 'DB_ERROR', 'Unexpected error');
+							for (const row of ((unreadRows ?? []) as any[])) {
+								const rid = String(row.room_id);
+								const cnt = Number(row.unread_count) || 0;
+								unreadByRoom.set(rid, cnt);
+								if (cnt > 0) unreadConversationCount++;
+							}
+						}
 
 						// Sort newest-first (latest_message.created_at DESC, id DESC for ties).
 						candidates.sort((a, b) => {
@@ -8257,6 +8287,7 @@ export default {
 									content:    c.msgContent,
 									created_at: c.msgCreatedAt,
 								},
+								unread_count: unreadByRoom.get(c.roomId) ?? 0,
 							}];
 						});
 
@@ -8264,7 +8295,196 @@ export default {
 							? `${pageItems[pageItems.length - 1].msgCreatedAt}:${pageItems[pageItems.length - 1].msgId}`
 							: null;
 
-						return inboxOk(conversations, next_cursor);
+						return inboxOk(conversations, next_cursor, unreadConversationCount);
+					} catch {
+						const resp = fail(req, env, request_id, 500, 'DB_ERROR', 'Unexpected error');
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					}
+				}
+
+				// GET /api/dm/unread-count — lightweight Persona-wide unread CONVERSATION
+				// count. Returns ONLY { unread_conversation_count } so the future Mail badge
+				// never has to download private Inbox message previews. Uses the identical
+				// authorization + eligibility as GET /api/dm/inbox (source ownership → DM
+				// Rooms containing the Persona → current mutual Echo → not blocked → their
+				// dm_system posts) then get_dm_unread_counts over the same 24h window. It
+				// NEVER reveals which conversations exist. Cache-Control: private, no-store.
+				if (path === '/api/dm/unread-count' && req.method === 'GET') {
+					const ucFail = (status: number, code: string, message: string) => {
+						const resp = fail(req, env, request_id, status, code, message);
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					};
+					const ucOk = (unread_conversation_count: number) => {
+						const resp = ok(req, env, request_id, { unread_conversation_count });
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					};
+
+					try {
+						let userId: string;
+						try {
+							userId = await requireAuth(req, env);
+						} catch {
+							return ucFail(401, 'AUTH_INVALID', 'Authentication required');
+						}
+
+						const sourcePersona = (url.searchParams.get('source_persona_author_id') || '').trim();
+						if (!sourcePersona) return ucFail(400, 'BAD_REQUEST', 'source_persona_author_id is required');
+
+						let owns = false;
+						try {
+							owns = await verifyPersonaOwnership(env, ctx, userId, sourcePersona);
+						} catch {
+							return ucFail(500, 'DB_ERROR', 'Unexpected error');
+						}
+						if (!owns) return ucFail(403, 'FORBIDDEN', 'You do not own this persona');
+
+						// DM Rooms containing the source Persona.
+						const { data: roomRows, error: roomErr } = await sb(env)
+							.from('rooms')
+							.select('id, dm_persona_lo, dm_persona_hi')
+							.eq('room_type', DM_ROOM_TYPE)
+							.or(`dm_persona_lo.eq.${sourcePersona},dm_persona_hi.eq.${sourcePersona}`);
+						if (roomErr) return ucFail(500, 'DB_ERROR', 'Unexpected error');
+						if (!roomRows || (roomRows as any[]).length === 0) return ucOk(0);
+
+						const roomToOther = new Map<string, string>();
+						for (const row of roomRows as any[]) {
+							const other: string = row.dm_persona_lo === sourcePersona ? row.dm_persona_hi : row.dm_persona_lo;
+							if (other) roomToOther.set(String(row.id), other);
+						}
+						const allOtherIds = [...new Set(roomToOther.values())];
+
+						// Mutual-Echo filter (same two-query pattern as inbox / mutuals).
+						const [outgoingRes, incomingRes] = await Promise.all([
+							sb(env).from('echoes').select('echoed_user_id').eq('echoer_author_id', sourcePersona),
+							sb(env).from('echoes').select('echoer_author_id').eq('echoed_user_id', sourcePersona),
+						]);
+						if ((outgoingRes as any).error || (incomingRes as any).error) return ucFail(500, 'DB_ERROR', 'Unexpected error');
+						const outgoing = new Set<string>(((outgoingRes.data ?? []) as any[]).map((r) => r.echoed_user_id));
+						const incoming = new Set<string>(((incomingRes.data ?? []) as any[]).map((r) => r.echoer_author_id));
+						const mutualSet = new Set<string>(allOtherIds.filter((id) => id && id !== sourcePersona && outgoing.has(id) && incoming.has(id)));
+						if (mutualSet.size === 0) return ucOk(0);
+						const eligibleOthers = [...mutualSet];
+
+						// Block filter (both directions).
+						const [blk1, blk2] = await Promise.all([
+							sb(env).from('blocks').select('blocked_user_id').eq('blocker_user_id', sourcePersona).in('blocked_user_id', eligibleOthers),
+							sb(env).from('blocks').select('blocker_user_id').eq('blocked_user_id', sourcePersona).in('blocker_user_id', eligibleOthers),
+						]);
+						if (blk1.error || blk2.error) return ucFail(500, 'DB_ERROR', 'Unexpected error');
+						const blockedOut = new Set<string>(((blk1.data ?? []) as any[]).map((r: any) => r.blocked_user_id));
+						const blockedIn  = new Set<string>(((blk2.data ?? []) as any[]).map((r: any) => r.blocker_user_id));
+						const allowedSet = new Set<string>(eligibleOthers.filter((id) => !blockedOut.has(id) && !blockedIn.has(id)));
+
+						const eligibleRoomEntries = [...roomToOther.entries()].filter(([, other]) => allowedSet.has(other));
+						if (eligibleRoomEntries.length === 0) return ucOk(0);
+						const eligibleRoomIds = eligibleRoomEntries.map(([roomId]) => roomId);
+
+						// Canonical dm_system posts for the eligible Rooms.
+						const { data: postRows, error: postErr } = await sb(env)
+							.from('posts')
+							.select('id, room_id')
+							.in('room_id', eligibleRoomIds)
+							.eq('post_type', DM_SYSTEM_POST_TYPE);
+						if (postErr) return ucFail(500, 'DB_ERROR', 'Unexpected error');
+						const roomToPostId = new Map<string, number>();
+						for (const row of (postRows ?? []) as any[]) {
+							if (row.room_id && row.id) roomToPostId.set(String(row.room_id), Number(row.id));
+						}
+
+						const tuples = eligibleRoomEntries
+							.filter(([roomId]) => roomToPostId.has(roomId))
+							.map(([roomId, other]) => ({ room_id: roomId, post_id: roomToPostId.get(roomId) as number, other }));
+						if (tuples.length === 0) return ucOk(0);
+
+						// Grouped SQL unread count over the same 24h window as the inbox.
+						const dmCutoffIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+						const { data: unreadRows, error: unreadErr } = await (sb(env) as any).rpc('get_dm_unread_counts', {
+							p_reader: sourcePersona,
+							p_cutoff: dmCutoffIso,
+							p_convos: tuples,
+						});
+						if (unreadErr) return ucFail(500, 'DB_ERROR', 'Unexpected error');
+						let count = 0;
+						for (const row of ((unreadRows ?? []) as any[])) {
+							if ((Number(row.unread_count) || 0) > 0) count++;
+						}
+						return ucOk(count);
+					} catch {
+						const resp = fail(req, env, request_id, 500, 'DB_ERROR', 'Unexpected error');
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					}
+				}
+
+				// POST /api/dm/read — advance the reader Persona's monotonic read cursor for
+				// ONE DM Room. Private local read-state ONLY; never a visible receipt to the
+				// other participant (no notification, no cross-user side effect). Body:
+				//   { source_persona_author_id, post_id, last_read_message_id }
+				// The cursor TIMESTAMP is derived server-side from the referenced comment —
+				// a client-supplied timestamp is never trusted. Full reauthorization uses the
+				// existing verifyDmRoomCommentAccess (auth → source ownership → dm_system post
+				// → DM Room → source in canonical pair → derive other → current mutual Echo →
+				// not blocked). The cursor advances atomically and monotonically via
+				// dm_advance_read_cursor (older/equal → successful no-op; safe under retries,
+				// duplicates, and out-of-order multi-device writes). Cache-Control: private, no-store.
+				if (path === '/api/dm/read' && req.method === 'POST') {
+					const readFail = (status: number, code: string, message: string) => {
+						const resp = fail(req, env, request_id, status, code, message);
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					};
+
+					try {
+						const body = (await req.json().catch(() => null)) as any;
+						const source = typeof body?.source_persona_author_id === 'string' ? body.source_persona_author_id.trim() : '';
+						const postId = Number(body?.post_id);
+						const msgId = Number(body?.last_read_message_id);
+						if (!source) return readFail(400, 'BAD_REQUEST', 'source_persona_author_id is required');
+						if (!Number.isFinite(postId) || postId <= 0) return readFail(400, 'BAD_REQUEST', 'post_id is required');
+						if (!Number.isFinite(msgId) || msgId <= 0) return readFail(400, 'BAD_REQUEST', 'last_read_message_id is required');
+
+						// Full DM comment authorization (derives the other participant safely;
+						// target_persona_author_id is intentionally NOT required).
+						const access = await verifyDmRoomCommentAccess(req, env, ctx, postId, source);
+						if (!access.ok) {
+							// Uniform generic failure — never reveal whether the post/DM exists.
+							return readFail(404, 'NOT_FOUND', 'Not found');
+						}
+						const { roomId, other } = access;
+
+						// The referenced comment must belong to THIS dm_system post, be authored
+						// by the OTHER Persona (incoming only — a reader-authored message can
+						// never advance the reader's cursor), and carry a valid server created_at
+						// (the authoritative cursor timestamp).
+						const { data: comment, error: cErr } = await sb(env)
+							.from('comments')
+							.select('id, post_id, author_id, created_at')
+							.eq('id', msgId)
+							.maybeSingle();
+						if (cErr) return readFail(500, 'DB_ERROR', 'Unexpected error');
+						if (!comment
+							|| Number((comment as any).post_id) !== postId
+							|| String((comment as any).author_id || '') !== other
+							|| !(comment as any).created_at) {
+							return readFail(404, 'NOT_FOUND', 'Not found');
+						}
+
+						// Atomic advance-only upsert. Older/equal cursor → no-op (idempotent).
+						const { error: rpcErr } = await (sb(env) as any).rpc('dm_advance_read_cursor', {
+							p_room: roomId,
+							p_reader: source,
+							p_msg_id: msgId,
+							p_created_at: (comment as any).created_at,
+						});
+						if (rpcErr) return readFail(500, 'DB_ERROR', 'Unexpected error');
+
+						const resp = ok(req, env, request_id, { ok: true });
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
 					} catch {
 						const resp = fail(req, env, request_id, 500, 'DB_ERROR', 'Unexpected error');
 						resp.headers.set('Cache-Control', 'private, no-store');
