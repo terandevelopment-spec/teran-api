@@ -7954,6 +7954,110 @@ export default {
 					return !error && (count ?? 0) > 0;
 				}
 
+				// GET /api/dm/mutuals?source_persona_author_id=<active-persona> —
+				// Authenticated contact/entry list for the (future) Profile DM tab. Returns
+				// ONLY the Personas that BOTH echo, and are echoed by, the caller's source
+				// Persona (a current mutual Echo in both directions), minus blocked pairs.
+				// This endpoint is strictly READ-ONLY: it NEVER creates or resolves a DM
+				// Room or dm_system post. It exposes only public Persona summary fields and
+				// never account/device IDs, echo rows, room/post IDs, canonical pair fields,
+				// or block information. Every exit is `Cache-Control: private, no-store`.
+				if (path === '/api/dm/mutuals' && req.method === 'GET') {
+					// Uniform exit wrapper: private no-store + structured error on EVERY path
+					// (raw Supabase/SQL errors are never surfaced).
+					const dmFail = (status: number, code: string, message: string) => {
+						const resp = fail(req, env, request_id, status, code, message);
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					};
+					const dmOk = (users: unknown[]) => {
+						const resp = ok(req, env, request_id, { users });
+						resp.headers.set('Cache-Control', 'private, no-store');
+						return resp;
+					};
+
+					try {
+						// 1. Authenticate (JWT sub = account/device identity).
+						let userId: string;
+						try {
+							userId = await requireAuth(req, env);
+						} catch {
+							return dmFail(401, 'AUTH_INVALID', 'Authentication required');
+						}
+
+						// 2. Require the active SOURCE Persona (author_id). UNTRUSTED input —
+						//    ownership is verified below.
+						const sourcePersona = (url.searchParams.get('source_persona_author_id') || '').trim();
+						if (!sourcePersona) {
+							return dmFail(400, 'BAD_REQUEST', 'source_persona_author_id is required');
+						}
+
+						// 3. Caller must OWN the source Persona (account/persona binding — never
+						//    room membership or sibling inheritance). A forged or sibling Persona
+						//    the caller does not own is rejected here (403).
+						let owns = false;
+						try {
+							owns = await verifyPersonaOwnership(env, ctx, userId, sourcePersona);
+						} catch {
+							return dmFail(500, 'DB_ERROR', 'Unexpected error');
+						}
+						if (!owns) return dmFail(403, 'FORBIDDEN', 'You do not own this persona');
+
+						// 4. Current mutual Echo in BOTH directions, computed server-side with
+						//    exactly TWO queries (never one-per-Persona, never in the client):
+						//      outgoing = Personas this source echoes   (echoer_author_id = source)
+						//      incoming = Personas that echo this source (echoed_user_id  = source)
+						//    The mutual set is their intersection, minus self. echoes.user_id
+						//    (the account/device id) is NEVER used as Persona identity — only the
+						//    echoer_author_id / echoed_user_id Persona fields are.
+						const [outgoingRes, incomingRes] = await Promise.all([
+							sb(env).from('echoes').select('echoed_user_id').eq('echoer_author_id', sourcePersona),
+							sb(env).from('echoes').select('echoer_author_id').eq('echoed_user_id', sourcePersona),
+						]);
+						if ((outgoingRes as any).error || (incomingRes as any).error) {
+							return dmFail(500, 'DB_ERROR', 'Unexpected error');
+						}
+						const outgoing = new Set<string>(((outgoingRes.data ?? []) as any[]).map((r) => r.echoed_user_id));
+						const incoming = new Set<string>(((incomingRes.data ?? []) as any[]).map((r) => r.echoer_author_id));
+						const mutualIds = [...outgoing].filter((id) => id && id !== sourcePersona && incoming.has(id));
+
+						if (mutualIds.length === 0) return dmOk([]);
+
+						// 5. Exclude blocked pairs (persona-to-persona, either direction) using
+						//    the existing block helper. Evaluated in parallel, not sequentially.
+						const blockedFlags = await Promise.all(mutualIds.map((id) => isMutuallyBlocked(sourcePersona, id)));
+						const allowedIds = mutualIds.filter((_, i) => !blockedFlags[i]);
+
+						if (allowedIds.length === 0) return dmOk([]);
+
+						// 6. Batch-resolve public Persona summaries in ONE query. Personas with
+						//    no profile row are omitted (never surfaced as raw identifiers).
+						const { data: profileRows, error: profErr } = await sb(env)
+							.from('user_profiles')
+							.select('user_id, display_name, avatar, teran_id')
+							.in('user_id', allowedIds);
+						if (profErr) return dmFail(500, 'DB_ERROR', 'Unexpected error');
+
+						const byId = new Map<string, any>(((profileRows ?? []) as any[]).map((p) => [p.user_id, p]));
+						// 7. Return only the approved Persona fields, in a stable deterministic
+						//    order (display name, then author_id). No IDs beyond author_id.
+						const users = allowedIds
+							.map((id) => byId.get(id))
+							.filter(Boolean)
+							.map((p) => ({
+								author_id: p.user_id,
+								display_name: p.display_name || 'Anonymous',
+								avatar: p.avatar || null,
+								teran_id: p.teran_id ?? null,
+							}))
+							.sort((a, b) => a.display_name.localeCompare(b.display_name) || a.author_id.localeCompare(b.author_id));
+
+						return dmOk(users);
+					} catch {
+						return dmFail(500, 'DB_ERROR', 'Unexpected error');
+					}
+				}
+
 				// POST /api/echoes - Echo a target Persona AS a source Persona (Persona-to-Persona)
 				if (path === '/api/echoes' && req.method === 'POST') {
 					const handlerStart = Date.now();
