@@ -8316,8 +8316,8 @@ export default {
 						resp.headers.set('Cache-Control', 'private, no-store');
 						return resp;
 					};
-					const ucOk = (unread_conversation_count: number) => {
-						const resp = ok(req, env, request_id, { unread_conversation_count });
+					const ucOk = (unread_conversation_count: number, unread_message_count = 0) => {
+						const resp = ok(req, env, request_id, { unread_conversation_count, unread_message_count });
 						resp.headers.set('Cache-Control', 'private, no-store');
 						return resp;
 					};
@@ -8408,11 +8408,11 @@ export default {
 							p_convos: tuples,
 						});
 						if (unreadErr) return ucFail(500, 'DB_ERROR', 'Unexpected error');
-						let count = 0;
+						let count = 0; let totalMessages = 0;
 						for (const row of ((unreadRows ?? []) as any[])) {
-							if ((Number(row.unread_count) || 0) > 0) count++;
+							const cnt = Number(row.unread_count) || 0; if (cnt > 0) { count++; totalMessages += cnt; }
 						}
-						return ucOk(count);
+						return ucOk(count, totalMessages);
 					} catch {
 						const resp = fail(req, env, request_id, 500, 'DB_ERROR', 'Unexpected error');
 						resp.headers.set('Cache-Control', 'private, no-store');
