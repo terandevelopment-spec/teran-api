@@ -11443,7 +11443,7 @@ export default {
 					let q = sb(env)
 						.from('rooms')
 						.select(
-							'id,room_key,name,description,emoji,icon_key,icon_thumb_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled,card_shape,card_border_visible,catalog_columns,catalog_title_enabled',
+							'id,room_key,name,description,emoji,icon_key,icon_thumb_key,owner_id,visibility,read_policy,post_policy,category,created_at,header_bg_color,header_text_color,room_bg_color,card_bg_color,card_text_color,like_visible,header_font_size,header_font_family,room_type,thread_card_style,social_reply_mode,detail_bg_color,detail_card_bg_color,detail_card_text_color,detail_comment_bg_color,detail_comment_text_color,detail_accent_color,detail_comment_input_bg_color,detail_comment_input_text_color,detail_comment_bar_bg_color,detail_show_icons,list_show_icons,list_icon_shape,detail_icon_shape,header_bg_image_key,header_text_enabled,header_height,header_glass_enabled,header_glass_style,room_bg_image_key,room_bg_image_opacity,card_bg_image_key,card_bg_image_opacity,card_glass_enabled,card_glass_style,detail_bg_image_key,detail_bg_image_opacity,detail_card_bg_image_key,detail_card_bg_image_opacity,detail_card_glass_enabled,detail_card_glass_style,detail_comment_bg_image_key,detail_comment_bg_image_opacity,detail_comment_glass_enabled,detail_comment_glass_style,detail_comment_input_bg_image_key,detail_comment_input_bg_image_opacity,detail_comment_input_glass_enabled,detail_comment_input_glass_style,detail_comment_bar_bg_image_key,detail_comment_bar_bg_image_opacity,detail_comment_bar_glass_enabled,detail_comment_bar_glass_style,detail_like_visible,detail_like_color,detail_reply_icon_color,detail_reply_badge_bg_color,detail_reply_badge_glass_enabled,card_shape,card_border_visible,catalog_columns,catalog_title_enabled,is_published',
 						);
 
 					if (owner_id_param) {
@@ -11497,6 +11497,12 @@ export default {
 						// NULLs. Owner-scoped listings above are unaffected — owners still see
 						// their Catalog Rooms.
 						q = q.or('room_type.is.null,room_type.neq.catalog');
+
+						// Publication gate: the public/discovery listing (Portal) shows only
+						// published Rooms. Owner-scoped branches above are intentionally left
+						// unfiltered so owners still see their unpublished Rooms in My Rooms.
+						// Visibility semantics are unchanged (private rooms remain discoverable).
+						q = q.eq('is_published', true);
 					}
 
 					// ── DM Rooms are never listed on ANY /api/rooms branch ──────────────
@@ -12301,6 +12307,10 @@ export default {
 					if (social_reply_mode !== null) insertObj.social_reply_mode = social_reply_mode;
 					if (creator_display_name !== null) insertObj.creator_display_name = creator_display_name;
 
+					// Publication gate: new Rooms are always created unpublished. Forced
+					// server-side — the client cannot choose the initial publication state.
+					insertObj.is_published = false;
+
 					// ── [ROOM_BORDER_TRACE] temporary diagnostics (remove after production verification) ──
 					console.log('[ROOM_BORDER_TRACE][REQUEST]', {
 						flatBorder: body?.card_border_visible,
@@ -12521,6 +12531,11 @@ export default {
 								throw new HttpError(422, 'VALIDATION_ERROR', 'Invalid post_policy value');
 							}
 							updates.post_policy = body.post_policy;
+						}
+						// ── Publication gate (owner-only, via this existing owner-gated PATCH) ──
+						// Idempotent: repeated { is_published: true } requests are a constant write.
+						if (typeof body?.is_published === 'boolean') {
+							updates.is_published = body.is_published;
 						}
 						// ── Creator display name ──
 						if (body?.creator_display_name !== undefined) {
@@ -14189,6 +14204,10 @@ export default {
 							catalog_title_enabled,
 						};
 						if (creator_display_name !== null) insertObj.creator_display_name = creator_display_name;
+
+						// Publication gate: Catalog Rooms are also created unpublished so no
+						// create path relies on the DB default of true. Forced server-side.
+						insertObj.is_published = false;
 
 						// 10. Create the Catalog Room.
 						const { data: room, error: roomErr } = await sb(env).from('rooms').insert(insertObj).select().single();
