@@ -11562,6 +11562,79 @@ export default {
 						}),
 					);
 
+					// ── Stage 1 (owner-management only): expose the authoritative
+					//    parent→Catalog relations so /MyRooms can group Catalog Rooms
+					//    under their parent. Additive and backward-compatible: the
+					//    public/discovery listing and explicit non-"me" owner listings
+					//    keep returning only { rooms }. Publication state is never
+					//    consulted here — an unpublished Catalog created moments ago must
+					//    group immediately. Uses the already-loaded owned `rooms` set and
+					//    a single bounded room_links query (no N+1, no full-Room duplication).
+					if (owner_id_param === 'me') {
+						const ownedRoomById = new Map<string, any>(
+							rooms
+								.filter((room: any) => room?.id != null)
+								.map((room: any) => [String(room.id), room] as [string, any]),
+						);
+						const ownedRoomIds = Array.from(ownedRoomById.keys());
+
+						let catalog_relations: Array<{
+							link_id: any;
+							parent_room_id: any;
+							catalog_room_id: any;
+							position: number | null;
+							created_at: string | null;
+						}> = [];
+						let catalog_relations_complete = true;
+
+						if (ownedRoomIds.length > 0) {
+							const { data: linkRows, error: linkErr } = await sb(env)
+								.from('room_links')
+								.select('id,source_room_id,target_room_id,position,created_at')
+								.in('source_room_id', ownedRoomIds);
+
+							if (linkErr) {
+								// Optional grouping metadata failed — preserve the usable Room
+								// list and let the frontend keep its flat fallback. Never mark a
+								// failed lookup complete; never leak DB internals to the client.
+								console.error(
+									`[perf] /api/rooms(list) catalog_relations lookup failed`,
+									JSON.stringify({ rid: request_id, error: linkErr.message }),
+								);
+								catalog_relations = [];
+								catalog_relations_complete = false;
+							} else {
+								// Authoritative in-memory validation: both endpoints must be
+								// owned Rooms present in this response, and the target must be a
+								// Catalog. Ordinary linked Rooms and foreign/missing Rooms drop out.
+								const valid = (linkRows || []).filter((link: any) => {
+									if (!link || link.source_room_id == null || link.target_room_id == null) return false;
+									const source = ownedRoomById.get(String(link.source_room_id));
+									const target = ownedRoomById.get(String(link.target_room_id));
+									return Boolean(source) && Boolean(target) && target.room_type === CATALOG_ROOM_TYPE;
+								});
+								// Deterministic order: position ASC (nulls last), then created_at ASC.
+								valid.sort((a: any, b: any) => {
+									const pa = a.position == null ? Number.POSITIVE_INFINITY : a.position;
+									const pb = b.position == null ? Number.POSITIVE_INFINITY : b.position;
+									if (pa !== pb) return pa - pb;
+									const ca = a.created_at ? String(a.created_at) : '';
+									const cb = b.created_at ? String(b.created_at) : '';
+									return ca < cb ? -1 : ca > cb ? 1 : 0;
+								});
+								catalog_relations = valid.map((link: any) => ({
+									link_id: link.id,
+									parent_room_id: link.source_room_id,
+									catalog_room_id: link.target_room_id,
+									position: link.position ?? null,
+									created_at: link.created_at ?? null,
+								}));
+							}
+						}
+
+						return ok(req, env, request_id, { rooms, catalog_relations, catalog_relations_complete });
+					}
+
 					return ok(req, env, request_id, { rooms });
 				}
 
