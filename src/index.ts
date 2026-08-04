@@ -14417,7 +14417,7 @@ export default {
 					// Query profile_linked_rooms by owner_user_id, ordered stably.
 					const { data: linkRows, error: linksErr } = await sb(env)
 						.from('profile_linked_rooms')
-						.select('id, owner_user_id, target_room_id, position, created_at')
+						.select('id, owner_user_id, target_room_id, position, created_at, is_default')
 						.eq('owner_user_id', resolvedOwnerId)
 						.order('position', { ascending: true })
 						.order('created_at', { ascending: true });
@@ -14452,6 +14452,7 @@ export default {
 							target_room_id: l.target_room_id,
 							position: l.position,
 							created_at: l.created_at,
+							is_default: l.is_default === true,
 							room: {
 								id: (room as any).id,
 								room_key: (room as any).room_key ?? null,
@@ -14576,7 +14577,7 @@ export default {
 							target_room_id: targetRoomIdRaw,
 							position: nextPosition,
 						} as any)
-						.select('id, owner_user_id, target_room_id, position, created_at')
+						.select('id, owner_user_id, target_room_id, position, created_at, is_default')
 						.single();
 
 					if (insertErr) {
@@ -14610,6 +14611,7 @@ export default {
 								target_room_id: ins.target_room_id,
 								position: ins.position,
 								created_at: ins.created_at,
+								is_default: ins.is_default === true,
 								room: tgt
 									? {
 											id: tgt.id,
@@ -14627,6 +14629,145 @@ export default {
 						},
 						201,
 					);
+				}
+
+				// PATCH /api/profile-rooms/:linkId
+				// Set or clear the single default Profile Room for the authenticated
+				// owner. Presentation-only: never joins, never touches membership,
+				// roles, invites, or permissions.
+				{
+					const m = path.match(/^\/api\/profile-rooms\/([^/]+)$/);
+					if (m && req.method === 'PATCH') {
+						const linkIdRaw = m[1];
+
+						// 1. Authenticate + resolve the active persona (same flow as DELETE).
+						const deviceId = await requireAuth(req, env);
+
+						const { data: deviceBinding } = await sb(env)
+							.from('account_devices')
+							.select('account_id')
+							.eq('device_id', deviceId)
+							.maybeSingle();
+
+						const accountId = (deviceBinding as any)?.account_id;
+						if (!accountId) {
+							throw new HttpError(403, 'TERAN_ID_REQUIRED', 'Create a Teran ID to manage profile rooms.');
+						}
+
+						const { data: primaryPersonaRaw } = await sb(env)
+							.from('account_personas')
+							.select('persona_author_id')
+							.eq('account_id', accountId)
+							.order('created_at', { ascending: true })
+							.limit(1)
+							.maybeSingle();
+
+						const resolvedOwnerId = (primaryPersonaRaw as any)?.persona_author_id;
+						if (!resolvedOwnerId) {
+							throw new HttpError(403, 'PROFILE_NOT_FOUND', 'Your profile must be set up before managing profile rooms.');
+						}
+
+						// 2. Validate linkId (UUID stored as TEXT in this table).
+						const linkId = typeof linkIdRaw === 'string' ? linkIdRaw.trim() : '';
+						if (!linkId) {
+							throw new HttpError(400, 'BAD_REQUEST', 'linkId is required');
+						}
+
+						// 3. Validate body: is_default must be an explicit boolean.
+						const body = (await req.json().catch(() => null)) as any;
+						if (!body || typeof body.is_default !== 'boolean') {
+							throw new HttpError(400, 'BAD_REQUEST', 'is_default (boolean) is required');
+						}
+						const nextDefault = body.is_default as boolean;
+
+						// 4. Confirm the link exists AND belongs to this owner. The
+						//    owner_user_id guard turns a cross-owner linkId into a 404,
+						//    so one profile can never set another profile's default.
+						const { data: linkRow, error: linkErr } = await sb(env)
+							.from('profile_linked_rooms')
+							.select('id, owner_user_id, target_room_id, position, created_at')
+							.eq('id', linkId)
+							.eq('owner_user_id', resolvedOwnerId)
+							.maybeSingle();
+						if (linkErr) throw new Error(linkErr.message);
+						if (!linkRow) {
+							throw new HttpError(404, 'NOT_FOUND', 'Profile room link not found');
+						}
+
+						if (nextDefault) {
+							// 5a. Make this the ONLY default. Clear any existing default(s)
+							//     for this owner FIRST so the partial unique index never
+							//     observes two `is_default = true` rows, then set this one.
+							//     If step two fails, the owner is left with zero defaults —
+							//     still a valid state, never two defaults.
+							const { error: clearErr } = await (sb(env)
+								.from('profile_linked_rooms') as any)
+								.update({ is_default: false })
+								.eq('owner_user_id', resolvedOwnerId)
+								.eq('is_default', true);
+							if (clearErr) throw new Error(clearErr.message);
+
+							const { error: setErr } = await (sb(env)
+								.from('profile_linked_rooms') as any)
+								.update({ is_default: true })
+								.eq('id', linkId)
+								.eq('owner_user_id', resolvedOwnerId);
+							if (setErr) {
+								// Concurrent set-default race: the partial unique index
+								// rejected a second default. Surface as a conflict.
+								if ((setErr as any).code === '23505') {
+									throw new HttpError(409, 'DEFAULT_ROOM_CONFLICT', 'A default room was set concurrently. Please retry.');
+								}
+								throw new Error(setErr.message);
+							}
+						} else {
+							// 5b. Clear the default on this link only. Zero defaults is a
+							//     valid state; never auto-select a replacement Room.
+							const { error: unsetErr } = await (sb(env)
+								.from('profile_linked_rooms') as any)
+								.update({ is_default: false })
+								.eq('id', linkId)
+								.eq('owner_user_id', resolvedOwnerId);
+							if (unsetErr) throw new Error(unsetErr.message);
+						}
+
+						// 6. Load the target Room summary for a response shaped exactly
+						//    like POST (canonical fields only; no token, no metadata cache).
+						const { data: targetSummary, error: sumErr } = await sb(env)
+							.from('rooms')
+							.select(ROOM_LINK_SUMMARY_FIELDS)
+							.eq('id', (linkRow as any).target_room_id)
+							.maybeSingle();
+						if (sumErr) throw new Error(sumErr.message);
+
+						const lr = linkRow as any;
+						const tgt = targetSummary as any;
+
+						console.log(`[profile-rooms] PATCH rid=${request_id} owner=${resolvedOwnerId} link=${linkId} is_default=${nextDefault}`);
+
+						return ok(req, env, request_id, {
+							room: {
+								link_id: lr.id,
+								target_room_id: lr.target_room_id,
+								position: lr.position,
+								created_at: lr.created_at,
+								is_default: nextDefault,
+								room: tgt
+									? {
+											id: tgt.id,
+											room_key: tgt.room_key ?? null,
+											name: tgt.name,
+											description: tgt.description ?? null,
+											visibility: tgt.visibility,
+											room_type: tgt.room_type ?? null,
+											emoji: tgt.emoji ?? null,
+											icon_key: tgt.icon_key ?? null,
+											icon_thumb_key: tgt.icon_thumb_key ?? null,
+										}
+									: null,
+							},
+						});
+					}
 				}
 
 				// DELETE /api/profile-rooms/:linkId
