@@ -11562,6 +11562,64 @@ export default {
 						}),
 					);
 
+					// ── Owner identity enrichment (Wire Room Discovery, Phase 1) ─────
+					// Attach the Room owner's public display name + avatar so Room cards
+					// can show owner identity without a per-Room profile request. This
+					// mirrors the feed's author-identity overlay exactly: `user_profiles`
+					// keyed by user_id, using getLiveDisplayName() for the name and the
+					// raw `avatar` value (which may be an R2 key, icon id, or URL — never
+					// a data: URI, stripped like the feed does). Properties:
+					//   • Batched  — one query over the unique owner_ids (no N+1); duplicate
+					//                owners are de-duped by the Set before querying.
+					//   • Order-preserving — mutates the already-ordered `rooms` objects
+					//                in place, so both the owner_id=me and default return
+					//                paths stay consistent and untouched otherwise.
+					//   • Non-fatal — every Room defaults to null owner fields first; any
+					//                lookup failure, missing owner_id, or partial result
+					//                simply leaves those fields null and never fails the
+					//                Room list request.
+					//   • Privacy — selects ONLY the public display name + avatar; no
+					//                phone/email/bio/teran_id/tokens/moderation fields.
+					for (const room of rooms as any[]) {
+						room.owner_display_name = null;
+						room.owner_avatar = null;
+					}
+					const uniqueOwnerIds = [
+						...new Set((rooms as any[]).map((r) => r.owner_id).filter(Boolean)),
+					] as string[];
+					if (uniqueOwnerIds.length > 0) {
+						try {
+							const { data: ownerProfiles, error: ownerErr } = await sb(env)
+								.from('user_profiles')
+								.select('user_id, display_name, avatar')
+								.in('user_id', uniqueOwnerIds);
+							if (ownerErr) {
+								console.warn(
+									`[perf] /api/rooms(list) owner identity lookup failed`,
+									JSON.stringify({ rid: request_id, error: ownerErr.message }),
+								);
+							} else {
+								const ownerMap: Record<string, { display_name?: string | null; avatar?: string | null }> = {};
+								for (const prof of (ownerProfiles || []) as any[]) {
+									if (prof?.user_id != null) ownerMap[String(prof.user_id)] = prof;
+								}
+								for (const room of rooms as any[]) {
+									const prof = room.owner_id != null ? ownerMap[String(room.owner_id)] : null;
+									if (!prof) continue;
+									room.owner_display_name = getLiveDisplayName(prof);
+									let ownerAvatar = typeof prof.avatar === 'string' ? prof.avatar : null;
+									if (ownerAvatar && ownerAvatar.startsWith('data:')) ownerAvatar = null;
+									room.owner_avatar = ownerAvatar || null;
+								}
+							}
+						} catch (ownerLookupErr: any) {
+							console.warn(
+								`[perf] /api/rooms(list) owner identity lookup threw`,
+								JSON.stringify({ rid: request_id, error: ownerLookupErr?.message ?? String(ownerLookupErr) }),
+							);
+						}
+					}
+
 					// ── Stage 1 (owner-management only): expose the authoritative
 					//    parent→Catalog relations so /MyRooms can group Catalog Rooms
 					//    under their parent. Additive and backward-compatible: the
